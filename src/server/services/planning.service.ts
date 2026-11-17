@@ -13,6 +13,8 @@ import {
   buildAlerts, buildMilestones, buildRows, buildSCurve, computeKpis, wbsProgress, weightedProgress,
   type BaselineMap, type MetricActivity, type MetricInput,
 } from "@/features/planning/metrics";
+import { mspToSchedule, isMspXml } from "@/features/planning/msp";
+import { writeMspXml } from "@/features/planning/msp-write";
 import { parseXer, writeXer, xerToSchedule, type ExportSchedule, type ImportedSchedule } from "@/features/planning/xer";
 import { mergeRelationships, planMerge, type ActivityPatch } from "@/features/planning/merge";
 import type { PlanActivityDTO, PlanningData } from "@/features/planning/dto";
@@ -629,7 +631,7 @@ async function mergeXer(existing: ExistingSchedule, imp: ImportedSchedule, opts:
 
   await prisma.$transaction(
     async (tx) => {
-      await tx.planSchedule.update({ where: { id: scheduleId }, data: { startDate: d2(startDate)!, dataDate: d2(dataDate)!, source: "XER", p6ProjectId: imp.p6ProjectId, defaultCalendarId } });
+      await tx.planSchedule.update({ where: { id: scheduleId }, data: { startDate: d2(startDate)!, dataDate: d2(dataDate)!, source: imp.p6ProjectId === "msp" ? "MSP" : "XER", p6ProjectId: imp.p6ProjectId, defaultCalendarId } });
 
       const calData = (c: (typeof plan.calendarsCreate)[number]["cal"]) => ({ name: c.name, workDays: c.workDays, holidays: c.holidays, workExceptions: c.workExceptions, hoursPerDay: c.hoursPerDay, p6Id: c.p6Id });
       if (plan.calendarsCreate.length) await tx.planCalendar.createMany({ data: plan.calendarsCreate.map((c) => ({ id: c.id, scheduleId, ...calData(c.cal) })) });
@@ -682,11 +684,11 @@ export async function importXer(projectId: string, text: string, opts: ImportOpt
 
   let imp;
   try {
-    imp = xerToSchedule(parseXer(text), { projectId: opts.projectId });
+    imp = isMspXml(text) ? mspToSchedule(text) : xerToSchedule(parseXer(text), { projectId: opts.projectId });
   } catch (e) {
-    throw new PlanningError(e instanceof Error ? e.message : "Could not read this XER file.");
+    throw new PlanningError(e instanceof Error ? e.message : "Could not read this schedule file.");
   }
-  if (imp.activities.length === 0) throw new PlanningError("The XER file has no activities for the selected project.");
+  if (imp.activities.length === 0) throw new PlanningError("The file has no activities for the selected project.");
 
   const existing = await loadExistingForMerge(projectId);
   const mode: ImportMode = !existing ? "create" : opts.mode ?? "update";
@@ -736,7 +738,7 @@ export async function importXer(projectId: string, text: string, opts: ImportOpt
       await tx.planSchedule.deleteMany({ where: { projectId } });
       await tx.planSchedule.create({
         data: {
-          id: scheduleId, projectId, name: imp.name, startDate: d2(startDate)!, dataDate: d2(dataDate)!, source: "XER", p6ProjectId: imp.p6ProjectId,
+          id: scheduleId, projectId, name: imp.name, startDate: d2(startDate)!, dataDate: d2(dataDate)!, source: imp.p6ProjectId === "msp" ? "MSP" : "XER", p6ProjectId: imp.p6ProjectId,
           defaultCalendarId: calIds.get(defaultP6) ?? null, createdById: userId,
         },
       });
@@ -813,4 +815,8 @@ export async function buildExportSchedule(projectId: string): Promise<ExportSche
 
 export async function exportXer(projectId: string): Promise<string> {
   return writeXer(await buildExportSchedule(projectId));
+}
+
+export async function exportMsp(projectId: string): Promise<string> {
+  return writeMspXml(await buildExportSchedule(projectId));
 }
