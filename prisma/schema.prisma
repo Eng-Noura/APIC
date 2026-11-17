@@ -1,0 +1,1429 @@
+// ============================================================================
+// SteelFlow ERP — Prisma Schema
+// Phase 1: Core Platform (Auth, RBAC, Projects, Customers, Documents, Reports)
+//
+// Phase 2 note: Pricing / Scrap / Cost Reconciliation models are intentionally
+// NOT defined here. When Phase 2 begins, new models (e.g. Quotation,
+// MaterialItem, ScrapEntry, CostComponent, PriceList) will attach to Project
+// via a nullable/optional relation, so nothing in Phase 1 needs to change.
+// See: src/features/phase2-pricing and src/features/phase2-scrap (stubs).
+// ============================================================================
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  MANAGER
+  ENGINEER
+  VIEWER
+}
+
+enum ProjectStage {
+  TENDERING
+  EXECUTION
+}
+
+enum ProjectStatus {
+  // Tendering stage statuses
+  UNDER_STUDY
+  SUBMITTED
+  APOLOGIZED
+  CANCELLED
+  // Execution stage statuses
+  IN_PROGRESS
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+enum DocumentCategory {
+  DRAWING
+  SPECIFICATION
+  CONTRACT
+  PURCHASE_ORDER
+  TECHNICAL_DOCUMENT
+  EMAIL
+  OTHER
+}
+
+enum MeetingStatus {
+  SCHEDULED
+  HELD
+  CANCELLED
+  POSTPONED
+}
+
+// ----------------------------------------------------------------------------
+// Core Models
+// ----------------------------------------------------------------------------
+
+model User {
+  id         String   @id @default(cuid())
+  name       String
+  email      String   @unique
+  password   String // bcrypt hash
+  role       Role     @default(VIEWER)
+  department String?
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  createdProjects    Project[]        @relation("ProjectCreatedBy")
+  uploadedDocs       Document[]       @relation("DocumentUploadedBy")
+  activityLogs       ActivityLog[]
+  scopeItems         ScopeItem[]      @relation("ScopeItemCreatedBy")
+  notices            Notice[]         @relation("NoticeCreatedBy")
+  meetingMinutes     MeetingMinute[]  @relation("MeetingMinuteCreatedBy")
+  uploadedDxfFiles   PartDxf[]        @relation("PartDxfUploadedBy")
+  createdNestingJobs NestingJob[]     @relation("NestingJobCreatedBy")
+  createdNestingRuns NestingRun[]     @relation("NestingRunCreatedBy")
+  nestingHistory     NestingHistory[]
+  planSchedules      PlanSchedule[]   @relation("PlanScheduleCreatedBy")
+  planBaselines      PlanBaseline[]   @relation("PlanBaselineCreatedBy")
+  planMaterials      PlanMaterial[]   @relation("PlanMaterialCreatedBy")
+  quotations         Quotation[]      @relation("QuotationCreatedBy")
+  quotationEvents    QuotationEvent[] @relation("QuotationEventBy")
+
+  @@map("users")
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  contact   String?
+  email     String?
+  phone     String?
+  address   String?
+  taxNumber String?
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  projects Project[]
+
+  @@map("customers")
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  number      String        @unique
+  name        String
+  description String?
+  stage       ProjectStage  @default(TENDERING)
+  status      ProjectStatus @default(UNDER_STUDY)
+  revision    String        @default("Rev. 00")
+  dueDate     DateTime?
+  startDate   DateTime?
+  endDate     DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  // Set when the project is converted to execution: the budget frozen from the approved quotations
+  // ({ currency, total, supply, install, quotations[], frozenAt }) and the moment of the conversion.
+  executionBudget    Json?
+  executionStartedAt DateTime?
+
+  // Production: the schedule WBS whose activities are driven by the production progress (tons made ÷ total tons).
+  productionWbsId String?
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  createdById String
+  createdBy   User   @relation("ProjectCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  documents         Document[]
+  takeoffDrawings   TakeoffDrawing[]
+  scopeItems        ScopeItem[]
+  notices           Notice[]
+  meetingMinutes    MeetingMinute[]
+  nestingJobs       NestingJob[]
+  nestingWorkspaces NestingWorkspace[]
+  planSchedule      PlanSchedule?
+  planMaterials     PlanMaterial[]
+  quotations        Quotation[]
+  documentFolders   DocumentFolder[]
+  purchaseOrders    PurchaseOrder[]
+  workOrders        WorkOrder[]
+  partGroups        PartGroup[]
+
+  // ---------------------------------------------------------------------
+  // Phase 2 extension point (do not remove): future models such as
+  // Quotation, MaterialUsage, ScrapEntry, CostSummary will each declare
+  // `projectId` and relate back here. No change to Project is required.
+  // ---------------------------------------------------------------------
+
+  @@map("projects")
+}
+
+// ----------------------------------------------------------------------------
+// Material Take-Off — Area & Weight (Phase 2, stage 1)
+// Mirrors the "Riser Duct Fabrication Drg" calculation sheet:
+//   unitArea (ext) = extWidth * extLength * 2   (both sides)
+//   unitArea (int) = intWidth * intLength * 2   (both sides)
+//   totalUnitArea  = extUnitArea + intUnitArea
+//   totalArea      = totalUnitArea * qty
+//   volume         = (totalArea / 2) * thicknessMm
+//   weight (kg)    = volume * 7.85
+// ----------------------------------------------------------------------------
+model TakeoffDrawing {
+  id            String   @id @default(cuid())
+  drawingNumber String // e.g. "13334036"
+  title         String // e.g. "Existing Riser Ø4657"
+  weightFromDwg Float? // reference weight from the drawing itself, for variance check
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  parts TakeoffPart[]
+
+  @@map("takeoff_drawings")
+}
+
+model TakeoffPart {
+  id          String @id @default(cuid())
+  itemNo      Int
+  description String // e.g. "PL 20 mm", "IPE 120", free text label
+
+  // Per-part material (e.g. "Steel", "Stainless Steel"). Optional because
+  // existing rows predate this field. This is the authoritative source of
+  // material for DXF Nesting grouping — never NestingJob.material, which is
+  // legacy job-level metadata only (see NestingJob doc comment below).
+  material String?
+
+  // What kind of item this is — drives which fields are relevant and what
+  // the default area/weight formula looks like:
+  //   PLATE      — flat sheet: width x length x thickness, optional cut-out
+  //   HOT_ROLLED — rolled section (IPE/FB/angle/etc): weight is per-metre
+  //                of the profile, not area x thickness x density
+  //   CONE       — frustum shell: D1, D2, height, thickness
+  //   PIPE       — cylindrical shell: OD, wall thickness, length
+  partType PartType
+
+  // Internal vs external scope item (e.g. duct inner wall vs outer wall).
+  // Purely descriptive/filterable — does not affect the calculation.
+  side PartSide @default(EXTERNAL)
+
+  qty         Int
+  thicknessMm Float? // required for PLATE/CONE/PIPE, irrelevant for HOT_ROLLED
+
+  // Raw, type-specific inputs the user typed in the "Add Item" popup —
+  // kept as JSON so each partType can have its own shape without a schema
+  // migration per field. Populated by the client-side default-formula
+  // builder in src/server/calc/takeoff.ts (`buildDefaultGeometryFormula`).
+  //   PLATE:      { width, length, cutoffFormula? }
+  //   CONE:       { d1, d2, height }
+  //   PIPE:       { od, length }
+  //   HOT_ROLLED: { profile, length, weightPerMeter, paintAreaPerMeter? }
+  geometry Json
+
+  // The area formula actually used to compute totalArea for sheet-based
+  // types (PLATE/CONE/PIPE) — pre-filled from `geometry` with a sensible
+  // default (e.g. "width*length" for a plate) but always visible and
+  // editable by the user, Excel-style. Not used for HOT_ROLLED, whose
+  // weight comes directly from weightPerMeter x length.
+  areaFormula String?
+
+  // Painting area is independent of the weight calculation: same geometry,
+  // but the user chooses whether painting covers 1 face or 2 faces.
+  paintSides Int @default(2) // 1 or 2
+
+  // Stored (computed) results — recalculated server-side on every write
+  // so they always match geometry/areaFormula without relying on the client.
+  totalArea    Float // m2 — single-face net area (already includes any cut-out)
+  volume       Float // totalArea * thicknessMm (sheet-based only, else 0)
+  weightKg     Float
+  paintAreaSqm Float @default(0) // totalArea * paintSides (sheet-based) — for HOT_ROLLED, paintAreaPerMeter * length * qty
+
+  // Scrap tracking: buyWeightKg is the actual purchased/allocated stock
+  // weight for this row (manual entry). scrapKg/scrapPct are derived and
+  // only present once buyWeightKg is set.
+  buyWeightKg Float? // kg — weight of stock material purchased for this row
+  scrapKg     Float? // buyWeightKg - weightKg
+  scrapPct    Float? // scrapKg / buyWeightKg
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  drawingId String
+  drawing   TakeoffDrawing @relation(fields: [drawingId], references: [id], onDelete: Cascade)
+
+  // Assembly grouping (BOQ). `qty` stays the TOTAL quantity and is recomputed server-side as
+  // effective group qty x qtyPerAssembly whenever the part is grouped.
+  groupId        String?
+  group          PartGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  posNo          String?
+  qtyPerAssembly Int        @default(1)
+  remark         String?
+
+  // Link to the part of the project's nesting workspace this part came from (the workspace is unique per
+  // project + kind, so kind + part id is enough). `nestSyncedQty` is the quantity both sides had at the last sync:
+  // comparing it with each side's current quantity tells WHO changed (see src/server/calc/nest-sync.ts).
+  nestKind      String? // "2D"
+  nestPartId    Int?
+  nestSyncedQty Int?
+  nestSyncedAt  DateTime?
+
+  // Optional DXF Nesting extension (Phase 1) — a TakeoffPart works exactly
+  // as before whether or not these are ever populated.
+  dxf               PartDxf?
+  nestingJobItems   NestingJobItem[]
+  // Phase 2A: historical placements referencing this part across nesting
+  // runs. onDelete: Restrict on the placement side — see NestingPlacement.
+  nestingPlacements NestingPlacement[] @relation("TakeoffPartNestingPlacements")
+
+  @@index([groupId])
+  @@index([nestKind, nestPartId])
+  @@map("takeoff_parts")
+}
+
+// BOQ assemblies. Drawing -> Assembly (PartGroup) -> Part. Groups can nest (a hatch inside a wall):
+//   - without a parent, `qty` is the number of assemblies of this kind in the project;
+//   - with a parent, `qty` is the number needed PER parent assembly.
+// Effective quantity = qty x the parent's effective quantity (see src/server/calc/boq-groups.ts).
+model PartGroup {
+  id        String   @id @default(cuid())
+  code      String
+  name      String
+  dwgNo     String?
+  qty       Int      @default(1)
+  remark    String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  parentId String?
+  parent   PartGroup?  @relation("PartGroupTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children PartGroup[] @relation("PartGroupTree")
+
+  parts TakeoffPart[]
+
+  @@unique([projectId, code])
+  @@index([projectId, sortOrder])
+  @@map("part_groups")
+}
+
+enum PartType {
+  PLATE
+  HOT_ROLLED
+  CONE
+  PIPE
+  // Bought-out item (bolts, hinges, gaskets, insulation...). Never nested, never part of the steel
+  // material usage / scrap figures and not fabricated, so it gets no work order of its own.
+  // Its shape lives in `geometry`: { unit: "pcs" | "m" | "set"..., unitWeightKg?: number }.
+  ACCESSORY
+}
+
+enum PartSide {
+  INTERNAL
+  EXTERNAL
+  BOTH
+}
+
+// ----------------------------------------------------------------------------
+// DXF Nesting (Phase 1 — foundation only, no optimization engine yet)
+//
+// This is an ADDITIONAL, optional workflow layered on top of the existing
+// Standard Calculations (TakeoffPart) system above. Nothing above this
+// section changes. A TakeoffPart works exactly as before whether or not it
+// ever gets a PartDxf attached.
+//
+//   TakeoffPart --(0..1)--> PartDxf            (actual uploaded geometry)
+//   Project     --(0..*)--> NestingJob          (a batch of parts to nest)
+//   NestingJob  --(0..*)--> NestingJobItem --> TakeoffPart (reference only,
+//                                               never a duplicate/copy)
+// ----------------------------------------------------------------------------
+
+// The parsed, normalized result of a DXF upload for one TakeoffPart.
+// One-to-one and fully optional — existing/older TakeoffPart rows simply
+// have no PartDxf row at all.
+model PartDxf {
+  id String @id @default(cuid())
+
+  fileName String
+  filePath String
+  fileSize Int?
+
+  valid        Boolean @default(false)
+  errorMessage String? // human-readable reason when valid = false
+
+  // Detected/declared DXF units ($INSUNITS), reported as-is for transparency
+  // — all derived numeric fields below are already normalized to mm / m².
+  unitsDetected String?
+
+  areaSqm      Float? // actual net geometry area (outer − holes), not bbox
+  bboxWidthMm  Float?
+  bboxHeightMm Float?
+
+  outerContourCount Int? // should be exactly 1 for a valid single-part DXF
+  holeCount         Int? @default(0)
+
+  // Set when the bounding box looks implausible for the detected unit
+  // (e.g. a part coming out several metres across) — usually means
+  // $INSUNITS in the source file doesn't match how it was actually drawn.
+  // Null when the size looks sane. Purely advisory, never blocks upload.
+  unitsWarning String?
+
+  // Normalized outer contour + hole contours (arrays of {x,y} in mm), kept
+  // as JSON so the future nesting engine has the real shape to work with —
+  // never re-derived from the bounding box.
+  geometryJson Json?
+
+  uploadedAt DateTime @default(now())
+
+  takeoffPartId String      @unique
+  takeoffPart   TakeoffPart @relation(fields: [takeoffPartId], references: [id], onDelete: Cascade)
+
+  uploadedById String
+  uploadedBy   User   @relation("PartDxfUploadedBy", fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@map("part_dxf_files")
+}
+
+enum NestingJobStatus {
+  DRAFT // still being assembled — parts can be added/removed
+  READY // locked in, waiting for the (future) nesting/optimization engine
+}
+
+// A batch of nestable parts sharing a material + thickness, scoped to a
+// Project — the container the future placement/optimization engine will
+// eventually run against. Phase 1 only supports creating the job and
+// assigning parts to it.
+model NestingJob {
+  id          String           @id @default(cuid())
+  name        String
+  // ⚠️ Legacy, optional job-level metadata only — kept for backward
+  // compatibility with old records. NOT the source of truth for any part's
+  // material/thickness. Nesting Groups / Source Coverage always resolve
+  // material and thickness per TakeoffPart (see getEligibleNestingParts in
+  // nesting.service.ts). Never read these two fields for grouping.
+  material    String?
+  thicknessMm Float?
+  status      NestingJobStatus @default(DRAFT)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("NestingJobCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  items   NestingJobItem[] // superseded, see model doc comment — kept for compatibility, unused
+  sources NestingSource[]
+  runs    NestingRun[]
+
+  @@map("nesting_jobs")
+}
+
+// A reference, never a copy — qtyOverride only exists for the (optional)
+// case where fewer than the full TakeoffPart quantity should go into this
+// specific nesting run; description/thickness/material stay owned by the
+// TakeoffPart.
+//
+// ⚠️ Superseded (kept for backward compatibility only): eligible parts are
+// now collected automatically per-project (see getEligibleNestingParts in
+// nesting.service.ts) instead of being manually added one by one. This
+// table and its API routes are no longer written to by the app — it's left
+// in place, untouched and unused, so no data is lost and nothing has to be
+// dropped from the database. A future reproducibility/snapshot model can
+// reuse or replace it when the real nesting engine ships.
+model NestingJobItem {
+  id          String   @id @default(cuid())
+  qtyOverride Int? // null = use the full TakeoffPart.qty
+  createdAt   DateTime @default(now())
+
+  nestingJobId String
+  nestingJob   NestingJob @relation(fields: [nestingJobId], references: [id], onDelete: Cascade)
+
+  takeoffPartId String
+  takeoffPart   TakeoffPart @relation(fields: [takeoffPartId], references: [id], onDelete: Cascade)
+
+  @@unique([nestingJobId, takeoffPartId])
+  @@map("nesting_job_items")
+}
+
+// User-declared available source sheets for a Nesting Job — the one piece
+// of information Phase 1b genuinely needs manual input for. Parts are
+// collected automatically; source material is not (the system has no way
+// to know what stock is available).
+model NestingSource {
+  id          String @id @default(cuid())
+  material    String
+  thicknessMm Float
+  widthMm     Float
+  lengthMm    Float
+
+  // A Source Sheet represents a purchasable material/thickness/size. When
+  // set, availableQty is a HARD LIMIT (Phase 2B §2): the nesting engine
+  // (nesting-engine.ts) will never open more physical sheets of this exact
+  // definition than this number, and reports a clear shortage
+  // (NestingRun.sourceShortageJson) instead of silently exceeding it. Left
+  // null/unset, this definition is treated as unlimited stock to purchase
+  // (backward compatible with older records) — the "how many do I need to
+  // buy" answer always comes from NestingRun.sourceRequirementJson,
+  // calculated after a run.
+  availableQty Int?
+  createdAt    DateTime @default(now())
+
+  nestingJobId String
+  nestingJob   NestingJob @relation(fields: [nestingJobId], references: [id], onDelete: Cascade)
+
+  // Phase 2A: NestingSheet rows created by a future run may point back here
+  // for provenance, but always snapshot material/thickness/width/length at
+  // creation time — this record can keep changing after that without ever
+  // affecting an already-completed NestingRun. See NestingSheet doc comment.
+  nestingSheets NestingSheet[]
+
+  @@map("nesting_sources")
+}
+
+// ----------------------------------------------------------------------------
+// Nesting Run persistence (Phase 2 — real engine, see nesting-engine.ts /
+// nesting-run.service.ts)
+//
+// A NestingRun is one execution of the deterministic shelf-fit algorithm in
+// src/server/calc/nesting-engine.ts, persisted here by
+// src/server/services/nesting-run.service.ts. No packing/rotation logic
+// lives in this schema file — this only defines the shape results are
+// written into.
+//
+//   NestingJob --(0..*)--> NestingRun  (one execution of the engine)
+//   NestingRun --(0..*)--> NestingSheet    (one physical sheet used by that run)
+//   NestingSheet --(0..*)--> NestingPlacement (one placed piece on that sheet)
+//   NestingPlacement --(1)--> TakeoffPart      (reference only, never a copy)
+//
+// Coordinate convention (applies to NestingPlacement.xMm/yMm/rotationDeg):
+//   - all lengths in millimeters, never pixels or percentages
+//   - sheet origin (0,0) = bottom-left corner of the sheet
+//   - x increases to the right, y increases upward
+//   - xMm/yMm is the placement's origin/anchor point on the sheet
+//   - rotationDeg is measured counter-clockwise from 0; stored as a plain
+//     Float so a future engine is free to use 0/90 only at first and later
+//     support 180/270 or arbitrary angles without a schema change
+//
+// Reproducibility: once a run is COMPLETED, later edits to NestingSource,
+// TakeoffPart, or Standard Calculations must NOT change that run's stored
+// results. NestingSheet therefore snapshots material/thickness/width/length
+// at creation time instead of reading them live off NestingSource.
+// NestingPlacement still references the live TakeoffPart (geometry keeps
+// coming from TakeoffPart -> PartDxf -> geometryJson) — full part-geometry
+// snapshotting is explicitly out of scope for this phase; see report.
+// ----------------------------------------------------------------------------
+
+enum NestingRunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  // Every eligible part was processed but at least one required instance
+  // could not be placed (insufficient source sheet capacity, insufficient
+  // sheet area, or a part too large for any known source size). Never
+  // reported as COMPLETED — see PROJECT.md Phase 2B §16 "No fake success".
+  PARTIAL
+  FAILED
+  CANCELLED
+}
+
+// One execution of the (future) nesting engine for a NestingJob. Historical
+// record — a job can accumulate many runs over time (re-runs, what-ifs).
+model NestingRun {
+  id     String           @id @default(cuid())
+  status NestingRunStatus @default(PENDING)
+
+  // Phase 2C — distinguishes an ordinary automatic run from one produced
+  // (in whole or in part) by an assisted-nesting session. Defaults to
+  // "AUTO" so every pre-existing row backfills safely with no behavior
+  // change to Standard/automatic nesting. "ASSISTED" is set only when the
+  // run was created via the assisted-nesting save flow.
+  mode String @default("AUTO")
+
+  // Which algorithm produced this run and with what settings — recorded so
+  // historical runs stay interpretable even after the engine evolves.
+  algorithmName    String?
+  algorithmVersion String?
+  configJson       Json? // full EngineConfig snapshot, e.g. { marginLeftMm, marginRightMm, marginTopMm, marginBottomMm, partGapMm }
+
+  // Denormalized copies of the same values inside configJson (PROJECT.md
+  // §13/§20) so a run's parameters can be queried/displayed without parsing
+  // JSON. configJson remains the authoritative snapshot; these are for
+  // convenience only.
+  partGapMm      Float?
+  marginLeftMm   Float?
+  marginRightMm  Float?
+  marginTopMm    Float?
+  marginBottomMm Float?
+
+  // Automatically-calculated purchasing requirement (PROJECT.md §3/§16):
+  // one row per source sheet definition used by this run, e.g.
+  // [{ sourceSheetId, material, thicknessMm, widthMm, lengthMm, requiredQty }].
+  // Never populated from user input — always derived by the engine.
+  sourceRequirementJson Json?
+
+  // Per material/thickness group shortage report (Phase 2B §2/§9): only
+  // populated when every compatible source for that group carries a hard
+  // availableQty cap and that combined cap fell short of true demand —
+  // e.g. [{ material, thicknessMm, requiredSheets, availableSheets,
+  // shortageSheets }]. Empty/absent means no purchasing shortage.
+  sourceShortageJson Json?
+
+  createdAt    DateTime  @default(now())
+  startedAt    DateTime?
+  completedAt  DateTime?
+  errorMessage String?
+
+  // Aggregate metrics — always nullable in Phase 2A; the future engine
+  // populates them once it actually computes a result. Not calculated here.
+  totalSheets               Int?
+  totalUsedAreaSqm          Float?
+  totalScrapAreaSqm         Float?
+  overallUtilizationPercent Float?
+
+  // Part-count summary and the full unplaced-parts breakdown (part id,
+  // requested/placed/remaining qty, reason) — kept as JSON since this is a
+  // point-in-time report attached to the run, not a queryable relation.
+  totalPartsRequired Int?
+  totalPartsPlaced   Int?
+  totalPartsUnplaced Int?
+  unplacedPartsJson  Json?
+
+  nestingJobId String
+  nestingJob   NestingJob @relation(fields: [nestingJobId], references: [id], onDelete: Cascade)
+
+  // Nullable + SetNull: losing the user who kicked off a run must never
+  // delete historical nesting results, matching the PartDxf.uploadedBy /
+  // NestingJob.createdBy pattern used elsewhere (Restrict there because
+  // those relations are required; this one is optional).
+  createdById String?
+  createdBy   User?   @relation("NestingRunCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  sheets     NestingSheet[]
+  placements NestingPlacement[]
+
+  @@index([nestingJobId])
+  @@index([status])
+  @@map("nesting_runs")
+}
+
+// One physical source sheet actually used within a NestingRun. Dimensions
+// and material are a SNAPSHOT of the NestingSource used, copied at creation
+// time — never re-read live — so editing/deleting the source later cannot
+// change a historical run's stored sheet metadata.
+model NestingSheet {
+  id String @id @default(cuid())
+
+  sheetNumber Int // 1-based, unique within its run
+
+  // Snapshot fields — copied from NestingSource at creation time.
+  material    String
+  thicknessMm Float
+  widthMm     Float
+  lengthMm    Float
+
+  // Calculated metrics — nullable until the future engine computes them.
+  usedAreaSqm        Float?
+  scrapAreaSqm       Float?
+  utilizationPercent Float?
+
+  createdAt DateTime @default(now())
+
+  nestingRunId String
+  nestingRun   NestingRun @relation(fields: [nestingRunId], references: [id], onDelete: Cascade)
+
+  // Provenance only — optional and SetNull on delete, since this sheet's
+  // own material/thicknessMm/widthMm/lengthMm above are already a durable
+  // snapshot and don't depend on this relation surviving.
+  sourceSheetId String?
+  sourceSheet   NestingSource? @relation(fields: [sourceSheetId], references: [id], onDelete: SetNull)
+
+  placements NestingPlacement[]
+
+  @@unique([nestingRunId, sheetNumber])
+  @@index([nestingRunId])
+  @@map("nesting_sheets")
+}
+
+// One placed instance of a TakeoffPart on a NestingSheet. A TakeoffPart with
+// qty = 20 can end up with 20 NestingPlacement rows spread across multiple
+// sheets/runs — instanceNumber (1..qty) identifies which required piece this
+// is; it is never used to create duplicate TakeoffPart rows.
+model NestingPlacement {
+  id String @id @default(cuid())
+
+  instanceNumber Int // 1-based index within (nestingRunId, takeoffPartId)
+
+  // Millimeters, sheet-local, bottom-left origin — see model group doc
+  // comment above for the full coordinate convention.
+  xMm         Float
+  yMm         Float
+  rotationDeg Float @default(0)
+
+  // Phase 2C — provenance of this specific placement within an assisted
+  // session: "AUTO" (the ordinary automatic optimizer — the default, so
+  // every existing row backfills safely), "MANUAL" (the user placed it by
+  // hand), "PATTERN" (generated by repeating a detected pattern), or
+  // "OPTIMIZED" (added/repositioned by Optimize Remaining / Optimize
+  // Entire Nest). isLocked mirrors the assisted UI's "locked" concept
+  // (manual placements are locked by default) so a reloaded session can
+  // resume with the same optimizer constraints it was saved with.
+  origin   String  @default("AUTO")
+  isLocked Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  nestingSheetId String
+  nestingSheet   NestingSheet @relation(fields: [nestingSheetId], references: [id], onDelete: Cascade)
+
+  // Denormalized alongside nestingSheetId so uniqueness can be enforced per
+  // (run, part, instance) rather than per (sheet, part, instance) — the same
+  // required instance must never be placeable twice within one run, even if
+  // it ends up assigned to a different sheet than a sibling instance.
+  nestingRunId String
+  nestingRun   NestingRun @relation(fields: [nestingRunId], references: [id], onDelete: Cascade)
+
+  // Reference only — the authoritative part data (number, description,
+  // material, thickness, qty, DXF/geometryJson) stays owned by TakeoffPart,
+  // never duplicated here. Restrict: a TakeoffPart that has ever been placed
+  // in a nesting run cannot be deleted out from under historical results;
+  // the app must resolve/clear those placements first.
+  takeoffPartId String
+  takeoffPart   TakeoffPart @relation("TakeoffPartNestingPlacements", fields: [takeoffPartId], references: [id], onDelete: Restrict)
+
+  @@unique([nestingRunId, takeoffPartId, instanceNumber])
+  @@index([nestingSheetId])
+  @@index([takeoffPartId])
+  @@map("nesting_placements")
+}
+
+model Document {
+  id         String           @id @default(cuid())
+  title      String
+  category   DocumentCategory @default(OTHER)
+  revision   String           @default("Rev. 00")
+  folder     String? // path such as "Engineering/Drawings"; null = derived from the category
+  filePath   String
+  fileName   String
+  fileSize   Int?
+  uploadDate DateTime         @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  uploadedById String
+  uploadedBy   User   @relation("DocumentUploadedBy", fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@map("documents")
+}
+
+// Scope of work — a running list of scope entries for a project (not files).
+model ScopeItem {
+  id          String   @id @default(cuid())
+  description String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("ScopeItemCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@map("scope_items")
+}
+
+// Notices — a running list of notice entries for a project (not files).
+model Notice {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  noticeDate  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("NoticeCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@map("notices")
+}
+
+// Meeting minutes — each entry is a meeting date + its status (not a file).
+model MeetingMinute {
+  id          String        @id @default(cuid())
+  meetingDate DateTime
+  status      MeetingStatus @default(SCHEDULED)
+  notes       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("MeetingMinuteCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@map("meeting_minutes")
+}
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  action    String // e.g. "CREATE", "UPDATE", "DELETE", "LOGIN"
+  entity    String // e.g. "PROJECT", "CUSTOMER", "DOCUMENT", "USER"
+  entityId  String?
+  detail    String?
+  timestamp DateTime @default(now())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("activity_logs")
+}
+
+// ----------------------------------------------------------------------------
+// Settings (single-row configuration table, admin managed)
+// ----------------------------------------------------------------------------
+
+model CompanySettings {
+  id       Int     @id @default(1)
+  name     String  @default("SteelFlow Engineering Co.")
+  logoUrl  String?
+  address  String?
+  phone    String?
+  email    String?
+  timezone String  @default("Africa/Cairo")
+
+  language   String @default("en")
+  dateFormat String @default("DD/MM/YYYY")
+  currency   String @default("EGP")
+  theme      String @default("light")
+
+  defaultRevisionFormat String  @default("Rev. 00")
+  autoSave              Boolean @default(true)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("company_settings")
+}
+
+model ProjectStatusConfig {
+  id        String        @id @default(cuid())
+  status    ProjectStatus @unique
+  label     String
+  color     String        @default("gray")
+  isDefault Boolean       @default(false)
+  sortOrder Int           @default(0)
+
+  @@map("project_status_config")
+}
+
+// ----------------------------------------------------------------------------
+// Nesting workspace (auto-save of the DXF / CSV Nesting tabs)
+//
+// One row per (project, kind): the whole working state of the client-side Nest
+// Boost tools — imported parts, settings, the current result and the saved
+// nests — stored as a JSON snapshot so it comes back when the project is opened.
+//   kind = "2D"  (DXF Nesting tool)   |   "1D"  (bars / pipes / profiles tool)
+// ----------------------------------------------------------------------------
+model NestingWorkspace {
+  id        String   @id @default(cuid())
+  kind      String // "2D" | "1D"
+  dataJson  Json
+  // Bumped by every save. A save that names an older version is refused (see nesting-workspace.service).
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  updatedById String?
+
+  @@unique([projectId, kind])
+  @@map("nesting_workspaces")
+}
+
+// ----------------------------------------------------------------------------
+// Nesting history (per user)
+//
+// Every DXF / CSV import made in the Nesting tabs while no project is open is auto-saved here
+// instead of creating a new project each time. The user opens an entry later, renames or deletes it,
+// and — when the work is done — saves it as a real project (savedProjectId remembers which one;
+// there is deliberately no foreign key so deleting that project never touches the history).
+//   data2D / data1D = the same JSON snapshots NestingWorkspace stores per project.
+// ----------------------------------------------------------------------------
+model NestingHistory {
+  id             String   @id @default(cuid())
+  name           String
+  data2D         Json?
+  data1D         Json?
+  savedProjectId String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, updatedAt])
+  @@map("nesting_history")
+}
+
+// ----------------------------------------------------------------------------
+// Planning & Follow-up (Primavera P6 style schedule)
+// One schedule per project: WBS tree, activities, logic links, calendars,
+// baselines and progress snapshots. Dates are stored as UTC-midnight DateTimes;
+// durations are working days (Float, so 2.5d from P6 survives).
+// `p6Id` / `p6Raw` keep the original Primavera ids and unknown columns so an
+// imported XER can be exported again without losing them.
+// ----------------------------------------------------------------------------
+
+enum PlanActivityType {
+  TASK
+  MILESTONE_START
+  MILESTONE_FINISH
+}
+
+enum PlanRelType {
+  FS
+  SS
+  FF
+  SF
+}
+
+model PlanSchedule {
+  id                String    @id @default(cuid())
+  name              String
+  startDate         DateTime
+  dataDate          DateTime
+  finishDate        DateTime?
+  defaultCalendarId String?
+  source            String    @default("NATIVE") // NATIVE | XER
+  p6ProjectId       String?
+  calcError         String? // set when the logic has a loop, cleared on a clean recalculation
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("PlanScheduleCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  calendars     PlanCalendar[]
+  wbs           PlanWbs[]
+  activities    PlanActivity[]
+  relationships PlanRelationship[]
+  baselines     PlanBaseline[]
+  snapshots     PlanProgressSnapshot[]
+
+  @@map("plan_schedules")
+}
+
+model PlanCalendar {
+  id             String   @id @default(cuid())
+  name           String
+  workDays       Json // boolean[7], index 0 = Sunday
+  holidays       Json // ISO dates (non-working)
+  workExceptions Json // ISO dates (working)
+  hoursPerDay    Float    @default(8)
+  isDefault      Boolean  @default(false)
+  p6Id           String?
+  createdAt      DateTime @default(now())
+
+  scheduleId String
+  schedule   PlanSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  activities PlanActivity[]
+
+  @@index([scheduleId])
+  @@map("plan_calendars")
+}
+
+model PlanWbs {
+  id        String  @id @default(cuid())
+  code      String
+  name      String
+  sortOrder Int     @default(0)
+  p6Id      String?
+
+  scheduleId String
+  schedule   PlanSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  parentId String?
+  parent   PlanWbs?  @relation("PlanWbsTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children PlanWbs[] @relation("PlanWbsTree")
+
+  activities PlanActivity[]
+  materials  PlanMaterial[]
+
+  @@index([scheduleId])
+  @@map("plan_wbs")
+}
+
+model PlanActivity {
+  id              String           @id @default(cuid())
+  code            String
+  name            String
+  type            PlanActivityType @default(TASK)
+  durationDays    Float            @default(1)
+  remainingDays   Float?
+  percentComplete Float            @default(0)
+  actualStart     DateTime?
+  actualFinish    DateTime?
+  constraintType  String? // SNET | SNLT | FNET | FNLT
+  constraintDate  DateTime?
+  sortOrder       Int              @default(0)
+
+  // Calculated by the CPM engine on every change.
+  earlyStart  DateTime?
+  earlyFinish DateTime?
+  lateStart   DateTime?
+  lateFinish  DateTime?
+  totalFloat  Float?
+  isCritical  Boolean   @default(false)
+
+  p6Id      String?
+  p6Raw     Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scheduleId String
+  schedule   PlanSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  wbsId String?
+  wbs   PlanWbs? @relation(fields: [wbsId], references: [id], onDelete: SetNull)
+
+  calendarId String?
+  calendar   PlanCalendar? @relation(fields: [calendarId], references: [id], onDelete: SetNull)
+
+  predecessors PlanRelationship[] @relation("PlanRelSuccessor")
+  successors   PlanRelationship[] @relation("PlanRelPredecessor")
+  materials    PlanMaterial[]
+
+  @@unique([scheduleId, code])
+  @@index([scheduleId, sortOrder])
+  @@map("plan_activities")
+}
+
+model PlanRelationship {
+  id      String      @id @default(cuid())
+  type    PlanRelType @default(FS)
+  lagDays Float       @default(0)
+
+  scheduleId String
+  schedule   PlanSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  predecessorId String
+  predecessor   PlanActivity @relation("PlanRelPredecessor", fields: [predecessorId], references: [id], onDelete: Cascade)
+
+  successorId String
+  successor   PlanActivity @relation("PlanRelSuccessor", fields: [successorId], references: [id], onDelete: Cascade)
+
+  @@unique([predecessorId, successorId, type])
+  @@index([scheduleId])
+  @@map("plan_relationships")
+}
+
+// A frozen copy of every activity's dates, used to measure delay and draw the baseline bars.
+model PlanBaseline {
+  id        String   @id @default(cuid())
+  name      String
+  isPrimary Boolean  @default(true)
+  data      Json // { [activityId]: { start, finish } }
+  createdAt DateTime @default(now())
+
+  scheduleId String
+  schedule   PlanSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  createdById String?
+  createdBy   User?   @relation("PlanBaselineCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([scheduleId])
+  @@map("plan_baselines")
+}
+
+// Overall % complete at each progress update — draws the "Actual" S-curve.
+model PlanProgressSnapshot {
+  id        String   @id @default(cuid())
+  dataDate  DateTime
+  percent   Float
+  createdAt DateTime @default(now())
+
+  scheduleId String
+  schedule   PlanSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  @@unique([scheduleId, dataDate])
+  @@map("plan_progress_snapshots")
+}
+
+// ----------------------------------------------------------------------------
+// Material follow-up (procurement tracking) — project-wide.
+// A PlanMaterial is something the project needs (qty, phase, needed-by date);
+// each PlanMaterialOrder is a purchase against it (supplier, PO, expected and
+// received quantities). Status (not ordered / ordered / partial / delivered / late)
+// is derived from the orders, never stored. Linked to the schedule's WBS phase and
+// activity, but kept at project level so it survives re-importing a schedule.
+// ----------------------------------------------------------------------------
+
+model PlanMaterial {
+  id          String    @id @default(cuid())
+  code        String?
+  description String
+  spec        String? // grade / size, e.g. "ST37 · 6 mm plate"
+  unit        String    @default("kg")
+  requiredQty Float
+  neededBy    DateTime? // overrides the linked activity's start date
+  notes       String?
+  sortOrder   Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  wbsId String?
+  wbs   PlanWbs? @relation(fields: [wbsId], references: [id], onDelete: SetNull)
+
+  activityId String?
+  activity   PlanActivity? @relation(fields: [activityId], references: [id], onDelete: SetNull)
+
+  createdById String
+  createdBy   User   @relation("PlanMaterialCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  orders PlanMaterialOrder[]
+
+  @@index([projectId, sortOrder])
+  @@map("plan_materials")
+}
+
+model PlanMaterialOrder {
+  id           String    @id @default(cuid())
+  supplier     String
+  poNumber     String?
+  orderedQty   Float
+  unitPrice    Float?
+  orderDate    DateTime?
+  expectedDate DateTime?
+  receivedQty  Float     @default(0)
+  receivedDate DateTime?
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  materialId String
+  material   PlanMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  // Set when the order line was created from a purchase order (Procurement); `supplier` / `poNumber` keep a readable copy.
+  purchaseOrderId String?
+  purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+
+  receiptLines GoodsReceiptLine[]
+
+  @@index([materialId])
+  @@index([purchaseOrderId])
+  @@map("plan_material_orders")
+}
+
+// ---------------------------------------------------------------------------
+// Quotations (per project): BOQ lines split into supply vs dismantle & install,
+// a status workflow, revisions (same number, higher revision) and an event log.
+// ---------------------------------------------------------------------------
+enum QuotationStatus {
+  DRAFT
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum QuotationItemType {
+  SUPPLY
+  INSTALL
+}
+
+model Quotation {
+  id           String          @id @default(cuid())
+  number       String
+  revision     Int             @default(0)
+  section      String?
+  description  String
+  status       QuotationStatus @default(DRAFT)
+  currency     String          @default("EGP")
+  issueDate    DateTime
+  validUntil   DateTime?
+  profitMargin Float? // percent, entered by the estimator
+  preparedBy   String?
+  approvedBy   String?
+  decidedAt    DateTime?
+  terms        String?
+  notes        String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("QuotationCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  items  QuotationItem[]
+  events QuotationEvent[]
+
+  @@unique([projectId, number, revision])
+  @@index([projectId, issueDate])
+  @@map("quotations")
+}
+
+model QuotationItem {
+  id          String            @id @default(cuid())
+  sortOrder   Int               @default(0)
+  description String
+  material    String?
+  qty         Float
+  unit        String            @default("kg")
+  unitRate    Float
+  type        QuotationItemType @default(SUPPLY)
+
+  quotationId String
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  @@index([quotationId, sortOrder])
+  @@map("quotation_items")
+}
+
+model QuotationEvent {
+  id        String   @id @default(cuid())
+  kind      String // CREATED | UPDATED | SUBMITTED | REVIEW | APPROVED | REJECTED | REVISED
+  message   String
+  createdAt DateTime @default(now())
+
+  quotationId String
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  userId String?
+  user   User?   @relation("QuotationEventBy", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([quotationId, createdAt])
+  @@map("quotation_events")
+}
+
+// Folders a user created in a project's Documents screen (the standard tree is built in).
+model DocumentFolder {
+  id        String   @id @default(cuid())
+  path      String // e.g. "Engineering/Site Photos"
+  createdAt DateTime @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, path])
+  @@map("document_folders")
+}
+
+
+// ----------------------------------------------------------------------------
+// Procurement: suppliers, purchase orders, goods receipts (with heat number / mill
+// certificate reference) and the remnant stock.
+//
+// A purchase order's lines ARE the existing PlanMaterialOrder rows (so the Materials
+// follow-up, its status and the project reports keep working); the order only groups them
+// per supplier and gives them one document number. A goods receipt adds to the received
+// quantity of those lines and records which heat / certificate the steel came with.
+// ----------------------------------------------------------------------------
+model Supplier {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  contactName String?
+  phone       String?
+  email       String?
+  address     String?
+  notes       String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  orders PurchaseOrder[]
+
+  @@map("suppliers")
+}
+
+enum PurchaseOrderStatus {
+  ISSUED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id            String              @id @default(cuid())
+  number        String              @unique // PO-2026-0001
+  status        PurchaseOrderStatus @default(ISSUED) // received / partial is derived from the lines
+  currency      String              @default("EGP")
+  orderDate     DateTime
+  expectedDate  DateTime?
+  paymentTerms  String?
+  notes         String?
+  createdById   String
+  createdByName String
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+
+  lines    PlanMaterialOrder[]
+  receipts GoodsReceipt[]
+
+  @@index([projectId, orderDate])
+  @@map("purchase_orders")
+}
+
+model GoodsReceipt {
+  id             String   @id @default(cuid())
+  number         String   @unique // GR-2026-0001
+  receivedDate   DateTime
+  deliveryNote   String? // the supplier's delivery note number
+  notes          String?
+  receivedByName String
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  lines GoodsReceiptLine[]
+
+  @@index([purchaseOrderId])
+  @@map("goods_receipts")
+}
+
+model GoodsReceiptLine {
+  id             String  @id @default(cuid())
+  qty            Float
+  accepted       Boolean @default(true) // a rejected line is recorded but does not count as received
+  heatNo         String? // heat / lot number of the steel
+  certificateRef String? // mill test certificate (MTC) number
+  notes          String?
+
+  receiptId String
+  receipt   GoodsReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  orderId String
+  order   PlanMaterialOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([receiptId])
+  @@index([orderId])
+  @@index([heatNo])
+  @@map("goods_receipt_lines")
+}
+
+enum StockKind {
+  SHEET
+  REMNANT
+}
+
+// Sheets and remnants (usable offcuts) the company holds, by thickness, material and size.
+model StockItem {
+  id              String    @id @default(cuid())
+  kind            StockKind @default(REMNANT)
+  material        String    @default("") // "" = unspecified
+  thicknessMm     Float
+  widthMm         Float
+  heightMm        Float
+  qty             Int       @default(1)
+  location        String?
+  heatNo          String?
+  notes           String?
+  origin          String    @default("MANUAL") // MANUAL | NEST | RECEIPT
+  originProjectId String?
+  createdById     String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  movements StockMovement[]
+
+  @@index([thicknessMm, material])
+  @@map("stock_items")
+}
+
+model StockMovement {
+  id        String   @id @default(cuid())
+  delta     Int // + added, − taken
+  reason    String // ADDED | REMNANT | USED | SCRAPPED | ADJUSTED
+  projectId String?
+  note      String?
+  userName  String?
+  createdAt DateTime @default(now())
+
+  stockItemId String
+  stockItem   StockItem @relation(fields: [stockItemId], references: [id], onDelete: Cascade)
+
+  @@index([stockItemId, createdAt])
+  @@map("stock_movements")
+}
+
+
+// ----------------------------------------------------------------------------
+// Production tracking. A work order covers one takeoff part (qty pieces); every piece is
+// followed through cutting → assembly → welding → painting by the time each stage was
+// finished. Progress by weight (tons made ÷ total tons of the project) then drives the
+// schedule's fabrication activities, so the S-curve "actual" is fed by the shop floor.
+// ----------------------------------------------------------------------------
+model WorkOrder {
+  id            String   @id @default(cuid())
+  number        String   @unique // WO-2026-0001
+  description   String // copied from the part, so the order stays readable if the part is edited
+  partNo        Int? // the part's item no.
+  partId        String? // takeoff part it was made from (no foreign key: the order outlives the part)
+  material      String?
+  qty           Int
+  unitWeightKg  Float
+  dueDate       DateTime?
+  notes         String?
+  createdById   String
+  createdByName String
+  createdAt     DateTime @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  pieces WorkOrderPiece[]
+
+  @@index([projectId])
+  @@map("work_orders")
+}
+
+model WorkOrderPiece {
+  id          String    @id @default(cuid())
+  seq         Int // 1..qty; the QR code is <work order number>-<seq>
+  cutAt       DateTime?
+  assembledAt DateTime?
+  weldedAt    DateTime?
+  paintedAt   DateTime?
+
+  workOrderId String
+  workOrder   WorkOrder @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([workOrderId, seq])
+  @@map("work_order_pieces")
+}

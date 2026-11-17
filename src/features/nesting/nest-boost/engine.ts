@@ -1,0 +1,2956 @@
+// Nest Boost engine — DXF parsing, part separation and grid-based sheet nesting.
+// Pure client-side code (uses Path2D / canvas), no server or database involved.
+
+export type Pt = [number, number];
+
+/**
+ * Part Segmentation (features/nesting/segmentation). An oversized ORIGINAL part that was split stays in the
+ * list as role "parent" — it keeps the takeoff quantity / traceability but is never nested — and the pieces
+ * made from it are ordinary nestable parts with role "child".
+ */
+export interface SegInfo {
+  role: "parent" | "child";
+  /** Same value on a parent and on all of its children. */
+  planId: string;
+  /** child: id of the original part. */
+  parentId?: number;
+  /** child: id of the piece inside the plan, e.g. "S01" or "S02a". */
+  segId?: string;
+  /** child: number shown in the list, "<original #>-<piece no>", e.g. "1-2". */
+  label?: string;
+  /** parent: ids of the pieces, in segment order. */
+  childIds?: number[];
+  /** parent: the cuts and settings the pieces were made from (JSON), so the layout can be re-opened and edited. */
+  plan?: unknown;
+  /** parent: outline signature when it was segmented, to notice if the part was changed afterwards. */
+  sig?: string;
+}
+
+export interface Group {
+  id: number;
+  /** Serial number shown next to the part and used in nesting messages. */
+  sn: number;
+  /** For auto-paired triangles: id of the single-triangle group it came from. */
+  cid?: number;
+  name: string;
+  qty: number;
+  /** Plate thickness in mm (0 = unknown). */
+  th: number;
+  /** Material grade/spec, e.g. "S235", "304 SS" ("" = unknown). Parts only
+   *  share a sheet with others of the same thickness AND material. */
+  material: string;
+  outer: Pt[];
+  holes: Pt[][];
+  extra?: Pt[][];
+  w: number;
+  h: number;
+  area: number;
+  per: number;
+  /** Number of physical parts this group represents (2 for a triangle pair). */
+  n?: number;
+  /** Set on a segmented original part and on the pieces generated from it. */
+  seg?: SegInfo;
+  /** The dimensions it was typed in with ("Add part by dimensions"), so the Details popup can show the exact formula. */
+  shape?: ManualShape;
+  /**
+   * true  = the part is drawn exactly as it will be cut (real DXF outline) — safe to release to production.
+   * false = an approximation used for pricing only (typed-in dimensions, a stand-in shape).
+   * undefined = not decided yet: see `isExact` for the default.
+   */
+  exact?: boolean;
+}
+
+/** Whether a part counts as exact. Parts nobody marked yet default to: typed-in shapes = approximate, everything else (DXF) = exact. */
+export const isExact = (g: Pick<Group, "exact" | "shape">): boolean => g.exact ?? !g.shape;
+
+/** The part number as shown to the user: "3" for a normal part, "1-2" for the 2nd piece of segmented part #1. */
+export const snText = (g: Pick<Group, "sn" | "seg">): string => g.seg?.label ?? String(g.sn);
+
+export interface Item {
+  g: Group;
+  /** Rotation in degrees, counter-clockwise, 0 <= rot < 360 (any value, not only multiples of 90). */
+  rot: number;
+  x: number;
+  y: number;
+}
+
+export interface Sheet {
+  items: Item[];
+  th: number;
+  material: string;
+  used: number;
+  grid?: Uint8Array;
+  /** Actual physical sheet size, if trimmed down from the stock size (S.W / S.H) to
+   *  cut less material / scrap. Undefined = use the stock sheet size. */
+  W?: number;
+  H?: number;
+  /** One part that is as big as the whole sheet (it does not fit inside the edge margins, but fits the raw sheet).
+   *  Nothing else is on this sheet, so neither the edge margin nor the spacing applies: margin = 0. */
+  solo?: boolean;
+  /** Stock size of the sheet source this sheet was cut from (undefined = the default sheet S.W / S.H).
+   *  It is the upper limit when the sheet is trimmed; W / H hold the current (trimmed) size. */
+  stockW?: number;
+  stockH?: number;
+  /** Id of the SheetSource2D this sheet comes from (undefined = the default sheet). */
+  srcId?: number;
+}
+
+/** A sheet size you have in stock (or a leftover sheet), for one thickness and material. */
+export interface SheetSource2D {
+  id: number;
+  /** Plate thickness in mm; 0 = any thickness. */
+  th: number;
+  /** Material; "" = any material. */
+  material: string;
+  /** Sheet length (W) and width (H) in mm. */
+  W: number;
+  H: number;
+  /** How many sheets of this size there are; null = as many as needed. */
+  qty: number | null;
+}
+
+/** Edge margin that applies to this sheet: 0 for a part-sized (solo) sheet, the setting otherwise. */
+export const mgOf = (sh: Sheet, S: Settings): number => (sh.solo ? 0 : S.mg);
+
+/** The extent (max x, max y) reached by any part currently on the sheet. */
+export function sheetExtent(sh: Sheet): { w: number; h: number } {
+  let mx = 0;
+  let my = 0;
+  for (const it of sh.items) {
+    const b = bbox(sides(it).o);
+    mx = Math.max(mx, b[2]);
+    my = Math.max(my, b[3]);
+  }
+  return { w: mx, h: my };
+}
+
+/** Smallest physical size this sheet can be trimmed to without cutting into its parts. */
+export function minSheetSize(sh: Sheet, S: Settings): { w: number; h: number } {
+  const e = sheetExtent(sh);
+  const m = mgOf(sh, S);
+  return { w: Math.round(e.w + m), h: Math.round(e.h + m) };
+}
+
+/**
+ * Trims (or restores) a sheet's physical size, e.g. to cut a shorter/narrower
+ * plate for a partly-filled sheet and reduce scrap. Clamped between the
+ * minimum needed to hold its parts and the stock sheet size (S.W / S.H).
+ * Returns the size actually applied.
+ */
+export function resizeSheet(sh: Sheet, S: Settings, w: number, h: number): { w: number; h: number } {
+  const min = minSheetSize(sh, S);
+  const W = Math.min(sh.stockW ?? S.W, Math.max(min.w, Math.round(w)));
+  const H = Math.min(sh.stockH ?? S.H, Math.max(min.h, Math.round(h)));
+  sh.W = W;
+  sh.H = H;
+  return { w: W, h: H };
+}
+
+export type FitDirection = "width" | "height" | "both";
+
+/**
+ * Shrinks a sheet down to its parts in the chosen direction only: "width" trims W and keeps H as it is,
+ * "height" trims H and keeps W, "both" trims both. The margin is kept on the trimmed side(s).
+ * Returns the size actually applied.
+ */
+export function fitSheetToParts(sh: Sheet, S: Settings, dir: FitDirection): { w: number; h: number } {
+  const m = minSheetSize(sh, S);
+  const curW = sh.W ?? S.W;
+  const curH = sh.H ?? S.H;
+  return resizeSheet(sh, S, dir === "height" ? curW : m.w, dir === "width" ? curH : m.h);
+}
+
+export interface Settings {
+  W: number;
+  H: number;
+  mg: number;
+  gp: number;
+  cell: number;
+  ro: number;
+  x0: number;
+  GW: number;
+  GH: number;
+}
+
+export interface OptResult {
+  sheets: Sheet[];
+  un: Group[];
+  skip: string[];
+  /** True once the user has edited the nest by hand (empty sheets, parts taken from the list / put back).
+   *  `un` is then re-derived from the quantities instead of coming from the optimiser. */
+  manual?: boolean;
+  /** Why the parts in `un` were not nested, by part number, when the optimiser knows better than the generic reason
+   *  (e.g. "the sheet sources for 10 mm are used up"). */
+  unWhy?: Record<number, string>;
+}
+
+const TOL = 0.05;
+const dist = (a: Pt, b: Pt) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+// ---------------------------------------------------------------- DXF parsing
+
+function arcPts(cx: number, cy: number, r: number, a0: number, sw: number): Pt[] {
+  const n = Math.max(3, Math.ceil(Math.abs(sw) / (Math.PI / 36)));
+  const p: Pt[] = [];
+  for (let i = 0; i <= n; i++) {
+    const a = a0 + (sw * i) / n;
+    p.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  }
+  return p;
+}
+
+function bulge(p: number[], q: number[], b: number): Pt[] {
+  const th = 4 * Math.atan(b);
+  const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+  const s = (Math.abs(b) * d) / 2;
+  const r = (d * d / 4 + s * s) / (2 * s);
+  const nx = -(q[1] - p[1]) / d;
+  const ny = (q[0] - p[0]) / d;
+  const k = (r - s) * Math.sign(b);
+  const c: Pt = [(p[0] + q[0]) / 2 + nx * k, (p[1] + q[1]) / 2 + ny * k];
+  return arcPts(c[0], c[1], r, Math.atan2(p[1] - c[1], p[0] - c[0]), th).slice(1);
+}
+
+function verts2pts(v: number[][], closed: boolean): Pt[] {
+  const o: Pt[] = [[v[0][0], v[0][1]]];
+  const n = v.length;
+  const m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const p = v[i];
+    const q = v[(i + 1) % n];
+    if (p[2]) o.push(...bulge(p, q, p[2]));
+    else o.push([q[0], q[1]]);
+  }
+  return o;
+}
+
+interface Ent {
+  t: string;
+  d: [number, string][];
+  v: Ent[];
+}
+
+function chain(paths: Pt[][], dropped?: Pt[][]): Pt[][] {
+  const loops: Pt[][] = [];
+  while (paths.length) {
+    let cur = paths.pop() as Pt[];
+    let go = true;
+    while (go) {
+      go = false;
+      if (cur.length > 2 && dist(cur[0], cur[cur.length - 1]) < TOL) break;
+      for (let i = 0; i < paths.length; i++) {
+        const p = paths[i];
+        const a = cur[0];
+        const b = cur[cur.length - 1];
+        if (dist(b, p[0]) < TOL) cur = cur.concat(p.slice(1));
+        else if (dist(b, p[p.length - 1]) < TOL) cur = cur.concat(p.slice(0, -1).reverse());
+        else if (dist(a, p[p.length - 1]) < TOL) cur = p.slice(0, -1).concat(cur);
+        else if (dist(a, p[0]) < TOL) cur = p.slice(1).reverse().concat(cur);
+        else continue;
+        paths.splice(i, 1);
+        go = true;
+        break;
+      }
+    }
+    if (cur.length > 3 && dist(cur[0], cur[cur.length - 1]) < TOL) {
+      cur.pop();
+      loops.push(cur);
+    } else if (cur.length > 2) dropped?.push(cur);
+  }
+  return loops;
+}
+
+/**
+ * Clean-up of the loose LINE / ARC / open-polyline pieces BEFORE they are chained into contours
+ * (what people otherwise do by hand with OVERKILL / TRIM in AutoCAD):
+ *   1. every piece is cut where another one ends on it or crosses it (T-junctions, lines that run
+ *      past a corner = "tails"),
+ *   2. pieces that now coincide (duplicate / partly overlapping lines) collapse into one,
+ *   3. dangling pieces (a whisker hanging off a corner) are removed, again and again.
+ * What is left goes to `chain`. A group of pieces that disappears completely (an open shape such as
+ * a "U") is returned in `lost`, so it is still reported as "could not be closed".
+ */
+function tidyOpenPaths(paths: Pt[][]): { paths: Pt[][]; lost: Pt[][] } {
+  let segs: [Pt, Pt][] = [];
+  for (const p of paths) for (let i = 0; i + 1 < p.length; i++) if (dist(p[i], p[i + 1]) > 1e-9) segs.push([p[i], p[i + 1]]);
+  if (!segs.length || segs.length > 200000) return { paths, lost: [] };
+
+  // ---- uniform grids (segments, and their end points) so the cutting test is not O(n²)
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [a, b] of segs) {
+    x0 = Math.min(x0, a[0], b[0]); y0 = Math.min(y0, a[1], b[1]);
+    x1 = Math.max(x1, a[0], b[0]); y1 = Math.max(y1, a[1], b[1]);
+  }
+  // TOL is in drawing units; for a drawing in metres 0.05 would swallow a whole 5 cm part, so the
+  // clean-up tolerance never exceeds 0.1 % of the drawing size.
+  const tol = Math.min(TOL, 1e-3 * Math.hypot(x1 - x0, y1 - y0));
+  segs = segs.filter(([a, b]) => dist(a, b) > tol);
+  if (!segs.length) return { paths, lost: [] };
+  const cell = Math.max(tol * 4, Math.hypot(x1 - x0, y1 - y0) / 200);
+  const ci = (v: number, o: number) => Math.floor((v - o) / cell);
+  const key = (ix: number, iy: number) => (ix + 2) * 1024 + (iy + 2);
+  const segGrid = new Map<number, number[]>();
+  const ptGrid = new Map<number, Pt[]>();
+  const push = <T,>(m: Map<number, T[]>, k: number, v: T) => { const a = m.get(k); if (a) a.push(v); else m.set(k, [v]); };
+  segs.forEach(([a, b], i) => {
+    for (let ix = ci(Math.min(a[0], b[0]) - tol, x0); ix <= ci(Math.max(a[0], b[0]) + tol, x0); ix++)
+      for (let iy = ci(Math.min(a[1], b[1]) - tol, y0); iy <= ci(Math.max(a[1], b[1]) + tol, y0); iy++) push(segGrid, key(ix, iy), i);
+    push(ptGrid, key(ci(a[0], x0), ci(a[1], y0)), a);
+    push(ptGrid, key(ci(b[0], x0), ci(b[1], y0)), b);
+  });
+
+  // ---- 1. cut every segment at junctions / crossings
+  const pieces: [Pt, Pt][] = [];
+  const seen = new Int32Array(segs.length);
+  segs.forEach(([a, b], i) => {
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const len = Math.hypot(dx, dy), len2 = len * len;
+    const cuts: { t: number; p: Pt }[] = [];
+    const add = (t: number, p: Pt) => { if (t * len > tol && (1 - t) * len > tol) cuts.push({ t, p }); };
+    const gx0 = ci(Math.min(a[0], b[0]) - tol, x0), gx1 = ci(Math.max(a[0], b[0]) + tol, x0);
+    const gy0 = ci(Math.min(a[1], b[1]) - tol, y0), gy1 = ci(Math.max(a[1], b[1]) + tol, y0);
+    for (let ix = gx0; ix <= gx1; ix++)
+      for (let iy = gy0; iy <= gy1; iy++) {
+        for (const q of ptGrid.get(key(ix, iy)) ?? []) {
+          const t = ((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / len2;
+          if (t <= 0 || t >= 1) continue;
+          if (Math.hypot(q[0] - (a[0] + t * dx), q[1] - (a[1] + t * dy)) <= tol) add(t, q);
+        }
+        for (const j of segGrid.get(key(ix, iy)) ?? []) {
+          if (j === i || seen[j] === i + 1) continue;
+          seen[j] = i + 1;
+          const [c, d] = segs[j];
+          const ex = d[0] - c[0], ey = d[1] - c[1];
+          const lj = Math.hypot(ex, ey);
+          const den = dx * ey - dy * ex;
+          if (Math.abs(den) < 1e-12 * len * lj) continue; // parallel / collinear: handled by the end-point test
+          const t = ((c[0] - a[0]) * ey - (c[1] - a[1]) * ex) / den;
+          const u = ((c[0] - a[0]) * dy - (c[1] - a[1]) * dx) / den;
+          if (u >= -tol / lj && u <= 1 + tol / lj) add(t, [a[0] + t * dx, a[1] + t * dy]);
+        }
+      }
+    if (!cuts.length) { pieces.push([a, b]); return; }
+    cuts.sort((m, n) => m.t - n.t);
+    let prev = a, prevT = 0;
+    for (const c of cuts) {
+      if ((c.t - prevT) * len <= tol) continue; // the same cut found twice
+      pieces.push([prev, c.p]);
+      prev = c.p;
+      prevT = c.t;
+    }
+    pieces.push([prev, b]);
+  });
+
+  // ---- 2. merge nearby end points into nodes, collapse duplicate pieces
+  const nodes: Pt[] = [];
+  const byCell = new Map<number, number[]>();
+  const nodeOf = (p: Pt): number => {
+    const ix = ci(p[0], x0), iy = ci(p[1], y0);
+    for (let u = ix - 1; u <= ix + 1; u++)
+      for (let v = iy - 1; v <= iy + 1; v++)
+        for (const id of byCell.get(key(u, v)) ?? []) if (dist(nodes[id], p) <= tol) return id;
+    nodes.push(p);
+    push(byCell, key(ix, iy), nodes.length - 1);
+    return nodes.length - 1;
+  };
+  const edgeKeys = new Set<string>();
+  const edges: { a: number; b: number }[] = [];
+  for (const [p, q] of pieces) {
+    const a = nodeOf(p), b = nodeOf(q);
+    if (a === b) continue;
+    const k = a < b ? `${a}-${b}` : `${b}-${a}`;
+    if (edgeKeys.has(k)) continue;
+    edgeKeys.add(k);
+    edges.push({ a, b });
+  }
+
+  // ---- 3. prune dangling pieces
+  const alive = edges.map(() => true);
+  const inc: number[][] = nodes.map(() => []);
+  edges.forEach((e, id) => { inc[e.a].push(id); inc[e.b].push(id); });
+  const deg = inc.map((l) => l.length);
+  const stack: number[] = [];
+  deg.forEach((d, n) => { if (d === 1) stack.push(n); });
+  while (stack.length) {
+    const n = stack.pop() as number;
+    if (deg[n] !== 1) continue;
+    const id = inc[n].find((e) => alive[e]);
+    if (id === undefined) continue;
+    alive[id] = false;
+    deg[n] = 0;
+    const o = edges[id].a === n ? edges[id].b : edges[id].a;
+    if (--deg[o] === 1) stack.push(o);
+  }
+
+  // pruned pieces that took a WHOLE shape with them (nothing of it survives) are reported as unclosed
+  const lost: Pt[][] = [];
+  const parent = nodes.map((_, i) => i);
+  const find = (n: number): number => (parent[n] === n ? n : (parent[n] = find(parent[n])));
+  edges.forEach((e, id) => { if (!alive[id]) parent[find(e.a)] = find(e.b); });
+  const comps = new Map<number, { pts: Pt[]; attached: boolean }>();
+  edges.forEach((e, id) => {
+    if (alive[id]) return;
+    const r = find(e.a);
+    const c = comps.get(r) ?? { pts: [], attached: false };
+    c.pts.push(nodes[e.a], nodes[e.b]);
+    if (deg[e.a] > 0 || deg[e.b] > 0) c.attached = true; // hangs off a surviving shape: just a tail
+    comps.set(r, c);
+  });
+  for (const c of comps.values()) if (!c.attached && c.pts.length > 2) lost.push(c.pts);
+
+  // ---- rebuild polylines (a run of degree-2 nodes = one path; a pure cycle comes out closed)
+  const adj: number[][] = nodes.map(() => []);
+  edges.forEach((e, id) => { if (alive[id]) { adj[e.a].push(id); adj[e.b].push(id); } });
+  const used = edges.map(() => false);
+  const out: Pt[][] = [];
+  const walk = (start: number, first: number): Pt[] => {
+    const pts: Pt[] = [nodes[start]];
+    let cur = start, eid = first;
+    for (;;) {
+      used[eid] = true;
+      cur = edges[eid].a === cur ? edges[eid].b : edges[eid].a;
+      pts.push(nodes[cur]);
+      if (cur === start || adj[cur].length !== 2) break;
+      const next = adj[cur].find((id) => !used[id]);
+      if (next === undefined) break;
+      eid = next;
+    }
+    return pts;
+  };
+  nodes.forEach((_, n) => {
+    if (adj[n].length === 2 || !adj[n].length) return;
+    for (const id of adj[n]) if (!used[id]) out.push(walk(n, id));
+  });
+  edges.forEach((e, id) => { if (alive[id] && !used[id]) out.push(walk(e.a, id)); });
+  return { paths: out, lost };
+}
+
+/** Groups the pieces that could not be closed into loops by where they lie (overlapping boxes = one shape). */
+function groupUnclosed(chains: Pt[][]): { x: number; y: number }[] {
+  const boxes = chains.map((c) => {
+    const xs = c.map((p) => p[0]);
+    const ys = c.map((p) => p[1]);
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  });
+  let merged = true;
+  while (merged) {
+    merged = false;
+    for (let i = 0; i < boxes.length && !merged; i++)
+      for (let j = i + 1; j < boxes.length && !merged; j++) {
+        const a = boxes[i];
+        const b = boxes[j];
+        if (a[0] <= b[2] + TOL && b[0] <= a[2] + TOL && a[1] <= b[3] + TOL && b[1] <= a[3] + TOL) {
+          boxes[i] = [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
+          boxes.splice(j, 1);
+          merged = true;
+        }
+      }
+  }
+  return boxes.map((b) => ({ x: (b[0] + b[2]) / 2, y: (b[1] + b[3]) / 2 }));
+}
+
+/** A "QTY: 2 / thk: 10" note drawn in the DXF above a group of parts (x, y in drawing units). */
+export interface DxfLabel {
+  x: number;
+  y: number;
+  qty?: number;
+  th?: number;
+}
+
+/** Plain text of a TEXT / MTEXT entity (MTEXT formatting codes removed, line breaks kept as \n). */
+function entText(e: { d: [number, string][] }): string {
+  const parts = e.d.filter((a) => a[0] === 3).map((a) => a[1]);
+  const last = e.d.filter((a) => a[0] === 1).map((a) => a[1]);
+  return parts
+    .concat(last)
+    .join("")
+    .replace(/\\P/gi, "\n")
+    .replace(/\\~/g, " ")
+    .replace(/\\[A-Za-z][^;\\]*;/g, "")
+    .replace(/\\\\/g, "\\")
+    .replace(/[{}]/g, "")
+    .replace(/%%[uUoOkK]/g, "");
+}
+
+const QTY_RE = /\b(?:qty|quantity)\b\s*[:=]?\s*(\d+)/i;
+const TH_RE = /\b(?:thk|thick(?:ness)?)\b\s*[:=]?\s*(\d+(?:[.,]\d+)?)/i;
+
+/** Reads the "QTY: n" / "thk: t" notes out of the TEXT and MTEXT entities (a note may be one text or two nearby ones). */
+function readLabels(texts: { x: number; y: number; h: number; text: string }[]): DxfLabel[] {
+  const toks = texts
+    .map((t) => {
+      const q = t.text.match(QTY_RE);
+      const k = t.text.match(TH_RE);
+      return { x: t.x, y: t.y, h: t.h, qty: q ? +q[1] : undefined, th: k ? +k[1].replace(",", ".") : undefined };
+    })
+    .filter((t) => t.qty !== undefined || t.th !== undefined);
+  const out: DxfLabel[] = toks.filter((t) => t.qty !== undefined && t.th !== undefined).map((t) => ({ x: t.x, y: t.y, qty: t.qty, th: t.th }));
+  // a quantity and a thickness written as two separate texts: pair each with the closest partner
+  const qs = toks.filter((t) => t.qty !== undefined && t.th === undefined);
+  const ks = toks.filter((t) => t.th !== undefined && t.qty === undefined);
+  const used = new Set<(typeof ks)[number]>();
+  for (const q of qs) {
+    let best: (typeof ks)[number] | null = null;
+    let bd = Infinity;
+    for (const k of ks) {
+      if (used.has(k)) continue;
+      const d = Math.hypot(k.x - q.x, k.y - q.y);
+      if (d < bd) {
+        bd = d;
+        best = k;
+      }
+    }
+    const reach = 8 * Math.max(q.h, best?.h ?? 0, 1e-9);
+    if (best && bd <= reach) {
+      used.add(best);
+      out.push({ x: (q.x + best.x) / 2, y: Math.max(q.y, best.y), qty: q.qty, th: best.th });
+    } else out.push({ x: q.x, y: q.y, qty: q.qty });
+  }
+  for (const k of ks) if (!used.has(k)) out.push({ x: k.x, y: k.y, th: k.th });
+  return out;
+}
+
+export function parseDXF(text: string): {
+  loops: Pt[][];
+  skip: string[];
+  labels: DxfLabel[];
+  /** Shapes whose lines could not be closed into a contour (duplicate / overlapping lines, gaps) — they are NOT imported. Positions in drawing units. */
+  unclosed: { x: number; y: number }[];
+} {
+  const L = text.split(/\r?\n/);
+  const E: Ent[] = [];
+  let cur: Ent | null = null;
+  let ent = false;
+  let sec = false;
+  let poly: Ent | null = null;
+  for (let i = 0; i + 1 < L.length; i += 2) {
+    const c = +L[i].trim();
+    const v = L[i + 1].trim();
+    if (c === 0) {
+      cur = null;
+      if (v === "SECTION") sec = true;
+      else if (v === "ENDSEC") ent = false;
+      else if (ent) {
+        if (v === "VERTEX" && poly) {
+          cur = { t: "V", d: [], v: [] };
+          poly.v.push(cur);
+        } else if (v === "SEQEND") poly = null;
+        else {
+          cur = { t: v, d: [], v: [] };
+          E.push(cur);
+          if (v === "POLYLINE") poly = cur;
+        }
+      }
+    } else if (c === 2 && sec) {
+      ent = v === "ENTITIES";
+      sec = false;
+    } else if (cur) cur.d.push([c, v]);
+  }
+
+  const loops: Pt[][] = [];
+  const open: Pt[][] = [];
+  const skip: Record<string, number> = {};
+  const texts: { x: number; y: number; h: number; text: string }[] = [];
+  const g = (e: Ent, c: number) => {
+    const x = e.d.find((a) => a[0] === c);
+    return x ? +x[1] : 0;
+  };
+  const all = (e: Ent, c: number) => e.d.filter((a) => a[0] === c).map((a) => +a[1]);
+
+  for (const e of E) {
+    let p: Pt[] | null = null;
+    let cl = false;
+    if (e.t === "TEXT" || e.t === "MTEXT") {
+      // TEXT with an alignment (center / right / ...) is positioned by its second point (11, 21)
+      const aligned = e.t === "TEXT" && (g(e, 72) !== 0 || g(e, 73) !== 0) && e.d.some((a) => a[0] === 11);
+      texts.push({ x: aligned ? g(e, 11) : g(e, 10), y: aligned ? g(e, 21) : g(e, 20), h: g(e, 40), text: entText(e) });
+    }
+    if (e.t === "LINE") p = [[g(e, 10), g(e, 20)], [g(e, 11), g(e, 21)]];
+    else if (e.t === "CIRCLE") {
+      p = arcPts(g(e, 10), g(e, 20), g(e, 40), 0, 2 * Math.PI);
+      p.pop();
+      cl = true;
+    } else if (e.t === "ARC") {
+      const a0 = (g(e, 50) * Math.PI) / 180;
+      let a1 = (g(e, 51) * Math.PI) / 180;
+      if (a1 <= a0) a1 += 2 * Math.PI;
+      p = arcPts(g(e, 10), g(e, 20), g(e, 40), a0, a1 - a0);
+    } else if (e.t === "LWPOLYLINE") {
+      const v: number[][] = [];
+      for (const [c, x] of e.d) {
+        if (c === 10) v.push([+x, 0, 0]);
+        else if (c === 20 && v.length) v[v.length - 1][1] = +x;
+        else if (c === 42 && v.length) v[v.length - 1][2] = +x;
+      }
+      if (v.length > 1) {
+        cl = (g(e, 70) & 1) === 1;
+        p = verts2pts(v, cl);
+        if (cl) p.pop();
+      }
+    } else if (e.t === "POLYLINE") {
+      const v = e.v.map((q) => [g(q, 10), g(q, 20), g(q, 42)]);
+      if (v.length > 1) {
+        cl = (g(e, 70) & 1) === 1;
+        p = verts2pts(v, cl);
+        if (cl) p.pop();
+      }
+    } else if (e.t === "SPLINE") {
+      const xs = all(e, 11);
+      const ys = all(e, 21);
+      const a = xs.length ? [xs, ys] : [all(e, 10), all(e, 20)];
+      p = a[0].map((x, i) => [x, a[1][i]] as Pt);
+      skip.SPLINE = 1;
+    } else if (!["POINT", "TEXT", "MTEXT", "DIMENSION", "HATCH", "SOLID"].includes(e.t)) skip[e.t] = 1;
+    if (p && p.length > 1) (cl ? loops : open).push(p);
+  }
+  const dropped: Pt[][] = [];
+  const tidy = tidyOpenPaths(open);
+  dropped.push(...tidy.lost);
+  const chained = chain(tidy.paths, dropped);
+  return { loops: loops.concat(chained), skip: Object.keys(skip), labels: readLabels(texts), unclosed: groupUnclosed(dropped) };
+}
+
+// ------------------------------------------------------------ geometry helpers
+
+const area = (p: Pt[]) => {
+  let s = 0;
+  for (let i = 0; i < p.length; i++) {
+    const q = p[(i + 1) % p.length];
+    s += p[i][0] * q[1] - q[0] * p[i][1];
+  }
+  return s / 2;
+};
+const per = (p: Pt[]) => p.reduce((s, q, i) => s + dist(q, p[(i + 1) % p.length]), 0);
+
+function inside(pt: Pt, poly: Pt[]) {
+  let c = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i];
+    const b = poly[j];
+    if (a[1] > pt[1] !== b[1] > pt[1] && pt[0] < ((b[0] - a[0]) * (pt[1] - a[1])) / (b[1] - a[1]) + a[0]) c = !c;
+  }
+  return c;
+}
+
+interface RawPart {
+  /** Where the part sat in the drawing before it was moved to 0,0: [minX, minY, maxX, maxY] (scaled). */
+  box: [number, number, number, number];
+  outer: Pt[];
+  holes: Pt[][];
+  w: number;
+  h: number;
+  area: number;
+  per: number;
+}
+
+interface Loop {
+  pts: Pt[];
+  a: number;
+  d: number;
+  par: number;
+  part?: RawPart;
+}
+
+/** Plate thickness from a file name such as "PL20mm.dxf" or "plate 5 mm.dxf". */
+export function thicknessFromName(name: string): number {
+  const tm = name.match(/(\d+(?:[.,]\d+)?)[\s_]*mm/i);
+  return tm ? +tm[1].replace(",", ".") : 0;
+}
+
+function extractParts(loops: Pt[][], sc: number, contains: (outer: Pt[], inner: Pt[]) => boolean = (o, i) => inside(i[0], o)): RawPart[] {
+  const L: Loop[] = loops
+    .map((l) => {
+      const pts = l.map((p) => [p[0] * sc, p[1] * sc] as Pt);
+      return { pts, a: Math.abs(area(pts)), d: 0, par: -1 };
+    })
+    .filter((l) => l.a > 1)
+    .sort((x, y) => y.a - x.a);
+  L.forEach((l, i) => {
+    for (let j = 0; j < i; j++)
+      if (contains(L[j].pts, l.pts)) {
+        l.d++;
+        l.par = j;
+      }
+  });
+  const parts: RawPart[] = [];
+  L.forEach((l) => {
+    if (l.d % 2 === 0) {
+      const part: RawPart = { box: [0, 0, 0, 0], outer: l.pts, holes: [], w: 0, h: 0, area: 0, per: 0 };
+      parts.push(part);
+      l.part = part;
+    }
+  });
+  L.forEach((l) => {
+    if (l.d % 2 === 1) L[l.par].part?.holes.push(l.pts);
+  });
+  for (const p of parts) {
+    const xs = p.outer.map((q) => q[0]);
+    const ys = p.outer.map((q) => q[1]);
+    const mx = Math.min(...xs);
+    const my = Math.min(...ys);
+    p.box = [mx, my, Math.max(...xs), Math.max(...ys)];
+    const mv = (r: Pt[]) => r.map((q) => [q[0] - mx, q[1] - my] as Pt);
+    p.outer = mv(p.outer);
+    p.holes = p.holes.map(mv);
+    p.w = Math.max(...xs) - mx;
+    p.h = Math.max(...ys) - my;
+    p.area = Math.abs(area(p.outer)) - p.holes.reduce((s, h) => s + Math.abs(area(h)), 0);
+    p.per = per(p.outer) + p.holes.reduce((s, h) => s + per(h), 0);
+  }
+  return parts;
+}
+
+export interface Counters {
+  id: number;
+  sn: number;
+}
+
+/**
+ * Splits one DXF's contours into parts and merges them into `groups`
+ * (identical parts share one row with a higher quantity). Returns the new
+ * array and how many parts were found.
+ */
+export function addFileParts(
+  groups: Group[],
+  loops: Pt[][],
+  name: string,
+  scale: number,
+  counters: Counters,
+  /** Override the thickness / material / per-contour quantity (used when importing from Part List). */
+  opts: { th?: number; material?: string; qty?: number; labels?: DxfLabel[] } = {},
+): { groups: Group[]; count: number; labelled: number } {
+  const fileTh = opts.th && opts.th > 0 ? opts.th : thicknessFromName(name);
+  const material = (opts.material ?? "").trim();
+  const addAll = Math.max(1, Math.round(opts.qty ?? 1));
+  const out = groups.slice();
+  const parts = extractParts(loops, scale);
+  let labelled = 0;
+  for (const p of parts) {
+    // the "QTY / thk" note belonging to this part (the closest note above it); it wins over the file name
+    const lb = opts.th && opts.th > 0 ? null : labelFor(p.box, opts.labels ?? [], scale);
+    if (lb) labelled++;
+    const th = lb?.th && lb.th > 0 ? lb.th : fileTh;
+    const add = lb?.qty && lb.qty > 0 ? Math.round(lb.qty) * (opts.qty ? addAll : 1) : addAll;
+    const m = out.find(
+      (g) =>
+        !g.seg &&
+        g.th === th &&
+        g.material === material &&
+        g.holes.length === p.holes.length &&
+        Math.abs(g.area - p.area) <= g.area * 0.002 + 0.5 &&
+        Math.abs(g.per - p.per) <= g.per * 0.005 + 0.5 &&
+        Math.abs(Math.max(g.w, g.h) - Math.max(p.w, p.h)) < 0.3,
+    );
+    if (m) out[out.indexOf(m)] = { ...m, qty: m.qty + add };
+    else out.push({ ...p, id: counters.id++, sn: ++counters.sn, name, qty: add, th, material });
+  }
+  return { groups: out, count: parts.length, labelled };
+}
+
+/**
+ * After the user edits the thickness / material of freshly imported rows, two rows may end up being the same part
+ * (same shape, thickness and material). Folds every row in `ids` into an earlier identical row (its quantity goes up)
+ * so the list never shows the same part twice. Returns the new array and, for each folded row, the id it went into.
+ */
+export function mergeDuplicateGroups(groups: Group[], ids: Set<number>): { groups: Group[]; merged: Map<number, number> } {
+  const out = groups.slice();
+  const merged = new Map<number, number>();
+  for (const id of ids) {
+    const i = out.findIndex((g) => g.id === id);
+    if (i < 0) continue;
+    const g = out[i];
+    if (g.seg) continue;
+    const j = out.findIndex(
+      (m, k) =>
+        k < i &&
+        !m.seg &&
+        m.th === g.th &&
+        m.material === g.material &&
+        m.holes.length === g.holes.length &&
+        Math.abs(m.area - g.area) <= m.area * 0.002 + 0.5 &&
+        Math.abs(m.per - g.per) <= m.per * 0.005 + 0.5 &&
+        Math.abs(Math.max(m.w, m.h) - Math.max(g.w, g.h)) < 0.3,
+    );
+    if (j < 0) continue;
+    out[j] = { ...out[j], qty: out[j].qty + g.qty };
+    out.splice(i, 1);
+    merged.set(g.id, out[j].id);
+  }
+  return { groups: out, merged };
+}
+
+// ------------------------------------------------------- parts typed in by hand (no DXF)
+
+/** A part described by its dimensions (mm). `hole` = diameter of one round hole in the middle (omit / 0 = solid part). */
+export type ManualShape =
+  | { kind: "rect"; w: number; h: number; hole?: number }
+  /** Two sides (a along the bottom, b at `angle` degrees from it) and the angle between them. The hole sits at the incircle centre. */
+  | { kind: "triangle"; a: number; b: number; angle: number; hole?: number }
+  | { kind: "circle"; d: number; hole?: number }
+  /** Bottom base `a`, top base `b` and the height between them. `right`: one side stands at 90° (right trapezoid); otherwise both sides lean equally (symmetric). */
+  | { kind: "trapezoid"; a: number; b: number; h: number; right?: boolean; hole?: number }
+  /**
+   * A cone (or truncated cone) given by its bottom diameter `d1`, top diameter `d2` (0 = a pointed cone) and the vertical
+   * height `h`. The part is the FLAT PATTERN (the cone unrolled): a circle sector, or a ring sector when `d2` > 0.
+   */
+  | { kind: "cone"; d1: number; d2: number; h: number; hole?: number }
+  /**
+   * A cylinder (pipe / shell) given by its diameter `d` and its height `h`. The part is the FLAT PATTERN (the cylinder
+   * unrolled): a rectangle π·d long and `h` wide. Type the mean (neutral-line) diameter when the thickness matters.
+   */
+  | { kind: "cylinder"; d: number; h: number; hole?: number }
+  /**
+   * A curved strip (a ring sector) like a bent flat bar: `r` = radius of the INNER edge (0 = a pie slice), `w` = width of
+   * the strip measured along the radius and `angle` = how many degrees of the ring it covers. The ends are cut along the radius.
+   */
+  | { kind: "arc"; r: number; w: number; angle: number; hole?: number }
+  /**
+   * A PART of a cylinder (a rolled plate): radius `r`, height `h` and how much of the circle it covers, given as the
+   * `angle` (°), the `arc` length or the `chord` (`by`, with the number in `v`). The part is the FLAT PATTERN: a rectangle
+   * (arc length) × h. Type the mean (neutral-line) radius when the thickness matters.
+   * `h2` (optional) = the piece is CUT OFF at a slant: `h` is the height at the left end, `h2` at the right end, so the flat
+   * pattern is a right trapezoid. With `by: "slope"`, `v` is the angle (°) of the slanted edge in the flat pattern and the
+   * length follows from the two heights: (h2 − h) / tan(v).
+   */
+  | { kind: "cylpart"; r: number; h: number; h2?: number; by: "angle" | "arc" | "chord" | "slope"; v: number; hole?: number };
+
+export interface ManualGeometry {
+  outer: Pt[];
+  holes: Pt[][];
+  w: number;
+  h: number;
+  area: number;
+  per: number;
+}
+
+/**
+ * Polygon for a circle: the chord never strays more than 0.05 mm from the true arc (at least 72 segments, like an imported
+ * DXF circle). The number of segments is a multiple of 4, so the points at 0°, 90°, 180° and 270° exist and a Ø400 circle
+ * measures exactly 400 mm across.
+ */
+function circlePts(cx: number, cy: number, r: number): Pt[] {
+  const n = Math.ceil(Math.min(720, Math.max(72, Math.ceil(Math.PI / Math.acos(Math.max(0, 1 - 0.05 / r))))) / 4) * 4;
+  const p: Pt[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = (2 * Math.PI * i) / n;
+    p.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  }
+  return p;
+}
+
+const fmtMm = (n: number) => String(Math.round(n * 100) / 100);
+
+/** Points on an arc of radius `r` around 0,0 from angle `a0` to `a1` (radians, both ends included); the chord stays within 0.05 mm of the true arc. */
+function coneArcPts(r: number, a0: number, a1: number): Pt[] {
+  const step = 2 * Math.acos(Math.max(-1, Math.min(1, 1 - 0.05 / Math.max(r, 0.05))));
+  const n = Math.min(2000, Math.max(8, Math.ceil(Math.abs(a1 - a0) / Math.max(step, 1e-4))));
+  const p: Pt[] = [];
+  for (let i = 0; i <= n; i++) {
+    const a = a0 + ((a1 - a0) * i) / n;
+    p.push([r * Math.cos(a), r * Math.sin(a)]);
+  }
+  return p;
+}
+
+/**
+ * Unrolling a cone: `slant` = length of the cone's side, `R` / `r` = outer / inner radius of the flat pattern
+ * (r = 0 for a pointed cone) and `angle` = the opening of the pattern in degrees (360° would be a full circle).
+ */
+export function coneFlat(d1: number, d2: number, h: number): { slant: number; R: number; r: number; angle: number } | { error: string } {
+  if (!(Number.isFinite(d1) && d1 > 0)) return { error: "Enter the bottom diameter (greater than 0)." };
+  if (!(Number.isFinite(d2) && d2 >= 0)) return { error: "The top diameter cannot be negative (leave it empty or 0 for a pointed cone)." };
+  if (!(Number.isFinite(h) && h > 0)) return { error: "Enter the height (greater than 0)." };
+  if (d2 >= d1) return { error: "The top diameter must be smaller than the bottom diameter." };
+  const dr = (d1 - d2) / 2; // how much the radius shrinks over the height
+  const slant = Math.hypot(h, dr);
+  const R = (slant * d1) / (d1 - d2); // slant length from the apex down to the bottom edge
+  const r = R - slant; // ... down to the top edge
+  const angle = (180 * d1) / R; // = 360 · (d1/2) / R
+  return { slant, R, r, angle };
+}
+
+/** What a piece of a cylinder measures: opening angle (°), arc length, chord and rise (sagitta); or a message. */
+export function cylPartInfo(
+  r: number,
+  by: "angle" | "arc" | "chord",
+  v: number,
+): { angle: number; arc: number; chord: number; rise: number } | { error: string } {
+  if (!(Number.isFinite(r) && r > 0)) return { error: "Enter the radius (greater than 0)." };
+  if (!(Number.isFinite(v) && v > 0)) return { error: by === "angle" ? "Enter the angle (greater than 0)." : by === "arc" ? "Enter the arc length (greater than 0)." : "Enter the chord length (greater than 0)." };
+  let t: number; // radians
+  if (by === "angle") t = (v * Math.PI) / 180;
+  else if (by === "arc") t = v / r;
+  else {
+    if (v > 2 * r + 1e-9) return { error: `The chord cannot be longer than the diameter (${fmtMm(2 * r)} mm).` };
+    t = 2 * Math.asin(Math.min(1, v / (2 * r)));
+  }
+  if (!(t > 0 && t < 2 * Math.PI)) return { error: "The piece must cover less than a full circle (angle under 360°)." };
+  return { angle: (t * 180) / Math.PI, arc: r * t, chord: 2 * r * Math.sin(t / 2), rise: r * (1 - Math.cos(t / 2)) };
+}
+
+/** Flat length of a (cut) piece of cylinder, plus what the piece measures; or a message. */
+export function cylPartFlat(s: Extract<ManualShape, { kind: "cylpart" }>): { len: number; info: NonNullable<ReturnType<typeof okInfo>> } | { error: string } {
+  const cut = s.h2 !== undefined && !(Number.isNaN(s.h2));
+  if (s.by === "slope") {
+    if (!cut) return { error: "Enter the height at the other end." };
+    if (!(Number.isFinite(s.v) && s.v > 0 && s.v < 90)) return { error: "The cut angle must be between 0° and 90°." };
+    const dh = Math.abs((s.h2 as number) - s.h);
+    if (!(dh > 0)) return { error: "The two heights must be different for a slanted cut." };
+    const f = cylPartInfo(s.r, "arc", dh / Math.tan((s.v * Math.PI) / 180));
+    return "error" in f ? f : { len: f.arc, info: f };
+  }
+  const f = cylPartInfo(s.r, s.by, s.v);
+  return "error" in f ? f : { len: f.arc, info: f };
+}
+const okInfo = (x: ReturnType<typeof cylPartInfo>) => ("error" in x ? null : x);
+
+/** Outline (+ hole) of a typed-in part, moved to 0,0 like every other part; or a message saying what is wrong with the numbers. */
+export function buildManualShape(s: ManualShape): ManualGeometry | { error: string } {
+  const ok = (n: number | undefined) => typeof n === "number" && Number.isFinite(n) && n > 0;
+  const hole = s.hole && s.hole > 0 ? s.hole : 0;
+  if (s.hole !== undefined && s.hole !== 0 && !Number.isFinite(s.hole)) return { error: "Hole diameter is not a number." };
+  if (s.hole !== undefined && s.hole < 0) return { error: "Hole diameter cannot be negative." };
+  let outer: Pt[];
+  let hc: Pt = [0, 0];
+  let maxHole: number;
+  if (s.kind === "cylpart") {
+    if (hole) return { error: "A cylinder part has no hole option — untick the hole." };
+    if (!ok(s.h)) return { error: "Enter the height (greater than 0)." };
+    const f = cylPartFlat(s);
+    if ("error" in f) return f;
+    if (s.h2 === undefined || Number.isNaN(s.h2)) return buildManualShape({ kind: "rect", w: f.len, h: s.h });
+    if (!ok(s.h2)) return { error: "Enter the height at the other end (greater than 0)." };
+    const outer: Pt[] = [[0, 0], [f.len, 0], [f.len, s.h2], [0, s.h]];
+    if (Math.abs(area(outer)) < 1) return { error: "This piece is too thin / too small." };
+    return { outer, holes: [], w: f.len, h: Math.max(s.h, s.h2), area: Math.abs(area(outer)), per: per(outer) };
+  } else if (s.kind === "cylinder") {
+    if (hole) return { error: "A cylinder has no hole option — untick the hole." };
+    if (!ok(s.d) || !ok(s.h)) return { error: "Enter the diameter and the height (greater than 0)." };
+    return buildManualShape({ kind: "rect", w: Math.PI * s.d, h: s.h });
+  } else if (s.kind === "arc") {
+    if (hole) return { error: "An arc has no hole option — untick the hole." };
+    if (!(Number.isFinite(s.r) && s.r >= 0)) return { error: "The inner radius cannot be negative (0 = a pie slice)." };
+    if (!ok(s.w)) return { error: "Enter the width of the strip (greater than 0)." };
+    if (!(Number.isFinite(s.angle) && s.angle > 0 && s.angle < 360)) return { error: "The arc angle must be between 0° and 360°." };
+    const half = (s.angle * Math.PI) / 360;
+    const mid = Math.PI / 2; // the strip arches upwards, like a bent bar
+    const outerArc = coneArcPts(s.r + s.w, mid - half, mid + half);
+    const innerArc = s.r > 1e-6 ? coneArcPts(s.r, mid + half, mid - half) : [[0, 0] as Pt];
+    const raw = [...outerArc, ...innerArc];
+    const x0 = Math.min(...raw.map((q) => q[0]));
+    const y0 = Math.min(...raw.map((q) => q[1]));
+    const arc = raw.map((q) => [q[0] - x0, q[1] - y0] as Pt);
+    if (Math.abs(area(arc)) < 1) return { error: "This arc is too thin / too small." };
+    const axs = arc.map((q) => q[0]);
+    const ays = arc.map((q) => q[1]);
+    return {
+      outer: arc,
+      holes: [],
+      w: Math.max(...axs) - Math.min(...axs),
+      h: Math.max(...ays) - Math.min(...ays),
+      area: Math.abs(area(arc)),
+      per: per(arc),
+    };
+  } else if (s.kind === "cone") {
+    if (hole) return { error: "A cone has no hole option — untick the hole." };
+    const f = coneFlat(s.d1, s.d2, s.h);
+    if ("error" in f) return f;
+    const half = (f.angle * Math.PI) / 360;
+    const arc = coneArcPts(f.R, -half, half); // outer edge (the bottom of the cone)
+    const ring = f.r > 1e-6 ? coneArcPts(f.r, half, -half) : [[0, 0] as Pt]; // inner edge back again, or the apex
+    const raw = [...arc, ...ring];
+    const x0 = Math.min(...raw.map((q) => q[0]));
+    const y0 = Math.min(...raw.map((q) => q[1]));
+    const cone = raw.map((q) => [q[0] - x0, q[1] - y0] as Pt);
+    const cxs = cone.map((q) => q[0]);
+    const cys = cone.map((q) => q[1]);
+    return {
+      outer: cone,
+      holes: [],
+      w: Math.max(...cxs) - Math.min(...cxs),
+      h: Math.max(...cys) - Math.min(...cys),
+      area: Math.abs(area(cone)),
+      per: per(cone),
+    };
+  } else if (s.kind === "rect") {
+    if (!ok(s.w) || !ok(s.h)) return { error: "Enter the length and the width (greater than 0)." };
+    outer = [[0, 0], [s.w, 0], [s.w, s.h], [0, s.h]];
+    hc = [s.w / 2, s.h / 2];
+    maxHole = Math.min(s.w, s.h);
+  } else if (s.kind === "circle") {
+    if (!ok(s.d)) return { error: "Enter the diameter (greater than 0)." };
+    outer = circlePts(s.d / 2, s.d / 2, s.d / 2);
+    hc = [s.d / 2, s.d / 2];
+    maxHole = s.d;
+  } else if (s.kind === "trapezoid") {
+    if (!ok(s.a) || !ok(s.b) || !ok(s.h)) return { error: "Enter the bottom base, the top base and the height (greater than 0)." };
+    const off = s.right ? 0 : (s.a - s.b) / 2; // where the top edge starts, measured from the bottom-left corner
+    const mx = Math.min(0, off);
+    outer = ([[0, 0], [s.a, 0], [off + s.b, s.h], [off, s.h]] as Pt[]).map((q) => [q[0] - mx, q[1]] as Pt);
+    if (Math.abs(area(outer)) < 1) return { error: "This trapezoid is too thin / too small." };
+    // a hole at the centre of gravity; it may be as wide as the nearest edge allows
+    let cx = 0;
+    let cy = 0;
+    let a2 = 0;
+    for (let i = 0; i < outer.length; i++) {
+      const p = outer[i];
+      const q = outer[(i + 1) % outer.length];
+      const c = p[0] * q[1] - q[0] * p[1];
+      a2 += c;
+      cx += (p[0] + q[0]) * c;
+      cy += (p[1] + q[1]) * c;
+    }
+    hc = [cx / (3 * a2), cy / (3 * a2)];
+    maxHole = 2 * distToPoly(hc, outer);
+  } else {
+    if (!ok(s.a) || !ok(s.b)) return { error: "Enter the length of both sides (greater than 0)." };
+    if (!(Number.isFinite(s.angle) && s.angle > 0 && s.angle < 180)) return { error: "The angle between the two sides must be between 0° and 180°." };
+    const t = (s.angle * Math.PI) / 180;
+    const A: Pt = [0, 0];
+    const B: Pt = [s.a, 0];
+    const C: Pt = [s.b * Math.cos(t), s.b * Math.sin(t)];
+    const la = dist(B, C); // side opposite A
+    const lb = s.b; // opposite B
+    const lc = s.a; // opposite C
+    const sum = la + lb + lc;
+    const ar = 0.5 * s.a * s.b * Math.sin(t);
+    if (ar < 1) return { error: "This triangle is too thin / too small." };
+    const mx = Math.min(A[0], B[0], C[0]); // C is left of A when the angle is over 90°
+    outer = [A, B, C].map((q) => [q[0] - mx, q[1]] as Pt);
+    hc = [(la * A[0] + lb * B[0] + lc * C[0]) / sum - mx, (la * A[1] + lb * B[1] + lc * C[1]) / sum];
+    maxHole = (2 * (2 * ar)) / sum; // incircle diameter
+  }
+  const holes: Pt[][] = [];
+  if (hole) {
+    if (hole >= maxHole - 1e-6)
+      return {
+        error: `The hole must be smaller than ${fmtMm(maxHole)} mm${s.kind === "triangle" || s.kind === "trapezoid" ? ` — that is how much room this ${s.kind} has in the middle` : ""}.`,
+      };
+    holes.push(circlePts(hc[0], hc[1], hole / 2));
+  }
+  const xs = outer.map((q) => q[0]);
+  const ys = outer.map((q) => q[1]);
+  return {
+    outer,
+    holes,
+    w: Math.max(...xs) - Math.min(...xs),
+    h: Math.max(...ys) - Math.min(...ys),
+    area: Math.abs(area(outer)) - holes.reduce((t, h) => t + Math.abs(area(h)), 0),
+    per: per(outer) + holes.reduce((t, h) => t + per(h), 0),
+  };
+}
+
+/** Default row name for a typed-in part, e.g. "Rectangle 500×300 Ø50". */
+export function manualPartName(s: ManualShape): string {
+  const hole = s.hole && s.hole > 0 ? ` Ø${fmtMm(s.hole)}` : "";
+  if (s.kind === "rect") return `Rectangle ${fmtMm(s.w)}×${fmtMm(s.h)}${hole}`;
+  if (s.kind === "circle") return `Circle Ø${fmtMm(s.d)}${hole ? ` /${hole}` : ""}`;
+  if (s.kind === "cylpart") {
+    const f = cylPartFlat(s);
+    const hh = s.h2 !== undefined && !Number.isNaN(s.h2) ? `${fmtMm(s.h)}/${fmtMm(s.h2)}` : fmtMm(s.h);
+    return `Cylinder part R${fmtMm(s.r)} ${"error" in f ? "" : `${fmtMm(f.info.angle)}° `}×${hh}`.replace("  ", " ");
+  }
+  if (s.kind === "cylinder") return `Cylinder flat Ø${fmtMm(s.d)}×${fmtMm(s.h)}`;
+  if (s.kind === "arc") return `Arc R${fmtMm(s.r)} W${fmtMm(s.w)} ${fmtMm(s.angle)}°`;
+  if (s.kind === "cone") return `Cone flat Ø${fmtMm(s.d1)}${s.d2 > 0 ? `/Ø${fmtMm(s.d2)}` : ""}×${fmtMm(s.h)}`;
+  if (s.kind === "trapezoid") return `Trapezoid ${fmtMm(s.a)}/${fmtMm(s.b)}×${fmtMm(s.h)}${s.right ? " right" : ""}${hole}`;
+  return `Triangle ${fmtMm(s.a)}-${fmtMm(s.b)} ${fmtMm(s.angle)}°${hole}`;
+}
+
+/**
+ * Adds a typed-in part to the list. An identical part (same shape, size, thickness, material) just gets a higher quantity,
+ * exactly like an imported DXF part. `id` is the row that now holds the part.
+ */
+export function addManualPart(
+  groups: Group[],
+  shape: ManualShape,
+  o: { name?: string; th: number; material: string; qty: number },
+  counters: Counters,
+): { groups: Group[]; id: number; merged: boolean } | { error: string } {
+  const geo = buildManualShape(shape);
+  if ("error" in geo) return geo;
+  const qty = Math.max(1, Math.round(o.qty || 1));
+  const th = o.th > 0 ? o.th : 0;
+  const material = (o.material ?? "").trim();
+  const m = groups.find(
+    (g) =>
+      !g.seg &&
+      g.th === th &&
+      g.material === material &&
+      g.holes.length === geo.holes.length &&
+      Math.abs(g.area - geo.area) <= g.area * 0.002 + 0.5 &&
+      Math.abs(g.per - geo.per) <= g.per * 0.005 + 0.5 &&
+      Math.abs(g.w - geo.w) < 0.3 &&
+      Math.abs(g.h - geo.h) < 0.3,
+  );
+  if (m) return { groups: groups.map((g) => (g === m ? { ...g, qty: g.qty + qty } : g)), id: m.id, merged: true };
+  const id = counters.id++;
+  const g: Group = { ...geo, id, sn: ++counters.sn, name: (o.name ?? "").trim() || manualPartName(shape), qty, th, material, shape };
+  return { groups: [...groups, g], id, merged: false };
+}
+
+/**
+ * The same part with a new overall size (mm): the outline and the holes are stretched, so a hole stays in proportion.
+ * Returns a NEW object, so nothing cached for the old one (rotated boxes, cell masks) is reused.
+ */
+export function resizeGroup(g: Group, w: number, h: number): Group {
+  const sx = w / g.w;
+  const sy = h / g.h;
+  const m = (r: Pt[]) => r.map((q) => [q[0] * sx, q[1] * sy] as Pt);
+  const outer = m(g.outer);
+  const holes = g.holes.map(m);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { shape, ...rest } = g; // stretched: the typed-in dimensions no longer describe it
+  return {
+    ...rest,
+    exact: isExact(g), // dropping `shape` must not silently flip an approximate part to exact
+    outer,
+    holes,
+    extra: g.extra?.map(m),
+    w,
+    h,
+    area: Math.abs(area(outer)) - holes.reduce((t, x) => t + Math.abs(area(x)), 0),
+    per: per(outer) + holes.reduce((t, x) => t + per(x), 0),
+  };
+}
+
+// ------------------------------------------------------- nest DXF import
+
+/** One sheet found in a nest DXF (as written by buildDxf): its size and the parts lying on it. */
+export interface NestSheetImport {
+  W: number;
+  H: number;
+  /** Parts on the sheet; `box` is relative to the sheet's lower-left corner. */
+  parts: RawPart[];
+}
+
+const isAxisRect = (pts: Pt[]) => {
+  if (pts.length !== 4) return false;
+  const xs = pts.map((q) => q[0]);
+  const ys = pts.map((q) => q[1]);
+  const bw = Math.max(...xs) - Math.min(...xs);
+  const bh = Math.max(...ys) - Math.min(...ys);
+  return bw > 1 && bh > 1 && Math.abs(Math.abs(area(pts)) - bw * bh) <= bw * bh * 0.001;
+};
+
+const boxOf = (pts: Pt[]) => {
+  const xs = pts.map((q) => q[0]);
+  const ys = pts.map((q) => q[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+};
+const boxWithin = (a: number[], b: number[], tol: number) => a[0] >= b[0] - tol && a[1] >= b[1] - tol && a[2] <= b[2] + tol && a[3] <= b[3] + tol;
+
+function distToPoly(p: Pt, poly: Pt[]): number {
+  let m = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const q = poly[i];
+    const r = poly[(i + 1) % poly.length];
+    const dx = r[0] - q[0];
+    const dy = r[1] - q[1];
+    const l2 = dx * dx + dy * dy;
+    const t = l2 ? Math.max(0, Math.min(1, ((p[0] - q[0]) * dx + (p[1] - q[1]) * dy) / l2)) : 0;
+    m = Math.min(m, Math.hypot(p[0] - q[0] - t * dx, p[1] - q[1] - t * dy));
+  }
+  return m;
+}
+
+/** `inner` lies entirely inside (or touching the edge of) `outer` — every vertex, not just the first one. */
+function containsLoop(outer: Pt[], inner: Pt[]): boolean {
+  if (!boxWithin(boxOf(inner), boxOf(outer), 0.1)) return false;
+  return inner.every((p) => inside(p, outer) || distToPoly(p, outer) <= 0.1);
+}
+
+/**
+ * Reads a nest DXF (sheet outlines + the parts placed on them, e.g. the file exported by this tool): every
+ * axis-aligned rectangle that is not inside another sheet's box is a sheet, every other contour inside a
+ * sheet's box is a part (holes handled like a normal DXF). Parts may touch the sheet edge or even be as big as
+ * the sheet, and parts may interlock (overlapping boxes).
+ * `stray` = contours that belong to no sheet (ignored).
+ */
+export function splitNestLoops(loops: Pt[][], sc: number): { sheets: NestSheetImport[]; stray: number } {
+  const L = loops.map((l) => l.map((p) => [p[0] * sc, p[1] * sc] as Pt)).filter((l) => Math.abs(area(l)) > 1);
+  const rects = L.filter(isAxisRect).sort((a, b) => Math.abs(area(b)) - Math.abs(area(a)));
+  const sheetLoops: { r: Pt[]; b: number[] }[] = [];
+  for (const r of rects) {
+    const b = boxOf(r);
+    if (!sheetLoops.some((s) => boxWithin(b, s.b, 0.1))) sheetLoops.push({ r, b });
+  }
+  const isSheet = new Set(sheetLoops.map((s) => s.r));
+  const rest = L.filter((l) => !isSheet.has(l));
+  const used = new Set<Pt[]>();
+  const sheets = sheetLoops
+    .sort((a, b) => a.b[0] - b.b[0] || a.b[1] - b.b[1])
+    .map((s) => {
+      const inner = rest.filter((l) => !used.has(l) && boxWithin(boxOf(l), s.b, 0.1));
+      inner.forEach((l) => used.add(l));
+      const parts = extractParts(inner, 1, containsLoop).map((p) => ({ ...p, box: [p.box[0] - s.b[0], p.box[1] - s.b[1], p.box[2] - s.b[0], p.box[3] - s.b[1]] as [number, number, number, number] }));
+      return { W: s.b[2] - s.b[0], H: s.b[3] - s.b[1], parts };
+    });
+  return { sheets, stray: rest.length - used.size };
+}
+
+/** Do the vertices of a and b coincide (same shape, any start vertex), within tol? */
+function sameOutline(a: Pt[], b: Pt[], tol: number): boolean {
+  const near = (p: Pt, poly: Pt[]) => {
+    let m = Infinity;
+    for (let i = 0; i < poly.length; i++) {
+      const q = poly[i];
+      const r = poly[(i + 1) % poly.length];
+      const dx = r[0] - q[0];
+      const dy = r[1] - q[1];
+      const l2 = dx * dx + dy * dy;
+      const t = l2 ? Math.max(0, Math.min(1, ((p[0] - q[0]) * dx + (p[1] - q[1]) * dy) / l2)) : 0;
+      m = Math.min(m, Math.hypot(p[0] - q[0] - t * dx, p[1] - q[1] - t * dy));
+    }
+    return m;
+  };
+  return a.every((p) => near(p, b) <= tol) && b.every((p) => near(p, a) <= tol);
+}
+
+const NEST_ROTS = [0, 90, 180, 270, ...Array.from({ length: 24 }, (_, i) => i * 15).filter((r) => r % 90)];
+
+/**
+ * Turns the sheets of a nest DXF into part rows (`groups`, identical parts share one row) and ready-made
+ * sheets with every part already placed where the DXF has it. Parts that are the same shape turned by a
+ * known angle (0/90/180/270, or any 15° step) share a row and keep that rotation.
+ */
+export function addNestParts(
+  groups: Group[],
+  nest: NestSheetImport[],
+  name: string,
+  counters: Counters,
+  opts: { th: number; material: string },
+): { groups: Group[]; sheets: Sheet[]; count: number } {
+  const out = groups.slice();
+  const sheets: Sheet[] = [];
+  let count = 0;
+  for (const ns of nest) {
+    const sh: Sheet = { items: [], th: opts.th, material: opts.material, used: 0, W: ns.W, H: ns.H };
+    for (const p of ns.parts) {
+      const tol = Math.max(0.5, Math.max(p.w, p.h) * 0.0005);
+      let found: { gi: number; rot: number } | null = null;
+      for (let gi = 0; gi < out.length && !found; gi++) {
+        const g = out[gi];
+        if (
+          g.seg || g.th !== opts.th || g.material !== opts.material || g.holes.length !== p.holes.length ||
+          Math.abs(g.area - p.area) > g.area * 0.002 + 0.5 || Math.abs(g.per - p.per) > g.per * 0.005 + 0.5
+        )
+          continue;
+        for (const rot of NEST_ROTS) {
+          const mapped = g.outer.map((pt) => tp(g, rot, pt));
+          const mh = g.holes.map((h) => h.map((pt) => tp(g, rot, pt)));
+          if (sameOutline(mapped, p.outer, tol) && p.holes.every((h) => mh.some((m) => sameOutline(m, h, tol)))) {
+            found = { gi, rot };
+            break;
+          }
+        }
+      }
+      let g: Group;
+      let rot = 0;
+      if (found) {
+        out[found.gi] = { ...out[found.gi], qty: out[found.gi].qty + 1 };
+        g = out[found.gi];
+        rot = found.rot;
+      } else {
+        g = { ...p, id: counters.id++, sn: ++counters.sn, name, qty: 1, th: opts.th, material: opts.material };
+        out.push(g);
+      }
+      sh.items.push({ g, rot, x: p.box[0], y: p.box[1] });
+      count++;
+    }
+    sheets.push(sh);
+  }
+  // items must point at the final (quantity-updated) group objects
+  const byId = new Map(out.map((g) => [g.id, g]));
+  for (const sh of sheets) for (const it of sh.items) it.g = byId.get(it.g.id) ?? it.g;
+  return { groups: out, sheets, count };
+}
+
+/**
+ * The note ("QTY: n  thk: t") that belongs to a part: notes are written above their group of parts, so it is the
+ * closest note that sits above the part (horizontally nearest first); if none is above, the closest one overall.
+ */
+function labelFor(box: [number, number, number, number], labels: DxfLabel[], scale: number): DxfLabel | null {
+  let best: DxfLabel | null = null;
+  let bd = Infinity;
+  let bestAbove = false;
+  for (const l of labels) {
+    const x = l.x * scale;
+    const y = l.y * scale;
+    const dx = x < box[0] ? box[0] - x : x > box[2] ? x - box[2] : 0;
+    const above = y >= box[3] - 1e-6;
+    const dy = above ? y - box[3] : box[1] - y > 0 ? box[1] - y : 0;
+    const d = Math.hypot(dx, dy);
+    if ((above && !bestAbove) || (above === bestAbove && d < bd)) {
+      best = l;
+      bd = d;
+      bestAbove = above;
+    }
+  }
+  return best;
+}
+
+// ------------------------------------------------------------- transformations
+
+const normAngle = (a: number) => {
+  const r = Math.round((((a % 360) + 360) % 360) * 1000) / 1000;
+  return r >= 360 ? 0 : r;
+};
+
+interface RotBox {
+  w: number;
+  h: number;
+  mx: number;
+  my: number;
+}
+const rotBoxCache = new WeakMap<Group, Map<number, RotBox>>();
+
+/** Size of the part after rotating it by `rot` degrees (mx/my = offset that moves its bbox back to 0,0). */
+export function rotBox(g: Group, rot: number): RotBox {
+  if (rot % 90 === 0) return rot % 180 ? { w: g.h, h: g.w, mx: 0, my: 0 } : { w: g.w, h: g.h, mx: 0, my: 0 };
+  let m = rotBoxCache.get(g);
+  if (!m) rotBoxCache.set(g, (m = new Map()));
+  const hit = m.get(rot);
+  if (hit) return hit;
+  const t = (rot * Math.PI) / 180;
+  const c = Math.cos(t);
+  const sn = Math.sin(t);
+  let x0 = 1e18;
+  let y0 = 1e18;
+  let x1 = -1e18;
+  let y1 = -1e18;
+  for (const r of [g.outer, ...(g.extra || [])])
+    for (const [x, y] of r) {
+      const X = x * c - y * sn;
+      const Y = x * sn + y * c;
+      x0 = Math.min(x0, X);
+      y0 = Math.min(y0, Y);
+      x1 = Math.max(x1, X);
+      y1 = Math.max(y1, Y);
+    }
+  const b = { w: x1 - x0, h: y1 - y0, mx: x0, my: y0 };
+  m.set(rot, b);
+  return b;
+}
+
+/** Rotates a point of the part; the rotated part's bounding box always starts at (0, 0). */
+export function tp(g: Group, rot: number, p: Pt): Pt {
+  const [x, y] = p;
+  if (rot === 0) return [x, y];
+  if (rot === 90) return [g.h - y, x];
+  if (rot === 180) return [g.w - x, g.h - y];
+  if (rot === 270) return [y, g.w - x];
+  const t = (rot * Math.PI) / 180;
+  const b = rotBox(g, rot);
+  return [x * Math.cos(t) - y * Math.sin(t) - b.mx, x * Math.sin(t) + y * Math.cos(t) - b.my];
+}
+
+export function path(g: Group, rot: number, dx: number, dy: number): Path2D {
+  const P = new Path2D();
+  for (const r of [g.outer, ...g.holes, ...(g.extra || [])]) {
+    r.forEach((p, i) => {
+      const [x, y] = tp(g, rot, p);
+      if (i) P.lineTo(x + dx, y + dy);
+      else P.moveTo(x + dx, y + dy);
+    });
+    P.closePath();
+  }
+  return P;
+}
+
+export const partColor = (g: Group) => `hsl(${(((g.cid ?? g.id) * 67) % 360)} 60% 55%)`;
+
+/** Two identical right/any triangles nested as one rectangle-ish pair. */
+export function pairOf(g: Group, common: boolean, gap: number): Group | null {
+  if (g.outer.length !== 3 || g.holes.length) return null;
+  const P = g.outer;
+  let bi = 0;
+  let bl = 0;
+  for (let i = 0; i < 3; i++) {
+    const l = dist(P[i], P[(i + 1) % 3]);
+    if (l > bl) {
+      bl = l;
+      bi = i;
+    }
+  }
+  const p = P[bi];
+  const q = P[(bi + 1) % 3];
+  const r = P[(bi + 2) % 3];
+  const r2: Pt = [p[0] + q[0] - r[0], p[1] + q[1] - r[1]];
+  let outer: Pt[];
+  let extra: Pt[][] = [];
+  if (common) outer = [p, r, q, r2];
+  else {
+    let nx = -(q[1] - p[1]) / bl;
+    let ny = (q[0] - p[0]) / bl;
+    if ((r[0] - p[0]) * nx + (r[1] - p[1]) * ny > 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    outer = [p, q, r];
+    extra = [[q, p, r2].map((a) => [a[0] + nx * gap, a[1] + ny * gap] as Pt)];
+  }
+  const allPts = outer.concat(...extra);
+  const mx = Math.min(...allPts.map((a) => a[0]));
+  const my = Math.min(...allPts.map((a) => a[1]));
+  const mv = (R: Pt[]) => R.map((a) => [a[0] - mx, a[1] - my] as Pt);
+  outer = mv(outer);
+  extra = extra.map(mv);
+  const a2 = outer.concat(...extra);
+  return {
+    ...g,
+    id: 1000 + g.id,
+    cid: g.id,
+    outer,
+    holes: [],
+    extra,
+    w: Math.max(...a2.map((a) => a[0])),
+    h: Math.max(...a2.map((a) => a[1])),
+    area: 2 * g.area,
+    n: 2,
+  };
+}
+
+// ------------------------------------------------------------------- placement
+
+interface Mask {
+  mw: number;
+  mh: number;
+  pad: number;
+  /** Extent of the cells the part really occupies inside the mask box (the padding around
+   *  them is empty). Placement is limited by these, not by the padded box — otherwise the
+   *  padding would eat sheet capacity (e.g. 4 x 1500 mm no longer fit a 6000 mm sheet). */
+  minC: number;
+  maxC: number;
+  minR: number;
+  maxR: number;
+  off: Int32Array;
+}
+type MaskCache = Map<string, Mask>;
+interface Slot {
+  sc: number;
+  gx: number;
+  gy: number;
+  rot: number;
+  m: Mask;
+}
+
+/** Rotation angles the optimizer may try, for the "Rotation" setting (0 none, 1 = 0/180, 2 = 90 steps, 3 = 45 steps, 4 = 15 steps). */
+export function rotList(ro: number): number[] {
+  if (ro === 0) return [0];
+  if (ro === 1) return [0, 180];
+  const step = ro === 2 ? 90 : ro === 3 ? 45 : 15;
+  return Array.from({ length: 360 / step }, (_, i) => i * step);
+}
+
+export function makeSettings(v: { W: number; H: number; mg: number; gp: number; cell: number; ro: number }): Settings {
+  const x0 = v.mg - v.gp / 2;
+  return {
+    ...v,
+    x0,
+    GW: Math.floor((v.W - 2 * v.mg + v.gp) / v.cell),
+    GH: Math.floor((v.H - 2 * v.mg + v.gp) / v.cell),
+  };
+}
+
+function mask(S: Settings, rc: MaskCache, g: Group, rot: number): Mask {
+  const k = [g.id, rot, S.cell, S.gp].join();
+  const hit = rc.get(k);
+  if (hit) return hit;
+  const { w: bw, h: bh } = rotBox(g, rot);
+  const pad = Math.ceil(S.gp / 2 / S.cell) + 1;
+  const mw = Math.ceil(bw / S.cell) + 2 * pad;
+  const mh = Math.ceil(bh / S.cell) + 2 * pad;
+  const cv = document.createElement("canvas");
+  cv.width = mw;
+  cv.height = mh;
+  const c = cv.getContext("2d", { willReadFrequently: true }) as CanvasRenderingContext2D;
+  c.setTransform(1 / S.cell, 0, 0, 1 / S.cell, pad, pad);
+  const P = path(g, rot, 0, 0);
+  c.fill(P, "evenodd");
+  c.lineWidth = S.gp;
+  c.lineJoin = "round";
+  if (S.gp > 0) c.stroke(P);
+  const d = c.getImageData(0, 0, mw, mh).data;
+  const o: number[] = [];
+  let minC = mw, maxC = -1, minR = mh, maxR = -1;
+  for (let r = 0; r < mh; r++)
+    for (let q = 0; q < mw; q++)
+      if (d[(r * mw + q) * 4 + 3] > 0) {
+        o.push(r * S.GW + q);
+        if (q < minC) minC = q;
+        if (q > maxC) maxC = q;
+        if (r < minR) minR = r;
+        if (r > maxR) maxR = r;
+      }
+  if (maxC < 0) { minC = maxC = minR = maxR = 0; }
+  const m: Mask = { mw, mh, pad, minC, maxC, minR, maxR, off: Int32Array.from(o) };
+  rc.set(k, m);
+  return m;
+}
+
+function place(S: Settings, rc: MaskCache, sh: Sheet, g: Group, rots: number[]): Slot | null {
+  let best: Slot | null = null;
+  for (const rot of rots) {
+    const m = mask(S, rc, g, rot);
+    if (m.maxC - m.minC + 1 > S.GW || m.maxR - m.minR + 1 > S.GH) continue;
+    const G = sh.grid as Uint8Array;
+    const o = m.off;
+    // gx/gy are the mask box's origin; only the occupied cells (minC..maxC / minR..maxR) must
+    // stay inside the grid, so the origin may sit a few cells outside it (empty padding).
+    const lim = Math.min(best ? best.sc - (m.maxC + 1) : 1e9, S.GW - 1 - m.maxC);
+    for (let gx = -m.minC; gx <= lim; gx++) {
+      let f = -Infinity;
+      for (let gy = -m.minR; gy <= S.GH - 1 - m.maxR; gy++) {
+        const b = gy * S.GW + gx;
+        let ok = true;
+        for (let k = 0; k < o.length; k++)
+          if (G[b + o[k]]) {
+            ok = false;
+            break;
+          }
+        if (ok) {
+          f = gy;
+          break;
+        }
+      }
+      if (f > -Infinity) {
+        const sc = gx + m.maxC + 1;
+        if (!best || sc < best.sc || (sc === best.sc && f < best.gy)) best = { sc, gx, gy: f, rot, m };
+        break;
+      }
+    }
+  }
+  return best;
+}
+
+function commit(S: Settings, sh: Sheet, g: Group, b: Slot) {
+  const b0 = b.gy * S.GW + b.gx;
+  for (const k of b.m.off) (sh.grid as Uint8Array)[b0 + k] = 1;
+  sh.used = Math.max(sh.used, b.sc);
+  sh.items.push({ g, rot: b.rot, x: S.x0 + (b.gx + b.m.pad) * S.cell, y: S.x0 + (b.gy + b.m.pad) * S.cell });
+}
+
+const tick = () => new Promise<void>((r) => setTimeout(r));
+
+/** True when two settings share the same sheet grid (size, margin, spacing, cell), so parts can be added to an existing nest. */
+export function sameSheetSettings(a: Settings, b: Settings): boolean {
+  return a.W === b.W && a.H === b.H && a.mg === b.mg && a.gp === b.gp && a.cell === b.cell;
+}
+
+/** Can parts be added to an existing nest? The stock sheet (length, width) and the edge margin must stay the same;
+ *  the gap between parts and the grid cell may differ for the parts being added. */
+export function canContinueOn(a: Settings, b: Settings): boolean {
+  return a.W === b.W && a.H === b.H && a.mg === b.mg;
+}
+
+/** Marks the cells taken by the parts already on `sh` (same cells the manual-nesting checks use). */
+function seedOf(S: Settings, sh: Sheet): Seed {
+  const grid = new Uint8Array(S.GW * S.GH);
+  let used = 0;
+  for (const it of sh.items) {
+    const cs = cellsOf(S, it.g, it.rot);
+    const [ax, ay] = cellOrigin(S, cs, it.x, it.y);
+    used = Math.max(used, ax + cs.maxC + 1);
+    cs.rows.forEach((runs, r) => {
+      const gy = ay + r;
+      if (gy < 0 || gy >= S.GH) return;
+      for (let i = 0; i < runs.length; i += 2)
+        for (let q = runs[i]; q <= runs[i + 1]; q++) {
+          const gx = ax + q;
+          if (gx >= 0 && gx < S.GW) grid[gy * S.GW + gx] = 1;
+        }
+    });
+  }
+  return { sh, grid, used };
+}
+
+/** An existing sheet whose occupied cells are known, so new parts can be fitted into its free space. */
+interface Seed {
+  sh: Sheet;
+  grid: Uint8Array;
+  used: number;
+}
+
+async function attempt(S: Settings, rc: MaskCache, items: Group[], rots: number[], stop: () => boolean, seeds: Seed[] = [], maxSheets = Infinity) {
+  // seeded sheets come first (they are filled before any new sheet is opened); copies, so every attempt starts from the same state
+  const sheets: Sheet[] = seeds.map((x) => ({ ...x.sh, items: x.sh.items.slice(), grid: x.grid.slice(), used: x.used }));
+  const un: Group[] = [];
+  for (let n = 0; n < items.length; n++) {
+    const g = items[n];
+    let ok = false;
+    for (const sh of sheets) {
+      const b = place(S, rc, sh, g, rots);
+      if (b) {
+        commit(S, sh, g, b);
+        ok = true;
+        break;
+      }
+    }
+    if (!ok) {
+      if (sheets.length - seeds.length >= maxSheets) un.push(g); // no more sheets of this source: the part waits for the next one
+      else {
+        const sh: Sheet = { grid: new Uint8Array(S.GW * S.GH), items: [], used: 0, th: 0, material: "" };
+        const b = place(S, rc, sh, g, rots);
+        if (b) {
+          commit(S, sh, g, b);
+          sheets.push(sh);
+        } else un.push(g);
+      }
+    }
+    if (n % 2 === 0) await tick();
+    if (stop()) break;
+  }
+  const nNew = sheets.length - seeds.length;
+  const sc = seeds.length
+    ? un.length * 1e9 + nNew * 1e7 + (nNew ? sheets[sheets.length - 1].used : sheets.reduce((a, x, i) => a + x.used - seeds[i].used, 0))
+    : un.length * 1e9 + (sheets.length - 1) * 1e7 + (sheets.length ? sheets[sheets.length - 1].used : 0);
+  return { sheets, un, sc };
+}
+
+export interface OptimizeOptions {
+  S: Settings;
+  pair: boolean;
+  common: boolean;
+  timeSec: number;
+  /** Continue an existing nest: only the pieces of each part not placed yet are nested, first into the free space of the
+   *  sheets already there (same thickness + material, full stock size), then onto new sheets. Needs the same sheet settings. */
+  base?: OptResult | null;
+  /** With `base`: true (default) = the new parts first fill the free space of the existing sheets (same thickness +
+   *  material), then new sheets are opened. false = the existing sheets are left alone, the new parts go on new sheets only. */
+  fillExisting?: boolean;
+  /** Sheet sizes you have, per thickness / material. Sources with a limited quantity (leftovers) are used first, then the
+   *  unlimited ones. A lot (material + thickness) with no matching source is nested on the default sheet (S.W × S.H).
+   *  With sources, a continued nest keeps its existing sheets as they are and adds new sheets. */
+  sources?: SheetSource2D[];
+  /** With sources: when they run out (or a part does not fit any), continue on the default sheet S.W × S.H. Default true. */
+  fallbackDefault?: boolean;
+  shouldStop: () => boolean;
+  onBest: (res: OptResult) => void;
+  onStatus: (text: string) => void;
+}
+
+/**
+ * Rotation that lets `g` sit on a bare sheet, when the part does NOT fit inside the sheet's edge margins but does fit
+ * the raw sheet (W x H). null = the part is not that big (normal nesting), or it fits no rotation at all.
+ */
+export function soloRot(g: Group, S: Settings, rots: number[]): number | null {
+  const uw = S.W - 2 * S.mg;
+  const uh = S.H - 2 * S.mg;
+  const fits = (r: number, w: number, h: number) => {
+    const b = rotBox(g, r);
+    return b.w <= w + 0.01 && b.h <= h + 0.01;
+  };
+  if (rots.some((r) => fits(r, uw, uh))) return null;
+  const r = rots.find((q) => fits(q, S.W, S.H));
+  return r === undefined ? null : r;
+}
+
+const sameText = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+
+/** The sheet sources that apply to a lot (thickness + material): limited quantities first (in the order given), then unlimited ones. */
+export function sourcesForLot(sources: SheetSource2D[], th: number, material: string): SheetSource2D[] {
+  const m = sources.filter(
+    (x) =>
+      x.W > 0 && x.H > 0 && (x.qty === null || x.qty > 0) &&
+      (!x.th || Math.abs(x.th - th) < 0.01) &&
+      (!x.material.trim() || sameText(x.material, material)),
+  );
+  return [...m.filter((x) => x.qty !== null), ...m.filter((x) => x.qty === null)];
+}
+
+/**
+ * Reads sheet sizes typed by hand: "3000x1500, 2400x1200x2" (separators: comma, semicolon or new line; the optional
+ * third number is how many sheets of that size you have). Sizes without it get `defaultQty` (null = unlimited).
+ * Anything that is not "length x width" with positive numbers is returned in `invalid`.
+ */
+export function parseSheetSizes(text: string, defaultQty: number | null): { items: { W: number; H: number; qty: number | null }[]; invalid: string[] } {
+  const items: { W: number; H: number; qty: number | null }[] = [];
+  const invalid: string[] = [];
+  for (const raw of text.split(/[,;\n]+/)) {
+    const tok = raw.trim();
+    if (!tok) continue;
+    const m = /^(\d+(?:\.\d+)?)\s*[x*×]\s*(\d+(?:\.\d+)?)(?:\s*[x*×]\s*(\d+))?$/i.exec(tok);
+    const W = m ? Number(m[1]) : NaN;
+    const H = m ? Number(m[2]) : NaN;
+    const qty = m && m[3] !== undefined ? Number(m[3]) : defaultQty;
+    if (!m || !(W > 0) || !(H > 0) || (qty !== null && !(qty > 0))) invalid.push(tok);
+    else items.push({ W, H, qty });
+  }
+  return { items, invalid };
+}
+
+function fitsUsable(g: Group, S: Settings, rots: number[]): boolean {
+  const uw = S.W - 2 * S.mg;
+  const uh = S.H - 2 * S.mg;
+  return rots.some((r) => {
+    const b = rotBox(g, r);
+    return b.w <= uw + 0.01 && b.h <= uh + 0.01;
+  });
+}
+
+/** Returns null when there is nothing to nest (all quantities are 0). */
+export async function runOptimize(groups: Group[], o: OptimizeOptions): Promise<OptResult | null> {
+  const { S } = o;
+  const rc: MaskCache = new Map();
+  const base = o.base ?? null;
+  const baseSheets = base ? base.sheets : [];
+  const placedBefore = placedCounts(base);
+  const skip = groups.filter((g) => !g.qty && g.seg?.role !== "parent").map((g) => `Part #${snText(g)} (${g.name}) was skipped: quantity is 0`);
+  const items: Group[] = [];
+  groups.forEach((g) => {
+    if (g.seg?.role === "parent") return; // segmented original: its pieces are nested instead
+    let n = Math.max(0, g.qty - (placedBefore.get(g.id) ?? 0));
+    const pg = o.pair ? pairOf(g, o.common, S.gp) : null;
+    if (pg) {
+      for (let i = 0; i < n >> 1; i++) items.push(pg);
+      n &= 1;
+    }
+    for (let i = 0; i < n; i++) items.push(g);
+  });
+  if (!items.length) return null;
+
+  const R = rotList(S.ro);
+  const key: ((g: Group) => number)[] = [
+    (g) => g.area,
+    (g) => Math.max(g.w, g.h),
+    (g) => g.h,
+    (g) => g.w * g.h * (0.6 + 0.8 * Math.random()),
+  ];
+  // Parts only share a sheet when both thickness AND material match.
+  const lots = Array.from(new Set(items.map((g) => `${g.th || 0}\u0000${g.material || ""}`)))
+    .map((k) => {
+      const i = k.indexOf("\u0000");
+      return { th: +k.slice(0, i), material: k.slice(i + 1) };
+    })
+    .sort((a, b) => a.th - b.th || a.material.localeCompare(b.material));
+  const done: Sheet[] = []; // new sheets of the lots already finished
+  const dun: Group[] = [];
+  const replaced = new Map<number, Sheet>(); // base sheet index -> same sheet with the new parts added
+  let it = 0;
+  const ids = new Set(groups.map((g) => g.id));
+  const unWhy: Record<number, string> = {};
+  const cur = (b: { sheets: Sheet[]; un: Group[] } | null, seedIdx: number[] = []): OptResult => {
+    const sheets = baseSheets.map((x, i) => replaced.get(i) ?? x);
+    seedIdx.forEach((bi, j) => b && sheets.splice(bi, 1, b.sheets[j]));
+    const why = { ...(base?.unWhy ?? {}), ...unWhy };
+    return {
+      sheets: sheets.concat(done, b ? b.sheets.slice(seedIdx.length) : []),
+      un: (base ? base.un.filter((g) => !ids.has(g.cid ?? g.id)) : []).concat(dun, b ? b.un : []),
+      skip: base ? Array.from(new Set(base.skip.concat(skip))) : skip,
+      ...(base?.manual ? { manual: true } : {}),
+      ...(Object.keys(why).length ? { unWhy: why } : {}),
+    };
+  };
+
+  /** Nests one lot on the sheet sources that apply to it: the limited ones (leftovers) first, then the unlimited ones,
+   *  then the default sheet. Parts that do not fit a source (or find no sheet left) go on to the next one. */
+  const nestOnSources = async (th: number, material: string, lot: Group[], list: SheetSource2D[], nLots: number) => {
+    const stages: { src: SheetSource2D | null; S: Settings; cap: number }[] = list.map((src) => ({
+      src,
+      S: makeSettings({ W: src.W, H: src.H, mg: S.mg, gp: S.gp, cell: S.cell, ro: S.ro }),
+      cap: src.qty === null ? Infinity : Math.max(0, src.qty - baseSheets.filter((x) => x.srcId === src.id).length),
+    }));
+    if (o.fallbackDefault !== false) stages.push({ src: null, S, cap: Infinity });
+    const active = stages.filter((x) => x.cap > 0);
+    const lbl = material ? `${material} • ${th || "?"} mm` : `${th || "?"} mm`;
+    let rem = lot.slice();
+    for (const st of active) {
+      if (!rem.length || o.shouldStop()) break;
+      const Ss = st.S;
+      const stamp = (sh: Sheet) => {
+        sh.th = th;
+        sh.material = material;
+        if (st.src) {
+          sh.W = st.src.W;
+          sh.H = st.src.H;
+          sh.stockW = st.src.W;
+          sh.stockH = st.src.H;
+          sh.srcId = st.src.id;
+        }
+      };
+      let cap = st.cap;
+      const cand: Group[] = [];
+      const next: Group[] = [];
+      for (const g of rem) {
+        const r = soloRot(g, Ss, R);
+        if (r !== null) {
+          // as big as this sheet: a sheet of its own, no margin / spacing
+          if (cap > 0) {
+            cap--;
+            const b = rotBox(g, r);
+            const sh: Sheet = { items: [{ g, rot: r, x: (Ss.W - b.w) / 2, y: (Ss.H - b.h) / 2 }], th, material, used: 0, solo: true };
+            stamp(sh);
+            done.push(sh);
+          } else next.push(g);
+        } else if (fitsUsable(g, Ss, R)) cand.push(g);
+        else next.push(g);
+      }
+      if (done.length) o.onBest(cur(null));
+      if (cand.length && cap > 0) {
+        const rc2: MaskCache = new Map();
+        const t0 = performance.now();
+        const lim = (o.timeSec * 1000) / nLots / active.length;
+        let best: { sheets: Sheet[]; un: Group[]; sc: number } | null = null;
+        let k = 0;
+        while (!o.shouldStop() && (k === 0 || performance.now() - t0 < lim)) {
+          const kf = k < 3 ? key[k] : key[3];
+          const ord = cand.slice().sort((a, b) => kf(b) - kf(a));
+          let rr = R;
+          if (k >= 4 && R.length >= 3) {
+            if (S.ro === 2) rr = [R, [0, 180], [0, 90], [0, 270, 90, 180]][(Math.random() * 4) | 0];
+            else {
+              const pick = (Math.random() * 3) | 0;
+              rr = pick === 0 ? R : pick === 1 ? R.filter((a) => a % 90 === 0) : R.slice().sort(() => Math.random() - 0.5);
+            }
+          }
+          const r = await attempt(Ss, rc2, ord, rr, o.shouldStop, [], cap);
+          k++;
+          it++;
+          r.sheets.forEach(stamp);
+          if (!o.shouldStop() && (!best || r.sc < best.sc)) {
+            best = r;
+            o.onBest(cur(best));
+          }
+          const where = st.src ? `sheet ${Math.round(st.src.W)}×${Math.round(st.src.H)}` : "default sheet";
+          o.onStatus(`${lbl} • ${where} • iteration ${it} • sheets: ${baseSheets.length + done.length + (best ? best.sheets.length : 0)}`);
+        }
+        if (best) {
+          done.push(...best.sheets);
+          next.push(...best.un);
+        } else next.push(...cand);
+      } else next.push(...cand);
+      rem = next;
+    }
+    if (rem.length) {
+      dun.push(...rem);
+      const biggest = stages.reduce((a, x) => (x.S.W * x.S.H > a.S.W * a.S.H ? x : a));
+      for (const g of rem) {
+        if (unWhy[g.sn]) continue;
+        const fitsAny = stages.some((x) => fitsUsable(g, x.S, R) || soloRot(g, x.S, R) !== null);
+        unWhy[g.sn] = fitsAny
+          ? `the sheets you have for ${lbl} are used up (${list.map((x) => `${Math.round(x.W)}×${Math.round(x.H)}${x.qty === null ? "" : ` ×${x.qty}`}`).join(", ")}) — add more sheets or allow the default sheet`
+          : whyNotNested(g, biggest.S);
+      }
+    }
+  };
+
+  for (const { th, material } of lots) {
+    const lot = items.filter((g) => (g.th || 0) === th && (g.material || "") === material);
+    const list = o.sources?.length ? sourcesForLot(o.sources, th, material) : [];
+    if (list.length) {
+      await nestOnSources(th, material, lot, list, lots.length);
+      continue;
+    }
+    // A part as big as the sheet (too big for the margins, but it fits the raw sheet) gets a sheet of its own with
+    // NO edge margin and NO spacing: it is the only thing on that sheet, so there is nothing to keep clear of.
+    const sub: Group[] = [];
+    for (const g of lot) {
+      const r = soloRot(g, S, R);
+      if (r === null) {
+        sub.push(g);
+        continue;
+      }
+      const b = rotBox(g, r);
+      const sh: Sheet = {
+        items: [{ g, rot: r, x: (S.W - b.w) / 2, y: (S.H - b.h) / 2 }],
+        th,
+        material,
+        used: 0,
+        solo: true,
+      };
+      done.push(sh);
+    }
+    if (done.length) o.onBest(cur(null));
+    if (!sub.length) continue;
+    // existing sheets of this lot that still have their full stock size can take more parts
+    const seedIdx: number[] = [];
+    if (o.fillExisting !== false) baseSheets.forEach((x, i) => {
+      if ((x.th || 0) === th && (x.material || "") === material && x.W === undefined && x.H === undefined && !x.solo) seedIdx.push(i);
+    });
+    const seeds = seedIdx.map((i) => seedOf(S, baseSheets[i]));
+    const t0 = performance.now();
+    const lim = (o.timeSec * 1000) / lots.length;
+    let best: { sheets: Sheet[]; un: Group[]; sc: number } | null = null;
+    let k = 0;
+    while (!o.shouldStop() && (k === 0 || performance.now() - t0 < lim)) {
+      const kf = k < 3 ? key[k] : key[3];
+      const ord = sub.slice().sort((a, b) => kf(b) - kf(a));
+      let rr = R;
+      if (k >= 4 && R.length >= 3) {
+        if (S.ro === 2) rr = [R, [0, 180], [0, 90], [0, 270, 90, 180]][(Math.random() * 4) | 0];
+        else {
+          // finer rotation modes: vary the search order / the allowed set between iterations
+          const pick = (Math.random() * 3) | 0;
+          rr = pick === 0 ? R : pick === 1 ? R.filter((a) => a % 90 === 0) : R.slice().sort(() => Math.random() - 0.5);
+        }
+      }
+      const r = await attempt(S, rc, ord, rr, o.shouldStop, seeds);
+      k++;
+      it++;
+      r.sheets.forEach((x) => {
+        x.th = th;
+        x.material = material;
+      });
+      if (!o.shouldStop() && (!best || r.sc < best.sc)) {
+        best = r;
+        o.onBest(cur(best, seedIdx));
+      }
+      const lbl = material ? `${material} • ${th || "?"} mm` : `${th || "?"} mm`;
+      o.onStatus(`${lbl} • iteration ${it} • sheets: ${baseSheets.length + done.length + (best ? best.sheets.length - seedIdx.length : 0)}`);
+    }
+    if (best) {
+      seedIdx.forEach((bi, j) => replaced.set(bi, best!.sheets[j]));
+      done.push(...best.sheets.slice(seedIdx.length));
+      dun.push(...best.un);
+    }
+  }
+  const out = cur(null);
+  out.sheets.forEach((s) => delete s.grid);
+  return out;
+}
+
+// ----------------------------------------------------- manual editing (pick up)
+
+export interface Sides {
+  o: Pt[][];
+  h: Pt[][];
+}
+type BBox = [number, number, number, number];
+
+export function sides(it: Item): Sides {
+  const f = (r: Pt[]) =>
+    r.map((p) => {
+      const q = tp(it.g, it.rot, p);
+      return [q[0] + it.x, q[1] + it.y] as Pt;
+    });
+  return { o: [it.g.outer, ...(it.g.extra || [])].map(f), h: it.g.holes.map(f) };
+}
+
+export function bbox(R: Pt[][]): BBox {
+  let a = 1e9;
+  let b = 1e9;
+  let c = -1e9;
+  let d = -1e9;
+  for (const r of R)
+    for (const p of r) {
+      a = Math.min(a, p[0]);
+      b = Math.min(b, p[1]);
+      c = Math.max(c, p[0]);
+      d = Math.max(d, p[1]);
+    }
+  return [a, b, c, d];
+}
+
+function segX(a: Pt, b: Pt, c: Pt, d: Pt) {
+  const o = (p: Pt, q: Pt, r: Pt) => (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+  return o(a, b, c) * o(a, b, d) < 0 && o(c, d, a) * o(c, d, b) < 0;
+}
+function ringX(r1: Pt[], r2: Pt[]) {
+  for (let i = 0; i < r1.length; i++) {
+    const a = r1[i];
+    const b = r1[(i + 1) % r1.length];
+    for (let j = 0; j < r2.length; j++) if (segX(a, b, r2[j], r2[(j + 1) % r2.length])) return true;
+  }
+  return false;
+}
+function solid(pt: Pt, s: Sides) {
+  return s.o.some((r) => inside(pt, r)) && !s.h.some((r) => inside(pt, r));
+}
+function hit(A: Sides, B: Sides) {
+  const x = bbox(A.o);
+  const y = bbox(B.o);
+  if (x[0] > y[2] || y[0] > x[2] || x[1] > y[3] || y[1] > x[3]) return false;
+  for (const r of A.o.concat(A.h)) for (const q of B.o.concat(B.h)) if (ringX(r, q)) return true;
+  return A.o.some((r) => solid(r[0], B)) || B.o.some((r) => solid(r[0], A));
+}
+interface Other {
+  s: Sides;
+  bb: BBox;
+  it: Item;
+}
+
+// ---------------------------------------------------- spacing exactly like the optimiser
+// The optimiser puts parts on a grid of `cell` mm and blocks every grid cell touched by the part grown by
+// spacing/2. Two parts may therefore be a little further apart than `spacing` (up to one cell more per side).
+// Manual editing uses the very same cells, so a hand-made nest keeps the same gaps as an optimised one and a part
+// can never be dropped into the free zone around another part.
+
+/** Occupied grid cells of a part at one rotation, as column runs per row (same rasterisation as the optimiser). */
+interface Cells {
+  pad: number;
+  minC: number;
+  maxC: number;
+  minR: number;
+  maxR: number;
+  /** rows[r] = [start0, end0, start1, end1, ...] (inclusive column runs) */
+  rows: Int32Array[];
+}
+
+type CellCanvasFactory = (w: number, h: number) => HTMLCanvasElement;
+let cellCanvas: CellCanvasFactory = (w, h) => {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  return c;
+};
+/** Lets tests (no DOM) supply their own canvas. */
+export function setCellCanvasFactory(f: CellCanvasFactory) {
+  cellCanvas = f;
+}
+
+const cellsCache = new WeakMap<Group, Map<string, Cells>>();
+
+function cellsOf(S: Settings, g: Group, rot: number): Cells {
+  let m = cellsCache.get(g);
+  if (!m) cellsCache.set(g, (m = new Map()));
+  const key = `${rot}|${S.cell}|${S.gp}`;
+  const hit = m.get(key);
+  if (hit) return hit;
+  const { w: bw, h: bh } = rotBox(g, rot);
+  const pad = Math.ceil(S.gp / 2 / S.cell) + 1;
+  const mw = Math.ceil(bw / S.cell) + 2 * pad;
+  const mh = Math.ceil(bh / S.cell) + 2 * pad;
+  const c = cellCanvas(mw, mh).getContext("2d", { willReadFrequently: true }) as CanvasRenderingContext2D;
+  c.setTransform(1 / S.cell, 0, 0, 1 / S.cell, pad, pad);
+  c.beginPath();
+  for (const r of [g.outer, ...g.holes, ...(g.extra || [])]) {
+    r.forEach((p, i) => {
+      const [x, y] = tp(g, rot, p);
+      if (i) c.lineTo(x, y);
+      else c.moveTo(x, y);
+    });
+    c.closePath();
+  }
+  c.fill("evenodd");
+  c.lineWidth = S.gp;
+  c.lineJoin = "round";
+  if (S.gp > 0) c.stroke();
+  const d = c.getImageData(0, 0, mw, mh).data;
+  const rows: Int32Array[] = [];
+  let minC = mw, maxC = -1, minR = mh, maxR = -1;
+  for (let r = 0; r < mh; r++) {
+    const runs: number[] = [];
+    let start = -1;
+    for (let q = 0; q <= mw; q++) {
+      const on = q < mw && d[(r * mw + q) * 4 + 3] > 0;
+      if (on && start < 0) start = q;
+      if (!on && start >= 0) {
+        runs.push(start, q - 1);
+        minC = Math.min(minC, start);
+        maxC = Math.max(maxC, q - 1);
+        start = -1;
+      }
+    }
+    if (runs.length) {
+      minR = Math.min(minR, r);
+      maxR = Math.max(maxR, r);
+    }
+    rows.push(Int32Array.from(runs));
+  }
+  if (maxC < 0) minC = maxC = minR = maxR = 0;
+  const out: Cells = { pad, minC, maxC, minR, maxR, rows };
+  m.set(key, out);
+  return out;
+}
+
+/** Grid position (in cells) of the mask origin of a part placed at (x, y). */
+const cellOrigin = (S: Settings, cs: Cells, x: number, y: number): Pt => [
+  Math.round((x - S.x0) / S.cell) - cs.pad,
+  Math.round((y - S.x0) / S.cell) - cs.pad,
+];
+
+/** Snaps a coordinate to the optimiser's grid (parts always sit on grid points, like optimised ones). */
+export const snapV = (S: Settings, v: number) => S.x0 + Math.round((v - S.x0) / S.cell) * S.cell;
+
+function cellsHit(a: Cells, ax: number, ay: number, b: Cells, bx: number, by: number): boolean {
+  if (ax + a.maxC < bx + b.minC || bx + b.maxC < ax + a.minC || ay + a.maxR < by + b.minR || by + b.maxR < ay + a.minR) return false;
+  const r0 = Math.max(ay + a.minR, by + b.minR);
+  const r1 = Math.min(ay + a.maxR, by + b.maxR);
+  for (let r = r0; r <= r1; r++) {
+    const ra = a.rows[r - ay];
+    const rb = b.rows[r - by];
+    if (!ra || !rb) continue;
+    let i = 0;
+    let j = 0;
+    while (i < ra.length && j < rb.length) {
+      const e1 = ra[i + 1] + ax;
+      const s2 = rb[j] + bx;
+      const e2 = rb[j + 1] + bx;
+      if (e1 < s2) i += 2;
+      else if (e2 < ra[i] + ax) j += 2;
+      else return true;
+    }
+  }
+  return false;
+}
+
+/** True when part `it` (at x, y) would break the sheet's grid limits or share a cell with any of `oth`. */
+function gridBad(S: Settings, sh: Sheet, it: Item, x: number, y: number, oth: Other[]): boolean {
+  const cs = cellsOf(S, it.g, it.rot);
+  const [ax, ay] = cellOrigin(S, cs, x, y);
+  const W = sh.W ?? S.W;
+  const H = sh.H ?? S.H;
+  const GW = Math.floor((W - 2 * S.mg + S.gp) / S.cell);
+  const GH = Math.floor((H - 2 * S.mg + S.gp) / S.cell);
+  // a solo sheet has no margin / spacing grid: its bounds are checked on the bounding box (isBad / groupBad)
+  if (!sh.solo && (ax + cs.minC < 0 || ay + cs.minR < 0 || ax + cs.maxC > GW - 1 || ay + cs.maxR > GH - 1)) return true;
+  const reach = S.gp + 2 * S.cell;
+  const b0 = bbox(sides(it).o);
+  const b: BBox = [b0[0] + x - it.x, b0[1] + y - it.y, b0[2] + x - it.x, b0[3] + y - it.y];
+  for (const o of oth) {
+    if (b[0] > o.bb[2] + reach || o.bb[0] > b[2] + reach || b[1] > o.bb[3] + reach || o.bb[1] > b[3] + reach) continue;
+    const oc = cellsOf(S, o.it.g, o.it.rot);
+    const [bx, by] = cellOrigin(S, oc, o.it.x, o.it.y);
+    if (cellsHit(cs, ax, ay, oc, bx, by)) return true;
+  }
+  return false;
+}
+
+export interface Sel {
+  sh: Sheet;
+  origSh: Sheet;
+  idx: number;
+  it: Item;
+  oth: Other[];
+  off: Pt;
+  pm: Pt;
+  orig: { x: number; y: number; rot: number };
+  lw?: number;
+  /** True while the held part overlaps something / enters the margin (drawn red, can't be placed). */
+  bad?: boolean;
+  /** The part was taken from the parts list (manual nesting), not picked up from a sheet. */
+  fresh?: boolean;
+}
+
+/** A part taken from the list that has not touched any sheet yet (it floats with the cursor). */
+export const inGhost = (sel: Sel) => !!sel.fresh && sel.sh === sel.origSh;
+
+/** Physical pieces of every part group currently on the sheets (paired triangles count as 2). */
+export function placedCounts(res: OptResult | null): Map<number, number> {
+  const m = new Map<number, number>();
+  if (!res) return m;
+  for (const sh of res.sheets)
+    for (const it of sh.items) {
+      const id = it.g.cid ?? it.g.id;
+      m.set(id, (m.get(id) ?? 0) + (it.g.n || 1));
+    }
+  return m;
+}
+
+/** Pieces of `g` still available to place by hand (never negative). */
+export const leftOf = (g: Group, placed: Map<number, number>) =>
+  g.seg?.role === "parent" ? 0 : Math.max(0, g.qty - (placed.get(g.id) ?? 0)); // a segmented original has nothing to place
+
+/** Re-derives the "not nested" list from quantities after a manual change. */
+export function syncUnplaced(res: OptResult, groups: Group[]) {
+  const placed = placedCounts(res);
+  const un: Group[] = [];
+  for (const g of groups) for (let i = leftOf(g, placed); i > 0; i--) un.push(g);
+  res.un = un;
+}
+
+export function newSheet(th: number, material: string): Sheet {
+  return { items: [], th, material, used: 0 };
+}
+
+/** Starts holding a brand-new copy of `g` taken from the parts list. */
+export function startNew(g: Group): Sel {
+  const it: Item = { g, rot: 0, x: 0, y: 0 };
+  // detached sheet that only carries the part's thickness/material until it enters a real sheet
+  const ghost = newSheet(g.th, g.material);
+  ghost.items.push(it);
+  return { sh: ghost, origSh: ghost, idx: -1, it, oth: [], pm: [0, 0], off: [0, 0], orig: { x: 0, y: 0, rot: 0 }, bad: false, fresh: true };
+}
+
+export function othersOf(sh: Sheet, f: Item): Other[] {
+  return sh.items
+    .filter((o) => o !== f)
+    .map((o) => {
+      const q = sides(o);
+      return { s: q, bb: bbox(q.o), it: o };
+    });
+}
+
+/**
+ * Changes the edge margin / part spacing of a nest that is already on screen (manual nesting).
+ * Every placed part is re-snapped to the new grid and every sheet is re-checked against the new margin and
+ * spacing. If any part would break the new values nothing changes (positions are restored) and the number of
+ * offending parts is returned, so the person can move them first.
+ */
+export function regap(res: OptResult, S: Settings, mg: number, gp: number): { S: Settings } | { bad: number } {
+  const nS = makeSettings({ W: S.W, H: S.H, mg, gp, cell: S.cell, ro: S.ro });
+  const saved = new Map<Item, { x: number; y: number }>();
+  for (const sh of res.sheets) for (const it of sh.items) saved.set(it, { x: it.x, y: it.y });
+  let bad = 0;
+  for (const sh of res.sheets) {
+    if (sh.solo) continue; // a solo sheet has no margin / spacing grid
+    for (const it of sh.items) {
+      it.x = snapV(nS, it.x);
+      it.y = snapV(nS, it.y);
+    }
+  }
+  for (const sh of res.sheets) {
+    if (sh.solo) continue;
+    sh.items.forEach((it, idx) => {
+      const sel: Sel = { sh, origSh: sh, idx, it, oth: othersOf(sh, it), off: [0, 0], pm: [0, 0], orig: { x: it.x, y: it.y, rot: it.rot } };
+      if (isBad(sel, nS)) bad++;
+    });
+  }
+  if (bad) {
+    saved.forEach((p, it) => {
+      it.x = p.x;
+      it.y = p.y;
+    });
+    return { bad };
+  }
+  return { S: nS };
+}
+
+export function startPick(sh: Sheet, idx: number, it: Item, m: Pt): Sel {
+  return {
+    sh,
+    origSh: sh,
+    idx,
+    it,
+    oth: othersOf(sh, it),
+    pm: m,
+    off: [m[0] - it.x, m[1] - it.y],
+    orig: { x: it.x, y: it.y, rot: it.rot },
+    bad: false,
+  };
+}
+
+/** Puts a picked part back where it was picked up (Esc). */
+export function cancelPick(sel: Sel) {
+  const it = sel.it;
+  if (sel.sh !== sel.origSh) {
+    const a = sel.sh.items;
+    a.splice(a.indexOf(it), 1);
+    sel.origSh.items.push(it);
+  }
+  it.x = sel.orig.x;
+  it.y = sel.orig.y;
+  it.rot = sel.orig.rot;
+  sel.bad = false;
+}
+
+export function isBad(sel: Sel, S: Settings) {
+  if (inGhost(sel)) return false;
+  const A = sides(sel.it);
+  const b = bbox(A.o);
+  const W = sel.sh.W ?? S.W;
+  const H = sel.sh.H ?? S.H;
+  const mg = mgOf(sel.sh, S);
+  if (b[0] < mg - 0.01 || b[1] < mg - 0.01 || b[2] > W - mg + 0.01 || b[3] > H - mg + 0.01) return true;
+  // same spacing rule as the optimiser: never share a grid cell with another part's spacing zone
+  return gridBad(S, sel.sh, sel.it, sel.it.x, sel.it.y, sel.oth);
+}
+function tryPos(sel: Sel, S: Settings, x: number, y: number) {
+  const it = sel.it;
+  const ox = it.x;
+  const oy = it.y;
+  it.x = snapV(S, x);
+  it.y = snapV(S, y);
+  if (it.x === ox && it.y === oy) return true; // sub-cell movement: stay put
+  if (isBad(sel, S)) {
+    it.x = ox;
+    it.y = oy;
+    return false;
+  }
+  return true;
+}
+export function moveTo(sel: Sel, S: Settings, tx: number, ty: number) {
+  if (sel.bad) {
+    // The part is currently in an invalid spot (forced rotation): let it move
+    // freely so it can be dragged out; it becomes normal again once it is valid.
+    sel.it.x = tx;
+    sel.it.y = ty;
+    sel.bad = isBad(sel, S);
+    return;
+  }
+  if (tryPos(sel, S, tx, ty)) return;
+  const it = sel.it;
+  const n = Math.max(1, Math.ceil(Math.hypot(tx - it.x, ty - it.y) / 3));
+  const sx = (tx - it.x) / n;
+  const sy = (ty - it.y) / n;
+  for (let i = 0; i < n; i++) {
+    const x = it.x + sx;
+    const y = it.y + sy;
+    if (!tryPos(sel, S, x, y) && !tryPos(sel, S, x, it.y) && !tryPos(sel, S, it.x, y)) break;
+  }
+}
+/** Moves the picked part onto another sheet of the same thickness. */
+export function transfer(sel: Sel, S: Settings, sh: Sheet, idx: number, m: Pt): boolean {
+  const it = sel.it;
+  if ((sh.th || 0) !== (sel.sh.th || 0)) return false;
+  if ((sh.material || "") !== (sel.sh.material || "")) return false;
+  if (sh.solo && sh !== sel.sh) return false; // a part-sized sheet takes nothing else
+  if (inGhost(sel)) {
+    // first contact with a sheet: hold the part by the centre of its bounding box
+    const b = bbox(sides(it).o);
+    sel.off = [(b[0] + b[2]) / 2 - it.x, (b[1] + b[3]) / 2 - it.y];
+  }
+  const sv = { sh: sel.sh, idx: sel.idx, oth: sel.oth, x: it.x, y: it.y };
+  sel.sh = sh;
+  sel.idx = idx;
+  sel.oth = othersOf(sh, it);
+  it.x = snapV(S, m[0] - sel.off[0]);
+  it.y = snapV(S, m[1] - sel.off[1]);
+  const bad = isBad(sel, S);
+  if (bad && !sel.bad) {
+    sel.sh = sv.sh;
+    sel.idx = sv.idx;
+    sel.oth = sv.oth;
+    it.x = sv.x;
+    it.y = sv.y;
+    return false;
+  }
+  sel.bad = bad;
+  const a = sv.sh.items;
+  a.splice(a.indexOf(it), 1);
+  sh.items.push(it);
+  return true;
+}
+/** Rotates the picked part by `d` degrees (any angle) around the centre of its bounding box. */
+export function rotate(sel: Sel, S: Settings, d: number) {
+  const it = sel.it;
+  const b = bbox(sides(it).o);
+  it.rot = normAngle(it.rot + d);
+  const c = bbox(sides(it).o);
+  it.x = snapV(S, it.x + (b[0] + b[2] - c[0] - c[2]) / 2);
+  it.y = snapV(S, it.y + (b[1] + b[3] - c[1] - c[3]) / 2);
+  // Rotation is never blocked: if there's no room the part turns anyway and is
+  // flagged invalid (drawn red) until it is moved to a free spot.
+  sel.bad = isBad(sel, S);
+  sel.off = [sel.pm[0] - it.x, sel.pm[1] - it.y];
+}
+
+/** Rotation detents: the wheel stops at every multiple of this many degrees (0, 45, 90, 135, ...). */
+export const ANGLE_DETENT = 45;
+
+/** True when `a` (degrees) sits exactly on a detent. */
+export function isDetent(a: number): boolean {
+  const r = ((a % ANGLE_DETENT) + ANGLE_DETENT) % ANGLE_DETENT;
+  return r < 1e-6 || ANGLE_DETENT - r < 1e-6;
+}
+
+/**
+ * Shortens a requested rotation `d` so it stops exactly on the next detent when it would reach or pass it
+ * (the next notch then carries on normally). A part already on a detent moves away freely.
+ */
+export function detentDelta(cur: number, d: number): number {
+  const e = 1e-9;
+  if (d > 0) {
+    const next = (Math.floor(cur / ANGLE_DETENT + e) + 1) * ANGLE_DETENT;
+    return cur + d >= next - e ? next - cur : d;
+  }
+  if (d < 0) {
+    const prev = (Math.ceil(cur / ANGLE_DETENT - e) - 1) * ANGLE_DETENT;
+    return cur + d <= prev + e ? prev - cur : d;
+  }
+  return d;
+}
+
+/** Like rotate(), but stops on every 45°. Returns true when the part landed exactly on a detent. */
+export function rotateSnap(sel: Sel, S: Settings, d: number): boolean {
+  const dd = detentDelta(sel.it.rot, d);
+  rotate(sel, S, dd);
+  return Math.abs(dd) > 1e-9 && isDetent(sel.it.rot);
+}
+
+// ------------------------------------------------- multi-selection (CAD-style box select)
+
+/** Several parts of ONE sheet selected together; they move as a rigid group. */
+export interface MultiSel {
+  sh: Sheet;
+  idx: number;
+  items: Item[];
+  /** Picked up with a double-click: the whole group follows the mouse until a click places it (Esc cancels). */
+  carry?: boolean;
+  /** Where the group was when it was picked up (so Esc can bring it back, even from another sheet). */
+  home?: { sh: Sheet; pos: Pt[]; rot?: number[] };
+  /** Only while a move is in progress (mouse drag / arrow key / carrying). */
+  drag?: {
+    pm: Pt;
+    base: Pt[];
+    own: Sides[];
+    obb: BBox[];
+    oth: Other[];
+    d: Pt;
+    /** Last pointer position (mm) seen by moveGroup; a rotation restarts the drag from here. */
+    ptr: Pt;
+    /** Started in an invalid spot: moves freely until valid again (same rule as a single part). */
+    bad: boolean;
+  };
+}
+
+/**
+ * Parts picked by a selection rectangle `r` = [x0, y0, x1, y1] (mm, any corner order).
+ *  - window (cross = false, drag left → right): only parts that are completely inside the rectangle.
+ *  - crossing (cross = true, drag right → left): every part the rectangle touches or overlaps.
+ */
+export function itemsInRect(sh: Sheet, r: BBox, cross: boolean): Item[] {
+  const x0 = Math.min(r[0], r[2]);
+  const x1 = Math.max(r[0], r[2]);
+  const y0 = Math.min(r[1], r[3]);
+  const y1 = Math.max(r[1], r[3]);
+  const ring: Pt[] = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  const R: Sides = { o: [ring], h: [] };
+  const out: Item[] = [];
+  for (const it of sh.items) {
+    const A = sides(it);
+    const b = bbox(A.o);
+    if (cross) {
+      if (b[0] > x1 || b[2] < x0 || b[1] > y1 || b[3] < y0) continue;
+      if (hit(A, R)) out.push(it);
+    } else if (b[0] >= x0 && b[2] <= x1 && b[1] >= y0 && b[3] <= y1) out.push(it);
+  }
+  return out;
+}
+
+/** Freezes the current geometry and starts moving the group (`m` = pointer position in mm). */
+export function startGroupDrag(ms: MultiSel, S: Settings, m: Pt) {
+  const chosen = new Set(ms.items);
+  const own = ms.items.map((it) => sides(it));
+  ms.drag = {
+    pm: m,
+    base: ms.items.map((it) => [it.x, it.y] as Pt),
+    own,
+    obb: own.map((q) => bbox(q.o)),
+    oth: ms.sh.items.filter((o) => !chosen.has(o)).map((o) => {
+      const q = sides(o);
+      return { s: q, bb: bbox(q.o), it: o };
+    }),
+    d: [0, 0],
+    ptr: m,
+    bad: false,
+  };
+  ms.drag.bad = groupBad(ms, S, 0, 0);
+}
+
+/** True when moving the whole group by (dx, dy) from where the drag started is not allowed. */
+function groupBad(ms: MultiSel, S: Settings, dx: number, dy: number): boolean {
+  const d = ms.drag as NonNullable<MultiSel["drag"]>;
+  const W = ms.sh.W ?? S.W;
+  const H = ms.sh.H ?? S.H;
+  const mg = mgOf(ms.sh, S);
+  for (let i = 0; i < ms.items.length; i++) {
+    const b = d.obb[i];
+    if (b[0] + dx < mg - 0.01 || b[1] + dy < mg - 0.01 || b[2] + dx > W - mg + 0.01 || b[3] + dy > H - mg + 0.01) return true;
+    if (gridBad(S, ms.sh, ms.items[i], d.base[i][0] + dx, d.base[i][1] + dy, d.oth)) return true;
+  }
+  return false;
+}
+
+/**
+ * Moves the group so the pointer offset from the drag start is (dx, dy), in whole grid cells like optimised parts.
+ * Like a single part, it stops at the last allowed position (slides along walls / other parts) instead of ever
+ * getting closer than the optimiser's spacing or leaving the margin.
+ */
+export function moveGroup(ms: MultiSel, S: Settings, dx: number, dy: number) {
+  const d = ms.drag;
+  if (!d) return;
+  d.ptr = [d.pm[0] + dx, d.pm[1] + dy];
+  const c = S.cell;
+  const apply = (cx: number, cy: number) => {
+    d.d = [cx * c, cy * c];
+    ms.items.forEach((it, i) => {
+      it.x = d.base[i][0] + cx * c;
+      it.y = d.base[i][1] + cy * c;
+    });
+  };
+  const tx = Math.round(dx / c);
+  const ty = Math.round(dy / c);
+  if (d.bad) {
+    apply(tx, ty);
+    d.bad = groupBad(ms, S, tx * c, ty * c);
+    return;
+  }
+  let x = Math.round(d.d[0] / c);
+  let y = Math.round(d.d[1] / c);
+  if (x === tx && y === ty) return;
+  if (!groupBad(ms, S, tx * c, ty * c)) {
+    apply(tx, ty);
+    return;
+  }
+  const steps = Math.max(Math.abs(tx - x), Math.abs(ty - y));
+  for (let i = 0; i < steps; i++) {
+    const sx = Math.sign(tx - x);
+    const sy = Math.sign(ty - y);
+    if (sx && sy && !groupBad(ms, S, (x + sx) * c, (y + sy) * c)) {
+      x += sx;
+      y += sy;
+    } else if (sx && !groupBad(ms, S, (x + sx) * c, y * c)) x += sx;
+    else if (sy && !groupBad(ms, S, x * c, (y + sy) * c)) y += sy;
+    else break;
+  }
+  apply(x, y);
+}
+
+/** Puts the group back where it was when the drag/carry started (Esc), on its original sheet. */
+export function cancelGroupDrag(ms: MultiSel) {
+  const h = ms.home;
+  if (h) {
+    if (h.sh !== ms.sh) {
+      for (const it of ms.items) {
+        const i = ms.sh.items.indexOf(it);
+        if (i >= 0) ms.sh.items.splice(i, 1);
+        h.sh.items.push(it);
+      }
+      ms.sh = h.sh;
+    }
+    ms.items.forEach((it, i) => {
+      it.x = h.pos[i][0];
+      it.y = h.pos[i][1];
+      if (h.rot) it.rot = h.rot[i];
+    });
+    ms.home = undefined;
+    ms.drag = undefined;
+    return;
+  }
+  const d = ms.drag;
+  if (!d) return;
+  ms.items.forEach((it, i) => {
+    it.x = d.base[i][0];
+    it.y = d.base[i][1];
+  });
+  ms.drag = undefined;
+}
+
+/**
+ * Carries the whole group onto another sheet of the same thickness / material. The group is centred on the pointer
+ * (pulled back inside the margin) and moves over only if every part fits there. Returns false when it does not.
+ */
+export function transferGroup(ms: MultiSel, S: Settings, sh: Sheet, idx: number, m: Pt): boolean {
+  if (sh === ms.sh) return true;
+  if ((sh.th || 0) !== (ms.sh.th || 0) || (sh.material || "") !== (ms.sh.material || "")) return false;
+  if (sh.solo) return false; // a part-sized sheet takes nothing else
+  const bs = ms.items.map((it) => bbox(sides(it).o));
+  const x0 = Math.min(...bs.map((q) => q[0]));
+  const y0 = Math.min(...bs.map((q) => q[1]));
+  const x1 = Math.max(...bs.map((q) => q[2]));
+  const y1 = Math.max(...bs.map((q) => q[3]));
+  const W = sh.W ?? S.W;
+  const H = sh.H ?? S.H;
+  const c = S.cell;
+  // whole-cell shifts that keep the group's bounding box inside the margin
+  const lox = Math.ceil((S.mg - x0) / c) * c;
+  const hix = Math.floor((W - S.mg - x1) / c) * c;
+  const loy = Math.ceil((S.mg - y0) / c) * c;
+  const hiy = Math.floor((H - S.mg - y1) / c) * c;
+  if (lox > hix || loy > hiy) return false;
+  const dx = Math.max(lox, Math.min(hix, Math.round((m[0] - (x0 + x1) / 2) / c) * c));
+  const dy = Math.max(loy, Math.min(hiy, Math.round((m[1] - (y0 + y1) / 2) / c) * c));
+  const oth: Other[] = sh.items.map((o) => {
+    const q = sides(o);
+    return { s: q, bb: bbox(q.o), it: o };
+  });
+  for (const it of ms.items) if (gridBad(S, sh, it, it.x + dx, it.y + dy, oth)) return false;
+  for (const it of ms.items) {
+    const i = ms.sh.items.indexOf(it);
+    if (i >= 0) ms.sh.items.splice(i, 1);
+    it.x += dx;
+    it.y += dy;
+    sh.items.push(it);
+  }
+  ms.sh = sh;
+  ms.idx = idx;
+  startGroupDrag(ms, S, m);
+  return true;
+}
+
+/**
+ * Splits a group that is being moved (mouse drag or carry): the part under the pointer stays in hand and keeps
+ * following it, every other part of the group goes back to where it was before the move started ("last position":
+ * the pick-up spot for a carry, the drag start for a mouse drag - on its original sheet).
+ * Returns the part that stays in hand, or null when there is nothing to separate (fewer than 2 parts / no move).
+ */
+export function separateGroup(ms: MultiSel, S: Settings): Item | null {
+  const dr = ms.drag;
+  if (!dr || ms.items.length < 2) return null;
+  const [px, py] = dr.ptr;
+  // the part the pointer is on (top-most wins, then nearest centre); if it is on none, the nearest one
+  let keep = 0;
+  let best = Infinity;
+  let inside = false;
+  ms.items.forEach((it, i) => {
+    const b = dr.obb[i];
+    const ins = px >= b[0] && px <= b[2] && py >= b[1] && py <= b[3];
+    const dist = Math.hypot(px - (b[0] + b[2]) / 2, py - (b[1] + b[3]) / 2);
+    if ((ins && !inside) || (ins === inside && dist < best)) {
+      keep = i;
+      best = dist;
+      inside = ins;
+    }
+  });
+  const h = ms.home;
+  const backSh = h ? h.sh : ms.sh;
+  const kept = ms.items[keep];
+  const keptHome = h
+    ? { sh: h.sh, pos: [h.pos[keep]], rot: h.rot ? [h.rot[keep]] : undefined }
+    : undefined;
+  ms.items.forEach((it, i) => {
+    if (i === keep) return;
+    const at = ms.sh.items.indexOf(it);
+    if (at >= 0) ms.sh.items.splice(at, 1);
+    const pos = h ? h.pos[i] : dr.base[i];
+    it.x = pos[0];
+    it.y = pos[1];
+    if (h?.rot) it.rot = h.rot[i];
+    backSh.items.push(it);
+  });
+  ms.items = [kept];
+  ms.home = keptHome;
+  startGroupDrag(ms, S, dr.ptr); // the kept part keeps following the pointer from where it is now
+  return kept;
+}
+
+/** Moves the selected group by a small step (arrow keys); it stops at the last allowed position. */
+export function nudgeGroup(ms: MultiSel, S: Settings, dx: number, dy: number) {
+  startGroupDrag(ms, S, [0, 0]);
+  moveGroup(ms, S, dx, dy);
+  ms.drag = undefined;
+}
+
+/**
+ * Rotates the whole selection as one rigid block by `d` degrees (counter-clockwise, like a single part) around the
+ * centre of its bounding box. Like a single part, rotation is never blocked: when there is no room the group turns
+ * anyway and is flagged `drag.bad` (drawn red, can't be placed) until it is moved to a free spot.
+ * Needs an active drag (start one with startGroupDrag first).
+ */
+export function rotateGroup(ms: MultiSel, S: Settings, d: number) {
+  const dr = ms.drag;
+  if (!dr) return;
+  const bs = ms.items.map((it) => bbox(sides(it).o));
+  const cx = (Math.min(...bs.map((q) => q[0])) + Math.max(...bs.map((q) => q[2]))) / 2;
+  const cy = (Math.min(...bs.map((q) => q[1])) + Math.max(...bs.map((q) => q[3]))) / 2;
+  const t = (d * Math.PI) / 180;
+  const co = Math.cos(t);
+  const si = Math.sin(t);
+  for (const it of ms.items) {
+    // follow a point that is fixed to the part itself, so the motion is an exact rigid rotation
+    const q: Pt = [it.g.w / 2, it.g.h / 2];
+    const w0 = tp(it.g, it.rot, q);
+    const rx = w0[0] + it.x - cx;
+    const ry = w0[1] + it.y - cy;
+    const tx = cx + rx * co - ry * si;
+    const ty = cy + rx * si + ry * co;
+    it.rot = normAngle(it.rot + d);
+    const w1 = tp(it.g, it.rot, q);
+    it.x = tx - w1[0];
+    it.y = ty - w1[1];
+  }
+  // one shared shift puts the block back on the optimiser's grid without changing the gaps inside it
+  const f = ms.items[0];
+  const sx = snapV(S, f.x) - f.x;
+  const sy = snapV(S, f.y) - f.y;
+  for (const it of ms.items) {
+    it.x += sx;
+    it.y += sy;
+  }
+  startGroupDrag(ms, S, dr.ptr); // keeps following the pointer from where it is now
+}
+
+/** Like rotateGroup(), but stops on every 45° (measured on the first part of the block). True = landed on a detent. */
+export function rotateGroupSnap(ms: MultiSel, S: Settings, d: number): boolean {
+  const ref = ms.items[0];
+  if (!ref) return false;
+  const dd = detentDelta(ref.rot, d);
+  rotateGroup(ms, S, dd);
+  return Math.abs(dd) > 1e-9 && isDetent(ref.rot);
+}
+
+// --------------------------------------------------------------------- drawing
+
+export interface DrawExtras {
+  /** Parts in the multi-selection (outlined in blue, or red while the block is in an invalid spot). */
+  sel?: ReadonlySet<Item> | null;
+  selBad?: boolean;
+  /** Selection rectangle being dragged, in mm. `cross` = right-to-left (touch) selection, drawn green + dashed. */
+  box?: { x0: number; y0: number; x1: number; y1: number; cross: boolean } | null;
+  /** Angle badge of the part / block being held: shown above (x, y) in mm; `snap` = exactly on a 45° step (drawn green). */
+  angle?: { deg: number; x: number; y: number; snap: boolean } | null;
+  /** Pixels per CSS px of the target canvas (devicePixelRatio × any extra supersampling). Default 1. */
+  dpr?: number;
+  /** Measure tool: segment in mm (drawn with its length). */
+  measure?: { a: Pt; b: Pt } | null;
+}
+
+export function drawSheet(sh: Sheet, cv: HTMLCanvasElement, k: number, S: Settings, selItem: Item | null, selBad = false, extra?: DrawExtras) {
+  const c = cv.getContext("2d") as CanvasRenderingContext2D;
+  /** Device-pixel ratio: line widths / dashes / text are authored in CSS px and scaled by this so hi-DPI + zoomed canvases stay crisp. */
+  const u = extra?.dpr ?? 1;
+  c.imageSmoothingQuality = "high";
+  const W = sh.W ?? S.W;
+  const H = sh.H ?? S.H;
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.clearRect(0, 0, cv.width, cv.height);
+  c.setTransform(k, 0, 0, -k, 0, cv.height);
+  c.lineWidth = u / k;
+  c.strokeStyle = "#94a3b8";
+  c.setLineDash([6 * u / k, 4 * u / k]);
+  const dmg = mgOf(sh, S);
+  c.strokeRect(dmg, dmg, W - 2 * dmg, H - 2 * dmg);
+  c.setLineDash([]);
+  for (const it of sh.items) {
+    c.fillStyle = selBad && selItem === it ? "#ef4444" : partColor(it.g);
+    const P = path(it.g, it.rot, it.x, it.y);
+    c.fill(P, "evenodd");
+    c.globalAlpha = selItem === it ? 0.75 : 1;
+    c.strokeStyle = selBad && selItem === it ? "#991b1b" : selItem === it && extra?.angle?.snap ? "#16a34a" : "#0008";
+    c.lineWidth = selItem === it && extra?.angle?.snap ? 2.5 * u / k : u / k;
+    c.stroke(P);
+    c.globalAlpha = 1;
+    if (extra?.sel?.has(it)) {
+      c.strokeStyle = extra.selBad ? "#dc2626" : "#2563eb";
+      c.lineWidth = 2.5 * u / k;
+      c.stroke(P);
+      c.lineWidth = u / k;
+    }
+  }
+  const bx = extra?.box;
+  if (bx) {
+    // AutoCAD style: window (left → right) = blue solid, crossing (right → left) = green dashed
+    const col = bx.cross ? "#16a34a" : "#2563eb";
+    c.fillStyle = bx.cross ? "rgba(22,163,74,0.14)" : "rgba(37,99,235,0.14)";
+    c.strokeStyle = col;
+    c.lineWidth = 1.5 * u / k;
+    c.setLineDash(bx.cross ? [6 * u / k, 4 * u / k] : []);
+    c.fillRect(bx.x0, bx.y0, bx.x1 - bx.x0, bx.y1 - bx.y0);
+    c.strokeRect(bx.x0, bx.y0, bx.x1 - bx.x0, bx.y1 - bx.y0);
+    c.setLineDash([]);
+    c.lineWidth = u / k;
+  }
+  // serial numbers on every part (drawn un-flipped so the text is readable)
+  c.save();
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.lineJoin = "round";
+  for (const it of sh.items) {
+    const b = bbox(sides(it).o);
+    const m = Math.min(b[2] - b[0], b[3] - b[1]) * k;
+    if (m < 16 * u) continue;
+    c.font = `bold ${Math.max(9 * u, Math.min(16 * u, m / 3))}px system-ui, Arial, sans-serif`;
+    const x = ((b[0] + b[2]) / 2) * k;
+    const y = cv.height - ((b[1] + b[3]) / 2) * k;
+    const t = `#${snText(it.g)}`;
+    c.lineWidth = 3 * u;
+    c.strokeStyle = "#fff";
+    c.strokeText(t, x, y);
+    c.fillStyle = "#000";
+    c.fillText(t, x, y);
+  }
+  const ms = extra?.measure;
+  if (ms) {
+    const ax = ms.a[0] * k, ay = cv.height - ms.a[1] * k, bx1 = ms.b[0] * k, by1 = cv.height - ms.b[1] * k;
+    c.strokeStyle = "#7c3aed";
+    c.fillStyle = "#7c3aed";
+    c.lineWidth = 1.5 * u;
+    c.beginPath();
+    c.moveTo(ax, ay);
+    c.lineTo(bx1, by1);
+    c.stroke();
+    for (const [px, py] of [[ax, ay], [bx1, by1]]) {
+      c.beginPath();
+      c.arc(px, py, 3.5 * u, 0, Math.PI * 2);
+      c.fill();
+    }
+    const dx = Math.abs(ms.b[0] - ms.a[0]);
+    const dy = Math.abs(ms.b[1] - ms.a[1]);
+    const len = Math.hypot(dx, dy);
+    const label = `${len.toFixed(1)} mm  (Δx ${dx.toFixed(1)} · Δy ${dy.toFixed(1)})`;
+    c.font = `bold ${12 * u}px system-ui, Arial, sans-serif`;
+    const w = c.measureText(label).width + 12 * u;
+    const lx = Math.max(2 * u, Math.min(cv.width - w - 2 * u, (ax + bx1) / 2 - w / 2));
+    const ly = Math.max(2 * u, Math.min(cv.height - 20 * u, (ay + by1) / 2 - 24 * u));
+    c.fillStyle = "rgba(124,58,237,0.95)";
+    c.beginPath();
+    if (typeof c.roundRect === "function") c.roundRect(lx, ly, w, 18 * u, 9 * u);
+    else c.rect(lx, ly, w, 18 * u);
+    c.fill();
+    c.fillStyle = "#fff";
+    c.fillText(label, lx + w / 2, ly + 9.5 * u);
+  }
+  const an = extra?.angle;
+  if (an) {
+    const label = `${Math.round(an.deg * 10) / 10}°`;
+    c.font = `bold ${13 * u}px system-ui, Arial, sans-serif`;
+    const w = c.measureText(label).width + 14 * u;
+    const bx0 = Math.max(2 * u, Math.min(cv.width - w - 2 * u, an.x * k - w / 2));
+    const by0 = Math.max(2 * u, cv.height - an.y * k - 26 * u);
+    c.fillStyle = an.snap ? "#16a34a" : "rgba(15,23,42,0.85)";
+    c.beginPath();
+    if (typeof c.roundRect === "function") c.roundRect(bx0, by0, w, 20 * u, 10 * u);
+    else c.rect(bx0, by0, w, 20 * u);
+    c.fill();
+    c.fillStyle = "#fff";
+    c.fillText(label, bx0 + w / 2, by0 + 10.5 * u);
+  }
+  c.restore();
+}
+
+export function sheetStats(sh: Sheet, S: Settings) {
+  let a = 0;
+  let mx = 0;
+  for (const it of sh.items) {
+    a += it.g.area;
+    mx = Math.max(mx, bbox(sides(it).o)[2]);
+  }
+  const W = sh.W ?? S.W;
+  const H = sh.H ?? S.H;
+  return {
+    parts: sh.items.reduce((s, x) => s + (x.g.n || 1), 0),
+    usedLength: Math.round(mx + mgOf(sh, S)),
+    utilization: (100 * a) / (W * H),
+  };
+}
+
+// --------------------------------------------------------------------- problems
+
+/** Explains why a part could not be nested. */
+export function whyNotNested(g: Group, S: Settings): string {
+  const uw = S.W - 2 * S.mg;
+  const uh = S.H - 2 * S.mg;
+  const R = rotList(S.ro);
+  const fit = (rs: number[]) =>
+    rs.some((r) => {
+      const b = rotBox(g, r);
+      return b.w <= uw && b.h <= uh;
+    });
+  const pr = (g.n || 1) > 1;
+  const sz = `${pr ? "pair of triangles " : "part "}${g.w.toFixed(1)} × ${g.h.toFixed(1)} mm`;
+  const us = `${uw} × ${uh} mm`;
+  if (!fit(R)) {
+    if (fit([0, 90]))
+      return `${sz} does not fit the usable sheet area ${us} with the current rotation setting — enable "90° steps" rotation`;
+    return (
+      `${sz} is larger than the usable sheet area ${us} (sheet size minus edge margins) — use a bigger sheet or a smaller margin` +
+      (pr ? ', or untick "Auto-pair triangles"' : "")
+    );
+  }
+  return `no free position found (spacing ${S.gp} mm, grid cell ${S.cell} mm) — try a smaller grid cell or spacing`;
+}
+
+/** One message per un-nested part number. */
+export function problemMessages(res: OptResult, S: Settings): string[] {
+  const msgs = res.skip.slice();
+  // manual nesting: leftovers are just "still to place" (shown in the parts table), not optimiser failures
+  if (res.manual) return msgs;
+  const mp = new Map<number, { g: Group; c: number }>();
+  for (const g of res.un) {
+    const q = mp.get(g.sn) || { g, c: 0 };
+    q.c++;
+    mp.set(g.sn, q);
+  }
+  mp.forEach(({ g, c }) =>
+    msgs.push(`Part #${snText(g)} (${g.name}) — ${c} pc${c > 1 ? "s" : ""} NOT nested: ${res.unWhy?.[g.sn] ?? whyNotNested(g, S)}`),
+  );
+  return msgs;
+}
+
+// ----------------------------------------------------------------- DXF export
+
+/**
+ * Detects a ring that is really a full circle (a CIRCLE entity or a polyline
+ * circle that was tessellated when the DXF was read). Returns its centre and
+ * radius, or null for anything else. Circles survive every rotation, so this
+ * can run on the already-transformed points.
+ */
+function fitCircle(pts: Pt[]): { c: Pt; r: number } | null {
+  const n = pts.length;
+  // A real polygon with few sides (hexagon, octagon...) must stay a polyline.
+  if (n < 16) return null;
+  // Least-squares (Kasa) fit: x^2 + y^2 + a*x + b*y + c = 0
+  let sx = 0, sy = 0;
+  for (const p of pts) {
+    sx += p[0];
+    sy += p[1];
+  }
+  const mx = sx / n;
+  const my = sy / n;
+  let suu = 0, suv = 0, svv = 0, suuu = 0, svvv = 0, suvv = 0, svuu = 0;
+  for (const p of pts) {
+    const u = p[0] - mx;
+    const v = p[1] - my;
+    suu += u * u;
+    suv += u * v;
+    svv += v * v;
+    suuu += u * u * u;
+    svvv += v * v * v;
+    suvv += u * v * v;
+    svuu += v * u * u;
+  }
+  const det = suu * svv - suv * suv;
+  if (Math.abs(det) < 1e-9) return null;
+  const k1 = 0.5 * (suuu + suvv);
+  const k2 = 0.5 * (svvv + svuu);
+  const uc = (k1 * svv - k2 * suv) / det;
+  const vc = (k2 * suu - k1 * suv) / det;
+  const cx = uc + mx;
+  const cy = vc + my;
+  const r = Math.sqrt(uc * uc + vc * vc + (suu + svv) / n);
+  if (!(r > 0)) return null;
+  const tol = Math.max(0.05, r * 0.001);
+  for (const p of pts) if (Math.abs(Math.hypot(p[0] - cx, p[1] - cy) - r) > tol) return null;
+  // Points must go all the way round (no big empty arc such as a "D" shape).
+  const ang = pts.map((p) => Math.atan2(p[1] - cy, p[0] - cx)).sort((a, b) => a - b);
+  let gap = ang[0] + 2 * Math.PI - ang[n - 1];
+  for (let i = 1; i < n; i++) gap = Math.max(gap, ang[i] - ang[i - 1]);
+  if (gap > Math.PI / 6) return null;
+  return { c: [cx, cy], r };
+}
+
+export function buildDxf(sheets: Sheet[], S: Settings): string {
+  let s = "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n";
+  const pl = (pts: Pt[], ox: number) => {
+    // Round contours are written as true CIRCLE entities, not polylines.
+    const ci = fitCircle(pts);
+    if (ci) {
+      s += `0\nCIRCLE\n8\n0\n10\n${(ci.c[0] + ox).toFixed(3)}\n20\n${ci.c[1].toFixed(3)}\n30\n0.0\n40\n${ci.r.toFixed(3)}\n`;
+      return;
+    }
+    s += "0\nPOLYLINE\n8\n0\n66\n1\n70\n1\n";
+    pts.forEach((p) => {
+      s += `0\nVERTEX\n8\n0\n10\n${(p[0] + ox).toFixed(3)}\n20\n${p[1].toFixed(3)}\n`;
+    });
+    s += "0\nSEQEND\n8\n0\n";
+  };
+  // A note written above each sheet: number, material, thickness, size and what is on it.
+  const txt = (str: string, x: number, y: number, h: number) => {
+    const clean = str.replace(/[\r\n]+/g, " ").replace(/[^\x20-\x7E]/g, "?");
+    s += `0\nTEXT\n8\n0\n10\n${x.toFixed(3)}\n20\n${y.toFixed(3)}\n30\n0.0\n40\n${h.toFixed(3)}\n1\n${clean}\n`;
+  };
+  let ox = 0;
+  sheets.forEach((sh, si) => {
+    const W = sh.W ?? S.W;
+    const H = sh.H ?? S.H;
+    pl([[0, 0], [W, 0], [W, H], [0, H]], ox);
+    const th = sh.th ?? 0;
+    const mat = (sh.material ?? "").trim();
+    const th_h = Math.min(80, Math.max(15, W / 60));
+    const perPart = new Map<string, number>();
+    for (const it of sh.items) perPart.set(snText(it.g), (perPart.get(snText(it.g)) ?? 0) + 1);
+    txt(
+      `Sheet ${si + 1} | Material: ${mat || "-"} | thk: ${th > 0 ? `${th} mm` : "-"} | ${Math.round(W)} x ${Math.round(H)} | ${sh.items.length} pcs`,
+      ox,
+      H + th_h * 1.2,
+      th_h,
+    );
+    if (perPart.size)
+      txt(`Parts: ${[...perPart].map(([sn, n]) => `#${sn} x${n}`).join("  ")}`, ox, H + th_h * 0.1, th_h * 0.7);
+    for (const it of sh.items)
+      for (const r of [it.g.outer, ...it.g.holes, ...(it.g.extra || [])])
+        pl(
+          r.map((p) => {
+            const q = tp(it.g, it.rot, p);
+            return [q[0] + it.x, q[1] + it.y] as Pt;
+          }),
+          ox,
+        );
+    ox += W + 300;
+  });
+  s += "0\nENDSEC\n0\nEOF\n";
+  return s;
+}
