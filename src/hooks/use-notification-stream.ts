@@ -11,6 +11,10 @@ export interface LiveNotification {
 const MAX_NOTIFICATIONS = 30;
 const RECONNECT_DELAY_MS = 3000;
 
+// Live notifications are disabled: the SSE stream polled the DB every 2s per open tab
+// and kept reconnecting on Vercel, burning function time and DB compute.
+const NOTIFICATIONS_ENABLED = false;
+
 export function useNotificationStream() {
   const [notifications, setNotifications] = useState<LiveNotification[]>([]);
   const [connected, setConnected] = useState(false);
@@ -18,6 +22,7 @@ export function useNotificationStream() {
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    if (!NOTIFICATIONS_ENABLED) return;
     let cancelled = false;
 
     function connect() {
