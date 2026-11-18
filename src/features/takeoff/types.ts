@@ -28,6 +28,10 @@ export interface TakeoffPartRow {
   posNo: string | null;
   qtyPerAssembly: number;
   remark: string | null;
+  /** scope this part belongs to (the project's Scope list) */
+  scopeId: string | null;
+  /** work order (group of parts sent to the shop together) this part belongs to */
+  workOrderGroupId: string | null;
   /** link to the part of the project's 2D nest this plate came from */
   nestKind: string | null;
   nestPartId: number | null;

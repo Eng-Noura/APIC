@@ -10,6 +10,8 @@ import { DrawingForm } from "./drawing-form";
 import { NestingImportDialog } from "./nesting-import-dialog";
 import { PartsGrid } from "./parts-grid";
 import { BoqPanel } from "./boq-panel";
+import { GroupingsPanel } from "./groupings-panel";
+import type { GroupingsData } from "@/server/services/part-grouping.service";
 import { sideAreas } from "./side-areas";
 import { autoImportNestParts } from "./nest-auto-import";
 import { useTakeoffProject } from "./project-context";
@@ -66,15 +68,23 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
   const [deletingDrawing, setDeletingDrawing] = React.useState<TakeoffDrawingRow | null>(null);
   const [deleteLoading, setDeleteLoading] = React.useState(false);
 
+  // The project's assemblies / scopes / work orders: feeds the three group columns, the "Group as…" window and the panel.
+  // Reloaded together with the drawings, so the part counts always match what is on screen.
+  const [groupings, setGroupings] = React.useState<GroupingsData | null>(null);
+  const loadGroupings = React.useCallback(async (pid: string) => {
+    const res = await fetch(`/api/part-groupings?projectId=${pid}`).catch(() => null);
+    setGroupings(res?.ok ? ((await res.json()) as GroupingsData) : null);
+  }, []);
+
   const loadDrawings = React.useCallback(async (pid: string): Promise<TakeoffDrawingRow[]> => {
     if (!pid) return [];
     setLoading(true);
-    const res = await fetch(`/api/takeoff/drawings?projectId=${pid}`);
+    const [res] = await Promise.all([fetch(`/api/takeoff/drawings?projectId=${pid}`), loadGroupings(pid)]);
     const list: TakeoffDrawingRow[] = res.ok ? await res.json() : [];
     setDrawings(list);
     setLoading(false);
     return list;
-  }, []);
+  }, [loadGroupings]);
 
   // Automatic: opening the Part List (or coming back to this browser tab) brings in the nest's new parts (once per
   // project) and carries quantity changes between the nest and the BOQ. The "Sync with nest" button stays for a manual run.
@@ -249,6 +259,10 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
         <BoqPanel projectId={projectId} drawings={drawings} canCreate={canCreate} canDelete={canDelete} refreshKey={drawings} onChanged={() => loadDrawings(projectId)} />
       )}
 
+      {projectId && drawings.length > 0 && (
+        <GroupingsPanel projectId={projectId} data={groupings} canCreate={canCreate} canDelete={canDelete} onChanged={() => { void loadGroupings(projectId); loadDrawings(projectId); }} />
+      )}
+
       {!projectId ? (
         <EmptyState icon={<FolderKanban className="h-5 w-5" />} title="No project selected" description="Choose a project above to see its material take-off data." />
       ) : loading ? (
@@ -311,6 +325,8 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
                   canCreate={canCreate}
                   canDelete={canDelete}
                   onChanged={() => loadDrawings(projectId)}
+                  groupings={groupings}
+                  onGroupingsChanged={() => void loadGroupings(projectId)}
                 />
               </div>
             );

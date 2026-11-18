@@ -159,6 +159,7 @@ model Project {
   purchaseOrders    PurchaseOrder[]
   workOrders        WorkOrder[]
   partGroups        PartGroup[]
+  workOrderGroups   WorkOrderGroup[]
 
   // ---------------------------------------------------------------------
   // Phase 2 extension point (do not remove): future models such as
@@ -272,6 +273,14 @@ model TakeoffPart {
   qtyPerAssembly Int        @default(1)
   remark         String?
 
+  // Two more ways to group parts, independent of the assembly (a part has at most one of each):
+  //   scope          — which scope of work the part belongs to (the project's Scope list, see ScopeItem)
+  //   workOrderGroup — which work order (package of parts sent to the shop together) it belongs to
+  scopeId          String?
+  scope            ScopeItem?       @relation(fields: [scopeId], references: [id], onDelete: SetNull)
+  workOrderGroupId String?
+  workOrderGroup   WorkOrderGroup?  @relation(fields: [workOrderGroupId], references: [id], onDelete: SetNull)
+
   // Link to the part of the project's nesting workspace this part came from (the workspace is unique per
   // project + kind, so kind + part id is enough). `nestSyncedQty` is the quantity both sides had at the last sync:
   // comparing it with each side's current quantity tells WHO changed (see src/server/calc/nest-sync.ts).
@@ -289,6 +298,8 @@ model TakeoffPart {
   nestingPlacements NestingPlacement[] @relation("TakeoffPartNestingPlacements")
 
   @@index([groupId])
+  @@index([scopeId])
+  @@index([workOrderGroupId])
   @@index([nestKind, nestPartId])
   @@map("takeoff_parts")
 }
@@ -320,6 +331,28 @@ model PartGroup {
   @@unique([projectId, code])
   @@index([projectId, sortOrder])
   @@map("part_groups")
+}
+
+// A work order GROUP: the parts that go to the shop together (e.g. "WO-01 — Gable wall"). Parts point to it with
+// `workOrderGroupId`. This is the planning side; the shop-floor tracking items (WorkOrder / pieces) are separate.
+model WorkOrderGroup {
+  id        String    @id @default(cuid())
+  code      String
+  name      String
+  dueDate   DateTime?
+  remark    String?
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  parts TakeoffPart[]
+
+  @@unique([projectId, code])
+  @@index([projectId, sortOrder])
+  @@map("work_order_groups")
 }
 
 enum PartType {
@@ -745,6 +778,9 @@ model ScopeItem {
 
   createdById String
   createdBy   User   @relation("ScopeItemCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  // Take-off parts that belong to this scope (Part List -> "Group as Scope").
+  parts TakeoffPart[]
 
   @@map("scope_items")
 }
