@@ -28,7 +28,9 @@ function NestingTabLinks({ isNesting }: { isNesting: boolean }) {
   );
 }
 
-function TakeoffTopBar({ showScrap, showSteelPricing }: { showScrap: boolean; showSteelPricing: boolean }) {
+// showScrap / showSteelPricing are unused while those tabs are temporarily hidden.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function TakeoffTopBar(_props: { showScrap: boolean; showSteelPricing: boolean }) {
   const pathname = usePathname();
   const isNesting = pathname?.startsWith("/takeoff/nesting") ?? false;
   const isScrap = pathname?.startsWith("/takeoff/scrap-material") ?? false;
@@ -54,6 +56,7 @@ function TakeoffTopBar({ showScrap, showSteelPricing }: { showScrap: boolean; sh
         >
           <NestingTabLinks isNesting={isNesting} />
         </React.Suspense>
+        {/* TEMP-HIDDEN (Nozzles / Scrap & Material / Steel Pricing) - uncomment to restore, or delete for good later.
         <Link href="/takeoff/nozzles" className={activeTabClass(isNozzles)}>
           Nozzles
         </Link>
@@ -67,6 +70,7 @@ function TakeoffTopBar({ showScrap, showSteelPricing }: { showScrap: boolean; sh
             Steel Pricing
           </Link>
         )}
+        */}
       </div>
     </div>
   );

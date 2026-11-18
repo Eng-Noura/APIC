@@ -231,15 +231,21 @@ export function TakeoffProjectProvider({ children }: { children: React.ReactNode
   }, []);
 
   React.useEffect(() => {
+    // Opened from the Start screen: /takeoff?project=<id> opens that project, then the param is dropped from the address.
+    const wanted = new URLSearchParams(window.location.search).get("project");
+    if (wanted) window.history.replaceState(null, "", window.location.pathname);
     fetch("/api/projects")
       .then((r) => r.json())
-      .then((data) => setProjects(data))
+      .then((data) => {
+        setProjects(data);
+        if (wanted) select(wanted, "");
+      })
       .finally(() => setLoadingProjects(false));
     fetch("/api/nesting/history")
       .then((r) => (r.ok ? r.json() : []))
       .then((data) => setHistory(Array.isArray(data) ? data : []))
       .catch(() => undefined);
-  }, []);
+  }, [select]);
 
   return (
     <TakeoffProjectContext.Provider

@@ -8,6 +8,7 @@ import { NAV_ITEMS } from "@/lib/nav-config";
 import type { Role } from "@prisma/client";
 
 const SUBTITLES: Record<string, string> = {
+  "/start": "Choose how you want to start",
   "/dashboard": "Operational overview across all active projects",
   "/projects": "Manage engineering projects and their lifecycle",
   "/customers": "Manage your customer directory",

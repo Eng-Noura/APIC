@@ -23,6 +23,7 @@ export interface NavItem {
 }
 
 export const NAV_ITEMS: NavItem[] = [
+  { label: "Start", href: "/start", icon: LayoutDashboard, hidden: true }, // landing screen; kept out of the sidebar (the logo links to it)
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard, hidden: true },
   {
     label: "Projects", href: "/projects", icon: FolderKanban, roles: ["ADMIN"],

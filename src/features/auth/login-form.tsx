@@ -45,7 +45,7 @@ export function LoginForm() {
       setError("Invalid email or password.");
       return;
     }
-    router.push(params.get("callbackUrl") || "/dashboard");
+    router.push(params.get("callbackUrl") || "/start");
     router.refresh();
   }
 
