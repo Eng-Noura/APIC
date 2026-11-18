@@ -26,7 +26,7 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "Start", href: "/start", icon: LayoutDashboard, hidden: true }, // landing screen; kept out of the sidebar (the logo links to it)
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard, hidden: true },
   {
-    label: "Projects", href: "/projects", icon: FolderKanban, roles: ["ADMIN"],
+    label: "Projects", href: "/projects", icon: FolderKanban,
     children: [
       { key: "list", label: "Projects List", icon: List, href: "/projects" },
       { key: "planning", label: "Planning", icon: CalendarRange, href: "/planning" },

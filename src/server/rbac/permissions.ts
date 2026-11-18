@@ -37,13 +37,13 @@ export const PERMISSIONS = {
   "nesting.edit": ["ADMIN", "MANAGER", "ENGINEER"],
   "nesting.delete": ["ADMIN", "MANAGER"],
 
-  // Scrap & Material pricing — restricted to ADMIN (Nouran Elsayed).
-  "scrapPricing.view": ["ADMIN"],
+  // Scrap & Material pricing — everyone can view; exporting stays with ADMIN.
+  "scrapPricing.view": ["ADMIN", "MANAGER", "ENGINEER", "VIEWER"],
   "scrapPricing.export": ["ADMIN"],
 
   // Steel Structures Pricing Engine — rebuilds the original pricing sheet as
   // one editable page (rate card, single-item calculator, full BOQ).
-  "steelPricing.view": ["ADMIN"],
+  "steelPricing.view": ["ADMIN", "MANAGER", "ENGINEER", "VIEWER"], // everyone can view; exporting stays with ADMIN
   "steelPricing.export": ["ADMIN"],
 
   // Planning & follow-up (Primavera-style schedule). Anyone can view; editing the
@@ -53,15 +53,15 @@ export const PERMISSIONS = {
   "planning.edit": ["ADMIN", "MANAGER", "ENGINEER"],
   "planning.delete": ["ADMIN", "MANAGER"],
 
-  // Quotations carry prices and margins, so they are limited to managers and admins;
-  // only an admin can approve / reject or delete one.
-  "quotations.view": ["ADMIN", "MANAGER"],
+  // Quotations: everyone can VIEW them (prices and margins included); only managers and admins can edit,
+  // and only an admin can approve / reject or delete one.
+  "quotations.view": ["ADMIN", "MANAGER", "ENGINEER", "VIEWER"],
   "quotations.edit": ["ADMIN", "MANAGER"],
   "quotations.approve": ["ADMIN"],
 
-  // Procurement: suppliers and purchase orders carry prices, so creating them is for managers and admins;
-  // anyone who works on a project can see them and record what arrives on site.
-  "procurement.view": ["ADMIN", "MANAGER", "ENGINEER"],
+  // Procurement: everyone can see suppliers and purchase orders; creating them is for managers and admins;
+  // engineers can record what arrives on site.
+  "procurement.view": ["ADMIN", "MANAGER", "ENGINEER", "VIEWER"],
   "procurement.edit": ["ADMIN", "MANAGER"],
   "procurement.receive": ["ADMIN", "MANAGER", "ENGINEER"],
 
