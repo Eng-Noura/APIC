@@ -255,14 +255,6 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
         </div>
       )}
 
-      {projectId && drawings.length > 0 && (
-        <BoqPanel projectId={projectId} drawings={drawings} canCreate={canCreate} canDelete={canDelete} refreshKey={drawings} onChanged={() => loadDrawings(projectId)} />
-      )}
-
-      {projectId && drawings.length > 0 && (
-        <GroupingsPanel projectId={projectId} data={groupings} canCreate={canCreate} canDelete={canDelete} onChanged={() => { void loadGroupings(projectId); loadDrawings(projectId); }} />
-      )}
-
       {!projectId ? (
         <EmptyState icon={<FolderKanban className="h-5 w-5" />} title="No project selected" description="Choose a project above to see its material take-off data." />
       ) : loading ? (
@@ -332,6 +324,14 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
             );
           })}
         </div>
+      )}
+
+      {projectId && drawings.length > 0 && (
+        <BoqPanel projectId={projectId} drawings={drawings} canCreate={canCreate} canDelete={canDelete} refreshKey={drawings} onChanged={() => loadDrawings(projectId)} />
+      )}
+
+      {projectId && drawings.length > 0 && (
+        <GroupingsPanel projectId={projectId} data={groupings} canCreate={canCreate} canDelete={canDelete} onChanged={() => { void loadGroupings(projectId); loadDrawings(projectId); }} />
       )}
 
       {projectId && canCreate && (
