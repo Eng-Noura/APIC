@@ -28,15 +28,12 @@ function NestingTabLinks({ isNesting }: { isNesting: boolean }) {
   );
 }
 
-// showSteelPricing is unused while that tab is temporarily hidden.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function TakeoffTopBar({ showScrap }: { showScrap: boolean; showSteelPricing: boolean }) {
+function TakeoffTopBar({ showScrap }: { showScrap: boolean }) {
   const pathname = usePathname();
   const isNesting = pathname?.startsWith("/takeoff/nesting") ?? false;
   const isScrap = pathname?.startsWith("/takeoff/scrap-management") ?? false;
-  const isSteelPricing = pathname?.startsWith("/takeoff/steel-pricing") ?? false;
   const isNozzles = pathname?.startsWith("/takeoff/nozzles") ?? false;
-  const isStandard = !isNesting && !isScrap && !isSteelPricing && !isNozzles;
+  const isStandard = !isNesting && !isScrap && !isNozzles;
 
   return (
     <div className="space-y-4">
@@ -61,15 +58,10 @@ function TakeoffTopBar({ showScrap }: { showScrap: boolean; showSteelPricing: bo
             Scrap Management
           </Link>
         )}
-        {/* TEMP-HIDDEN (Nozzles / Steel Pricing) - uncomment to restore, or delete for good later.
+        {/* TEMP-HIDDEN (Nozzles) - uncomment to restore, or delete for good later.
         <Link href="/takeoff/nozzles" className={activeTabClass(isNozzles)}>
           Nozzles
         </Link>
-        {showSteelPricing && (
-          <Link href="/takeoff/steel-pricing" className={activeTabClass(isSteelPricing)}>
-            Steel Pricing
-          </Link>
-        )}
         */}
       </div>
     </div>
@@ -79,16 +71,14 @@ function TakeoffTopBar({ showScrap }: { showScrap: boolean; showSteelPricing: bo
 export function TakeoffShell({
   children,
   showScrap = false,
-  showSteelPricing = false,
 }: {
   children: React.ReactNode;
   showScrap?: boolean;
-  showSteelPricing?: boolean;
 }) {
   return (
     <TakeoffProjectProvider>
       <div className="space-y-6">
-        <TakeoffTopBar showScrap={showScrap} showSteelPricing={showSteelPricing} />
+        <TakeoffTopBar showScrap={showScrap} />
         <ProjectGate>{children}</ProjectGate>
       </div>
     </TakeoffProjectProvider>

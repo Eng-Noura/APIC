@@ -41,11 +41,6 @@ export const PERMISSIONS = {
   "scrapPricing.view": ["ADMIN", "MANAGER", "ENGINEER", "VIEWER"],
   "scrapPricing.export": ["ADMIN"],
 
-  // Steel Structures Pricing Engine — rebuilds the original pricing sheet as
-  // one editable page (rate card, single-item calculator, full BOQ).
-  "steelPricing.view": ["ADMIN", "MANAGER", "ENGINEER", "VIEWER"], // everyone can view; exporting stays with ADMIN
-  "steelPricing.export": ["ADMIN"],
-
   // Planning & follow-up (Primavera-style schedule). Anyone can view; editing the
   // schedule / recording progress follows the project-edit tiers; deleting a whole
   // schedule is limited to managers and admins.
