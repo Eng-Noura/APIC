@@ -4,7 +4,6 @@ import { AlertTriangle, Banknote, Boxes, Download, Loader2, Percent, Recycle, Ro
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { EmptyState } from "@/components/shared/empty-state";
 import { KpiCard } from "@/components/shared/kpi-card";
 import { useTakeoffProject } from "@/features/takeoff/project-context";
@@ -57,7 +56,8 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
   const [hasNesting, setHasNesting] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [groups, setGroups] = React.useState<SourceGroup[]>([]);
-  const [defaults, setDefaults] = React.useState<ScrapDefaults>(DEFAULT_SCRAP_DEFAULTS);
+  const [fallback, setFallback] = React.useState<ScrapDefaults>(DEFAULT_SCRAP_DEFAULTS);
+  const [byMaterial, setByMaterial] = React.useState<Record<string, ScrapDefaults>>({});
   const [overrides, setOverrides] = React.useState<Record<string, Partial<ScrapRowEdit>>>({});
   const [runChanged, setRunChanged] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
@@ -83,12 +83,14 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
         const sig = sources.map((g) => `${g.key}:${g.buyQty}:${g.buyWeightKg}:${g.usedWeightKg}`).join("|");
         const saved = loadScrapState(projectId);
         if (saved) {
-          setDefaults(saved.defaults);
+          setFallback(saved.defaults);
+          setByMaterial(saved.byMaterial);
           const keep = new Set(sources.map((g) => g.key));
           setOverrides(Object.fromEntries(Object.entries(saved.overrides).filter(([k]) => keep.has(k))));
           setRunChanged(!!saved.nestSignature && saved.nestSignature !== sig);
         } else {
-          setDefaults(DEFAULT_SCRAP_DEFAULTS);
+          setFallback(DEFAULT_SCRAP_DEFAULTS);
+          setByMaterial({});
           setOverrides({});
         }
         setUnplaced(snap.result.un.length);
@@ -105,12 +107,21 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
 
   // 2) Remember the inputs per project.
   React.useEffect(() => {
-    if (projectId && signature && loaded.current) saveScrapState(projectId, { nestSignature: signature, defaults, overrides });
-  }, [projectId, signature, defaults, overrides]);
+    if (projectId && signature && loaded.current) saveScrapState(projectId, { nestSignature: signature, defaults: fallback, byMaterial, overrides });
+  }, [projectId, signature, fallback, byMaterial, overrides]);
 
   // 3) Apply defaults + per-row edits, then calculate. Instant — no server round-trip.
+  const materials = React.useMemo(
+    () => [...new Set(groups.map((g) => g.material))].map((m) => ({ material: m, sources: groups.filter((g) => g.material === m).length })),
+    [groups],
+  );
+  const defaultsFor = React.useCallback((material: string) => byMaterial[material] ?? fallback, [byMaterial, fallback]);
+  const setMaterialDefault = (material: string, patch: Partial<ScrapDefaults>) =>
+    setByMaterial((m) => ({ ...m, [material]: { ...(m[material] ?? fallback), ...patch } }));
+
   const inputs: ScrapRowInput[] = React.useMemo(() => groups.map((g) => {
     const o = overrides[g.key] ?? {};
+    const defaults = defaultsFor(g.material);
     const costPerKg = o.costPerKg ?? defaults.costPerKg;
     return {
       ...g,
@@ -119,7 +130,7 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
       usedLaterPriceLEPerKg: o.usedLaterPriceLEPerKg ?? costPerKg, // kept remnants are valued at cost unless told otherwise
       scrapSellPriceLEPerKg: o.scrapSellPriceLEPerKg ?? defaults.scrapSellPriceLEPerKg,
     };
-  }), [groups, overrides, defaults]);
+  }), [groups, overrides, defaultsFor]);
   const rows = React.useMemo(() => inputs.map(calculateScrapRow), [inputs]);
   const totals = React.useMemo(() => calculateScrapTotals(rows), [rows]);
   const scenarios = React.useMemo(() => calculateScrapScenarios(inputs, SCENARIOS), [inputs]);
@@ -188,22 +199,38 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
         <KpiCard label="Effective cost / kg" value={`${fmt(totals.effectiveCostPerKg)} LE`} icon={Banknote} tone="primary" hint={`vs ${fmt(totals.avgCostPerKg)} purchase price — use this in Pricing`} />
       </div>
 
-      {/* Defaults */}
+      {/* Defaults per material */}
       <div className="space-y-3 rounded-xl border border-border bg-card p-4">
-        <p className="text-xs font-medium text-muted-foreground">Defaults — apply to every source you haven&apos;t edited in the table.</p>
-        <div className="grid gap-3 sm:grid-cols-3">
-          <div className="space-y-1.5">
-            <Label>Cost / kg (LE)</Label>
-            <NumCell className="w-full" value={defaults.costPerKg} onChange={(n) => setDefaults((d) => ({ ...d, costPerKg: n }))} />
-          </div>
-          <div className="space-y-1.5">
-            <Label>% Used Later</Label>
-            <NumCell className="w-full" max={100} value={defaults.usedLaterPct * 100} onChange={(n) => setDefaults((d) => ({ ...d, usedLaterPct: n / 100 }))} />
-          </div>
-          <div className="space-y-1.5">
-            <Label>Scrap sell price (LE/kg)</Label>
-            <NumCell className="w-full" value={defaults.scrapSellPriceLEPerKg} onChange={(n) => setDefaults((d) => ({ ...d, scrapSellPriceLEPerKg: n }))} />
-          </div>
+        <p className="text-xs font-medium text-muted-foreground">
+          Defaults by material — each material has its own prices. They fill every source of that material you haven&apos;t edited in the table; edit a source below to give it its own values.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[520px] text-sm">
+            <thead className="text-xs text-muted-foreground">
+              <tr>
+                <th className="py-1 text-left font-medium">Material</th>
+                <th className="py-1 text-right font-medium">Cost / kg (LE)</th>
+                <th className="py-1 text-right font-medium">% Used later</th>
+                <th className="py-1 text-right font-medium">Scrap sell price (LE/kg)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {materials.map(({ material, sources }) => {
+                const d = defaultsFor(material);
+                return (
+                  <tr key={material} className="border-t border-border">
+                    <td className="py-1.5">
+                      <span className="font-medium">{material}</span>
+                      <span className="ml-2 text-xs text-muted-foreground">{sources} source{sources === 1 ? "" : "s"}</span>
+                    </td>
+                    <td className="py-1 text-right"><NumCell className="ml-auto" value={d.costPerKg} onChange={(n) => setMaterialDefault(material, { costPerKg: n })} /></td>
+                    <td className="py-1 text-right"><NumCell className="ml-auto" max={100} value={d.usedLaterPct * 100} onChange={(n) => setMaterialDefault(material, { usedLaterPct: n / 100 })} /></td>
+                    <td className="py-1 text-right"><NumCell className="ml-auto" value={d.scrapSellPriceLEPerKg} onChange={(n) => setMaterialDefault(material, { scrapSellPriceLEPerKg: n })} /></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -258,7 +285,7 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
                   <td className="border-l border-border px-3 py-2 text-right font-semibold tabular-nums">{fmt(r.effectiveCostPerKg)}</td>
                   <td className="px-1">
                     {edited && (
-                      <Button size="icon" variant="ghost" className="h-7 w-7" title="Reset this row to the defaults" onClick={() => resetRow(r.key)}>
+                      <Button size="icon" variant="ghost" className="h-7 w-7" title="Reset this source to its material defaults" onClick={() => resetRow(r.key)}>
                         <RotateCcw className="h-3.5 w-3.5" />
                       </Button>
                     )}
