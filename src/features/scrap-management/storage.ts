@@ -1,0 +1,50 @@
+import type { ScrapRowInput } from "@/server/calc/scrap-management";
+
+/** The four numbers the user types, per source row. */
+export type ScrapRowEdit = Pick<ScrapRowInput, "costPerKg" | "usedLaterPct" | "usedLaterPriceLEPerKg" | "scrapSellPriceLEPerKg">;
+
+export interface ScrapDefaults {
+  costPerKg: number;
+  usedLaterPct: number; // 0..1
+  scrapSellPriceLEPerKg: number;
+}
+
+export interface ScrapSavedState {
+  nestingRunId: string;
+  defaults: ScrapDefaults;
+  /** Per-row edits; only the fields the user actually changed. `usedLaterPriceLEPerKg` left out = follows Cost/kg. */
+  overrides: Record<string, Partial<ScrapRowEdit>>;
+}
+
+export const DEFAULT_SCRAP_DEFAULTS: ScrapDefaults = { costPerKg: 46, usedLaterPct: 0, scrapSellPriceLEPerKg: 15 };
+
+const keyFor = (projectId: string) => `scrapManagement.v1.${projectId}`;
+const isNum = (v: unknown): v is number => typeof v === "number" && isFinite(v);
+
+export function loadScrapState(projectId: string): ScrapSavedState | null {
+  try {
+    const raw = localStorage.getItem(keyFor(projectId));
+    if (!raw) return null;
+    const s = JSON.parse(raw) as Partial<ScrapSavedState>;
+    const d = s.defaults;
+    return {
+      nestingRunId: typeof s.nestingRunId === "string" ? s.nestingRunId : "",
+      defaults: {
+        costPerKg: isNum(d?.costPerKg) ? d.costPerKg : DEFAULT_SCRAP_DEFAULTS.costPerKg,
+        usedLaterPct: isNum(d?.usedLaterPct) ? d.usedLaterPct : DEFAULT_SCRAP_DEFAULTS.usedLaterPct,
+        scrapSellPriceLEPerKg: isNum(d?.scrapSellPriceLEPerKg) ? d.scrapSellPriceLEPerKg : DEFAULT_SCRAP_DEFAULTS.scrapSellPriceLEPerKg,
+      },
+      overrides: s.overrides && typeof s.overrides === "object" ? s.overrides : {},
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveScrapState(projectId: string, state: ScrapSavedState) {
+  try {
+    localStorage.setItem(keyFor(projectId), JSON.stringify(state));
+  } catch {
+    /* storage unavailable (private mode / quota) — the page still works, it just won't remember */
+  }
+}
