@@ -46,10 +46,27 @@ export const scrapRowInputsSchema = z.object({
   usedLaterPriceLEPerKg: money,
   scrapSellPriceLEPerKg: money,
 });
+const nonNeg = z.number().min(0).max(1e9);
 export const scrapManagementExportSchema = z.object({
-  nestingRunId: z.string().min(1),
   projectId: z.string().min(1),
-  rows: z.record(z.string(), scrapRowInputsSchema),
+  rows: z
+    .array(
+      scrapRowInputsSchema.extend({
+        key: z.string().min(1).max(200),
+        label: z.string().max(300),
+        material: z.string().max(100),
+        thicknessMm: nonNeg,
+        widthMm: nonNeg,
+        lengthMm: nonNeg,
+        usedAreaSqm: nonNeg,
+        usedWeightKg: nonNeg,
+        buyQty: nonNeg,
+        buyAreaSqm: nonNeg,
+        buyWeightKg: nonNeg,
+      }),
+    )
+    .min(1)
+    .max(500),
 });
 
 // ----------------------------------------------------------------------------

@@ -8,7 +8,9 @@ import { Label } from "@/components/ui/label";
 import { EmptyState } from "@/components/shared/empty-state";
 import { KpiCard } from "@/components/shared/kpi-card";
 import { useTakeoffProject } from "@/features/takeoff/project-context";
-import type { NestingJobRow, NestingJobDetail } from "@/features/nesting/types";
+import { decodeSnapshot } from "@/features/nesting/nest-boost/persist";
+import { buildMaterialRequests } from "@/features/nesting/nest-boost/material-requests";
+import { sourcesFromMaterialLines, type ScrapSource } from "./from-nesting";
 import {
   calculateScrapRow, calculateScrapScenarios, calculateScrapTotals,
   type ScrapRowInput,
@@ -18,10 +20,7 @@ import {
   type ScrapDefaults, type ScrapRowEdit,
 } from "./storage";
 
-interface SourceGroup {
-  key: string; label: string; material: string; thicknessMm: number; widthMm: number; lengthMm: number;
-  usedAreaSqm: number; usedWeightKg: number; buyQty: number; buyAreaSqm: number; buyWeightKg: number;
-}
+type SourceGroup = ScrapSource;
 
 const fmt = (n: number, d = 2) => n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 const pct = (n: number, d = 1) => `${fmt(n * 100, d)}%`;
@@ -52,7 +51,9 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
   const { projectId, projects } = useTakeoffProject();
   const project = projects.find((p) => p.id === projectId);
 
-  const [runId, setRunId] = React.useState("");
+  const [signature, setSignature] = React.useState("");
+  const [unplaced, setUnplaced] = React.useState(0);
+  const [unweighable, setUnweighable] = React.useState(0);
   const [hasNesting, setHasNesting] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [groups, setGroups] = React.useState<SourceGroup[]>([]);
@@ -62,41 +63,38 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
   const [exporting, setExporting] = React.useState(false);
   const loaded = React.useRef(false);
 
-  // 1) Resolve the project's current completed nesting run, then load its sources.
+  // 1) Read the project's 2D nesting (the same saved nest the 2D Nesting tab shows) and turn it into sources.
   React.useEffect(() => {
     let cancelled = false;
     loaded.current = false;
     if (!projectId) return;
     (async () => {
-      setRunId(""); setHasNesting(false); setGroups([]); setRunChanged(false);
+      setSignature(""); setHasNesting(false); setGroups([]); setRunChanged(false); setUnplaced(0); setUnweighable(0);
       setLoading(true);
       try {
-        const jobs: NestingJobRow[] = await fetch(`/api/nesting/jobs?projectId=${projectId}`).then((r) => r.json());
-        const job = jobs[0];
-        if (!job || cancelled) return;
-        const detail: NestingJobDetail = await fetch(`/api/nesting/jobs/${job.id}`).then((r) => r.json());
-        const run = (detail.runs ?? []).find((r) => r.status === "COMPLETED");
-        if (cancelled) return;
+        const res = await fetch(`/api/nesting/workspace?kind=2D&projectId=${projectId}`).catch(() => null);
+        if (!res?.ok || cancelled) return;
+        const snap = decodeSnapshot((await res.json())?.data);
+        if (!snap || snap.groups.length === 0 || cancelled) return;
         setHasNesting(true);
-        if (!run) return;
-        const res = await fetch(`/api/scrap-management?nestingRunId=${run.id}`);
-        if (!res.ok) { toast.error("Could not load the nesting result"); return; }
-        const data: { groups: SourceGroup[] } = await res.json();
-        if (cancelled) return;
+        if (!snap.result || snap.result.sheets.length === 0 || !snap.resS) return;
 
+        const { sources, unweighable: skipped } = sourcesFromMaterialLines(buildMaterialRequests(snap.result, snap.resS));
+        const sig = sources.map((g) => `${g.key}:${g.buyQty}:${g.buyWeightKg}:${g.usedWeightKg}`).join("|");
         const saved = loadScrapState(projectId);
         if (saved) {
           setDefaults(saved.defaults);
-          // keep edits only for sources that still exist in this run
-          const keep = new Set(data.groups.map((g) => g.key));
+          const keep = new Set(sources.map((g) => g.key));
           setOverrides(Object.fromEntries(Object.entries(saved.overrides).filter(([k]) => keep.has(k))));
-          setRunChanged(!!saved.nestingRunId && saved.nestingRunId !== run.id);
+          setRunChanged(!!saved.nestSignature && saved.nestSignature !== sig);
         } else {
           setDefaults(DEFAULT_SCRAP_DEFAULTS);
           setOverrides({});
         }
-        setGroups(data.groups);
-        setRunId(run.id);
+        setUnplaced(snap.result.un.length);
+        setUnweighable(skipped);
+        setGroups(sources);
+        setSignature(sig);
         loaded.current = true;
       } finally {
         if (!cancelled) setLoading(false);
@@ -107,8 +105,8 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
 
   // 2) Remember the inputs per project.
   React.useEffect(() => {
-    if (projectId && runId && loaded.current) saveScrapState(projectId, { nestingRunId: runId, defaults, overrides });
-  }, [projectId, runId, defaults, overrides]);
+    if (projectId && signature && loaded.current) saveScrapState(projectId, { nestSignature: signature, defaults, overrides });
+  }, [projectId, signature, defaults, overrides]);
 
   // 3) Apply defaults + per-row edits, then calculate. Instant — no server round-trip.
   const inputs: ScrapRowInput[] = React.useMemo(() => groups.map((g) => {
@@ -130,14 +128,16 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
   const resetRow = (key: string) => setOverrides((s) => { const n = { ...s }; delete n[key]; return n; });
 
   async function handleExport() {
-    if (!runId || !projectId) return;
+    if (!signature || !projectId) return;
     setExporting(true);
     const body = {
-      nestingRunId: runId, projectId,
-      rows: Object.fromEntries(inputs.map((i) => [i.key, {
+      projectId,
+      rows: inputs.map((i) => ({
+        key: i.key, label: i.label, material: i.material, thicknessMm: i.thicknessMm, widthMm: i.widthMm, lengthMm: i.lengthMm,
+        usedAreaSqm: i.usedAreaSqm, usedWeightKg: i.usedWeightKg, buyQty: i.buyQty, buyAreaSqm: i.buyAreaSqm, buyWeightKg: i.buyWeightKg,
         costPerKg: i.costPerKg, usedLaterPct: i.usedLaterPct,
         usedLaterPriceLEPerKg: i.usedLaterPriceLEPerKg, scrapSellPriceLEPerKg: i.scrapSellPriceLEPerKg,
-      }])),
+      })),
     };
     const res = await fetch("/api/scrap-management/export", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     setExporting(false);
@@ -151,17 +151,30 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
 
   if (!projectId) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="No project selected" description="Choose a project above to manage its scrap." />;
   if (loading) return <div className="rounded-xl border border-dashed border-border py-16 text-center text-sm text-muted-foreground">Loading…</div>;
-  if (!hasNesting) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="No nesting yet" description="Start a nesting for this project first — Scrap Management reads its current result." />;
-  if (!runId) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="Nesting not run yet" description="Run the nesting first, then come back — this page always reflects the project's current nesting result." />;
-  if (groups.length === 0) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="Nothing to show" description="The current nesting result has no sheet sources." />;
+  if (!hasNesting) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="No nesting yet" description="Add parts in 2D Nesting for this project first — Scrap Management reads its saved result." />;
+  if (!signature) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="Nesting not run yet" description="Run the 2D Nesting first, then come back — this page always reflects the project's current nest." />;
+  if (groups.length === 0) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="Nothing to show" description="None of the nested sheets has a thickness, so their weight can't be worked out. Set a thickness on the parts in 2D Nesting." />;
 
   return (
     <div className="space-y-6">
       {runChanged && (
         <div className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
-          <span>The nesting was re-run since you last used this page. Bought and used weights below are from the new result — re-check your percentages.</span>
+          <span>The 2D nest changed since you last used this page. Bought and used weights below are from the new result — re-check your percentages.</span>
           <Button size="sm" variant="ghost" className="ml-auto h-7" onClick={() => setRunChanged(false)}>Dismiss</Button>
+        </div>
+      )}
+
+      {unplaced > 0 && (
+        <div className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+          <span>{unplaced} part(s) were not placed in the nest, so the used weight is incomplete until they fit.</span>
+        </div>
+      )}
+      {unweighable > 0 && (
+        <div className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+          <span>{unweighable} sheet size(s) have no thickness set and are left out. Set the thickness in 2D Nesting to include them.</span>
         </div>
       )}
 

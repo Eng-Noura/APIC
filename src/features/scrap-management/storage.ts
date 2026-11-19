@@ -10,7 +10,8 @@ export interface ScrapDefaults {
 }
 
 export interface ScrapSavedState {
-  nestingRunId: string;
+  /** Fingerprint of the nest the inputs were entered against — a different one means the nest was re-run. */
+  nestSignature: string;
   defaults: ScrapDefaults;
   /** Per-row edits; only the fields the user actually changed. `usedLaterPriceLEPerKg` left out = follows Cost/kg. */
   overrides: Record<string, Partial<ScrapRowEdit>>;
@@ -28,7 +29,7 @@ export function loadScrapState(projectId: string): ScrapSavedState | null {
     const s = JSON.parse(raw) as Partial<ScrapSavedState>;
     const d = s.defaults;
     return {
-      nestingRunId: typeof s.nestingRunId === "string" ? s.nestingRunId : "",
+      nestSignature: typeof s.nestSignature === "string" ? s.nestSignature : "",
       defaults: {
         costPerKg: isNum(d?.costPerKg) ? d.costPerKg : DEFAULT_SCRAP_DEFAULTS.costPerKg,
         usedLaterPct: isNum(d?.usedLaterPct) ? d.usedLaterPct : DEFAULT_SCRAP_DEFAULTS.usedLaterPct,

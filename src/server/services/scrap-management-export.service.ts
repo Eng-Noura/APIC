@@ -35,7 +35,7 @@ const COLS = [
 
 export function buildScrapManagementWorkbook(
   inputs: ScrapRowInput[],
-  meta: { projectNumber: string; projectName: string; nestingRunId: string },
+  meta: { projectNumber: string; projectName: string },
 ): ExcelJS.Workbook {
   const wb = new ExcelJS.Workbook();
   wb.creator = "SteelFlow";
@@ -124,7 +124,6 @@ export function buildScrapManagementWorkbook(
   info.columns = [{ header: "Field", width: 24 }, { header: "Value", width: 40 }];
   info.addRow(["Project Number", meta.projectNumber]);
   info.addRow(["Project Name", meta.projectName]);
-  info.addRow(["Nesting Run ID", meta.nestingRunId]);
   info.addRow(["Generated At", new Date().toISOString()]);
   info.getRow(1).font = { bold: true };
   return wb;
