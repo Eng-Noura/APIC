@@ -34,6 +34,9 @@ export function NavList({ items, collapsed, onNavigate }: { items: NavItem[]; co
     : c.key === "material" ? pathname.includes("/material-usage")
     : c.key === "reports" ? pathname.includes("/reports")
     : c.key === "scrap" ? pathname.startsWith("/takeoff/scrap-management")
+    : c.key === "pricing" ? pathname.startsWith("/takeoff/pricing")
+    : c.key === "rates" ? pathname.startsWith("/takeoff/rate-library")
+    : c.key === "takeoff" ? pathname.startsWith("/takeoff") && !pathname.startsWith("/takeoff/pricing") && !pathname.startsWith("/takeoff/rate-library") && !pathname.startsWith("/takeoff/scrap-management")
     : c.key === "list" ? pathname === "/projects" || (pathname.startsWith("/projects/") && !["/planning", "/quotations", "/documents", "/material-usage", "/reports"].some((x) => pathname.includes(x)))
     : false;
 

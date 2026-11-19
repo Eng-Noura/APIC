@@ -6,7 +6,7 @@ export default async function TakeoffLayout({ children }: { children: React.Reac
   const session = await auth();
   const role = session?.user.role;
   return (
-    <TakeoffShell showScrap={can(role, "scrapPricing.view")}>
+    <TakeoffShell showScrap={can(role, "scrapPricing.view")} showPricing={can(role, "pricing.view")}>
       {children}
     </TakeoffShell>
   );

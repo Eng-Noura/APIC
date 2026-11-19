@@ -28,12 +28,14 @@ function NestingTabLinks({ isNesting }: { isNesting: boolean }) {
   );
 }
 
-function TakeoffTopBar({ showScrap }: { showScrap: boolean }) {
+function TakeoffTopBar({ showScrap, showPricing }: { showScrap: boolean; showPricing: boolean }) {
   const pathname = usePathname();
   const isNesting = pathname?.startsWith("/takeoff/nesting") ?? false;
   const isScrap = pathname?.startsWith("/takeoff/scrap-management") ?? false;
   const isNozzles = pathname?.startsWith("/takeoff/nozzles") ?? false;
-  const isStandard = !isNesting && !isScrap && !isNozzles;
+  const isPricing = pathname?.startsWith("/takeoff/pricing") ?? false;
+  const isRates = pathname?.startsWith("/takeoff/rate-library") ?? false;
+  const isStandard = !isNesting && !isScrap && !isNozzles && !isPricing && !isRates;
 
   return (
     <div className="space-y-4">
@@ -58,6 +60,16 @@ function TakeoffTopBar({ showScrap }: { showScrap: boolean }) {
             Scrap Management
           </Link>
         )}
+        {showPricing && (
+          <Link href="/takeoff/pricing" className={activeTabClass(isPricing)}>
+            Pricing
+          </Link>
+        )}
+        {showPricing && (
+          <Link href="/takeoff/rate-library" className={activeTabClass(isRates)}>
+            Rate Library
+          </Link>
+        )}
         {/* TEMP-HIDDEN (Nozzles) - uncomment to restore, or delete for good later.
         <Link href="/takeoff/nozzles" className={activeTabClass(isNozzles)}>
           Nozzles
@@ -71,14 +83,16 @@ function TakeoffTopBar({ showScrap }: { showScrap: boolean }) {
 export function TakeoffShell({
   children,
   showScrap = false,
+  showPricing = false,
 }: {
   children: React.ReactNode;
   showScrap?: boolean;
+  showPricing?: boolean;
 }) {
   return (
     <TakeoffProjectProvider>
       <div className="space-y-6">
-        <TakeoffTopBar showScrap={showScrap} />
+        <TakeoffTopBar showScrap={showScrap} showPricing={showPricing} />
         <ProjectGate>{children}</ProjectGate>
       </div>
     </TakeoffProjectProvider>
