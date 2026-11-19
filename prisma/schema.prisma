@@ -95,6 +95,9 @@ model User {
   planMaterials      PlanMaterial[]   @relation("PlanMaterialCreatedBy")
   quotations         Quotation[]      @relation("QuotationCreatedBy")
   quotationEvents    QuotationEvent[] @relation("QuotationEventBy")
+  rateProfiles       RateProfile[]    @relation("RateProfileCreatedBy")
+  pricingSheets      PricingSheet[]   @relation("PricingSheetCreatedBy")
+  pricingSnapshots   PricingSnapshot[] @relation("PricingSnapshotCreatedBy")
 
   @@map("users")
 }
@@ -160,6 +163,8 @@ model Project {
   workOrders        WorkOrder[]
   partGroups        PartGroup[]
   workOrderGroups   WorkOrderGroup[]
+  rateProfiles      RateProfile[]
+  pricingSheets     PricingSheet[]
 
   // ---------------------------------------------------------------------
   // Phase 2 extension point (do not remove): future models such as
@@ -781,6 +786,8 @@ model ScopeItem {
 
   // Take-off parts that belong to this scope (Part List -> "Group as Scope").
   parts TakeoffPart[]
+
+  pricingItems PricingItem[]
 
   @@map("scope_items")
 }
@@ -1462,4 +1469,274 @@ model WorkOrderPiece {
 
   @@unique([workOrderId, seq])
   @@map("work_order_pieces")
+}
+
+
+// ----------------------------------------------------------------------------
+// BOQ Pricing — rate library, pricing sheets, immutable snapshots.
+// The pricing unit is the ScopeItem (Part List -> "Group as Scope"); manual lines have no scopeItemId.
+// Method / category / base / calcProfile are plain strings validated by the pricing engine
+// (src/features/pricing/engine), so adding a method never needs a migration.
+// ----------------------------------------------------------------------------
+
+enum RateProfileType {
+  MATERIAL
+  FABRICATION
+  INSTALLATION
+  SUBCONTRACTOR
+  TRANSPORT
+  INDIRECT
+  PROFIT
+  ADD_ON
+  TAX_INSURANCE
+}
+
+enum RateScope {
+  GLOBAL
+  PROJECT
+}
+
+enum PricingSheetStatus {
+  DRAFT
+  CALCULATED
+  APPROVED
+  SUPERSEDED // an approved sheet that was re-opened: a new version took its place
+}
+
+enum PricingMaterialSource {
+  NESTING
+  STOCK
+  PROCUREMENT
+  MANUAL
+}
+
+model RateProfile {
+  id          String          @id @default(cuid())
+  type        RateProfileType
+  name        String
+  description String?
+  scope       RateScope       @default(GLOBAL)
+  active      Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  // Set when scope = PROJECT.
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("RateProfileCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  components RateComponent[]
+
+  @@index([scope, type])
+  @@index([projectId, type])
+  @@map("rate_profiles")
+}
+
+model RateComponent {
+  id        String   @id @default(cuid())
+  key       String // engine rate key, e.g. "installation.indirectPct" or "install.crane"
+  name      String
+  category  String
+  method    String
+  rate      Float
+  fixed     Float? // FIXED_PLUS_VARIABLE
+  unit      String?
+  base      String? // PERCENT_OF_BASE / DIVISOR / MARKUP
+  enabled   Boolean  @default(true)
+  sortOrder Int      @default(0)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  profileId String
+  profile   RateProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, key])
+  @@index([profileId, sortOrder])
+  @@map("rate_components")
+}
+
+model PricingSheet {
+  id          String             @id @default(cuid())
+  reference   String // e.g. "PRC-2026-001"
+  version     Int                @default(1)
+  date        DateTime
+  status      PricingSheetStatus @default(DRAFT)
+  currency    String             @default("EGP")
+  calcProfile String             @default("STANDARD") // default calculation profile for its items
+  notes       String?
+  basedOnId   String? // the sheet this version re-prices
+  approvedById String?
+  approvedAt  DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("PricingSheetCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  items     PricingItem[]
+  snapshots PricingSnapshot[]
+  history   PricingHistory[]
+
+  @@unique([projectId, reference, version])
+  @@index([projectId, status])
+  @@map("pricing_sheets")
+}
+
+model PricingItem {
+  id           String   @id @default(cuid())
+  itemNo       String
+  description  String
+  unit         String // KG | TON | EA | SQM | M (validated by the engine)
+  qty          Float
+  unitWeightKg Float?
+  scopeType    String   @default("")
+  calcProfile  String? // overrides the sheet's calculation profile
+  profileRefs  Json? // { INSTALLATION: "<rateProfileId>", … } chosen Rate Profiles
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sheetId String
+  sheet   PricingSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+
+  // null = manual line (e.g. equipment). Kept (SetNull) if the scope is deleted later.
+  scopeItemId String?
+  scopeItem   ScopeItem? @relation(fields: [scopeItemId], references: [id], onDelete: SetNull)
+
+  materials  PricingMaterialLine[]
+  components PricingItemComponent[]
+  overrides  PricingItemOverride[]
+
+  @@unique([sheetId, scopeItemId])
+  @@index([sheetId, sortOrder])
+  @@map("pricing_items")
+}
+
+model PricingMaterialLine {
+  id          String                @id @default(cuid())
+  source      PricingMaterialSource @default(MANUAL)
+  name        String
+  grade       String?
+  qty         Float
+  unit        String
+  unitCost    Float
+  notes       String?
+  importedRef String? // stable key of the imported source row — de-duplicates re-imports
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  itemId String
+  item   PricingItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, importedRef])
+  @@index([itemId])
+  @@map("pricing_material_lines")
+}
+
+// Extra cost lines on one item beyond what its Rate Profiles provide (fabrication, installation,
+// subcontractor, add-on, transportation …).
+model PricingItemComponent {
+  id        String   @id @default(cuid())
+  category  String
+  name      String
+  method    String
+  rate      Float
+  fixed     Float?
+  unit      String?
+  base      String?
+  enabled   Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  itemId String
+  item   PricingItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId, sortOrder])
+  @@map("pricing_item_components")
+}
+
+// Item-level rate override: always wins over profile / project / global.
+model PricingItemOverride {
+  id        String   @id @default(cuid())
+  rateKey   String
+  value     Float
+  reason    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  itemId String
+  item   PricingItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, rateKey])
+  @@map("pricing_item_overrides")
+}
+
+// Immutable once written (a database trigger rejects UPDATE). Changing rates later never alters a snapshot;
+// re-pricing creates a new sheet version and new snapshots.
+model PricingSnapshot {
+  id            String   @id @default(cuid())
+  kind          String // CALCULATED | APPROVED
+  sheetVersion  Int
+  engineVersion String
+  roundingPolicy Json // { money, rate, factor }
+  ratesUsed     Json // every rate layer value that fed the calculation
+  inputs        Json // quantities, components, profile choices
+  totals        Json // { directCost, indirectCost, totalCost, salePrice, profit, profitPct } (rounded)
+  createdAt     DateTime @default(now())
+
+  sheetId String
+  sheet   PricingSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("PricingSnapshotCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  items PricingSnapshotItem[]
+
+  @@index([sheetId, kind, createdAt])
+  @@map("pricing_snapshots")
+}
+
+model PricingSnapshotItem {
+  id          String  @id @default(cuid())
+  pricingItemId String? // plain reference (the live item may change or be deleted)
+  scopeItemId String?
+  itemNo      String
+  description String
+  unit        String
+  qty         Float
+  unitRate    Float // rounded to 4 dp
+  salePrice   Float // rounded to 2 dp
+  totalCost   Float
+  profit      Float
+  profitPct   Float
+  data        Json // full engine values + trace
+
+  snapshotId String
+  snapshot   PricingSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@index([snapshotId])
+  @@index([scopeItemId])
+  @@map("pricing_snapshot_items")
+}
+
+model PricingHistory {
+  id        String   @id @default(cuid())
+  action    String // CREATED | CALCULATED | APPROVED | REOPENED | RATE_CHANGED | …
+  message   String
+  data      Json?
+  userId    String?
+  createdAt DateTime @default(now())
+
+  sheetId String
+  sheet   PricingSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+
+  @@index([sheetId, createdAt])
+  @@map("pricing_history")
 }

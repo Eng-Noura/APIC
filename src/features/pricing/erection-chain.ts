@@ -14,10 +14,15 @@
  *   Cost (BB) = supply cost + Direct + indirect + commissioning + mob + engineering
  *               + third-party + insurance + tax;  Profit (BC) = AZ − BB.
  *
+ * This file is now a thin adapter over the component engine (`./engine`): the formulas live ONLY there.
+ *
  * Known workbook inconsistencies NOT reproduced here (need an owner decision):
  *  - rows 19–24 compute mob/demob on AQ and count it twice in AU+AV;
  *  - equipment rows (25+) divide by 0.97 then 0.9505 and skip the 3.8% tax.
  */
+import { N, RATE_KEYS, priceItem } from "./engine";
+import type { Component } from "./engine";
+
 export interface ChainLine {
   key: string;
   /** Quantity basis (e.g. tons). */
@@ -73,31 +78,38 @@ export interface ChainResult {
 }
 
 export function calcErectionChain(i: ChainInput): ChainResult {
-  const linesTotal = i.lines.reduce((s, l) => s + l.basis * l.rate, 0);
-  const heightFactorAmount = linesTotal * i.heightFactor;
-  const installDirect = linesTotal + heightFactorAmount;
-  const installIndirect = installDirect * i.installIndirect;
-  const installSale = (installDirect + installIndirect) * i.installMarkup;
-  const supplyCost = i.supplyCost ?? 0;
-  const supplyAndInstall = (i.supplySale ?? 0) + installSale;
-  const engineering = supplyAndInstall * (i.engineering ?? 0);
-  const thirdParty = supplyAndInstall * (i.thirdParty ?? 0);
-  const commissioning = i.commissioning ?? 0;
-  const subtotalBeforeMob = supplyAndInstall + commissioning + engineering + thirdParty;
-  const mobDemob = subtotalBeforeMob * (i.mobDemob ?? 0);
-  const totalBeforeInsurance = subtotalBeforeMob + mobDemob;
-  const insured = totalBeforeInsurance / i.insuranceDivisor;
-  const insurance = insured - totalBeforeInsurance;
-  const tax = insured * i.tax;
-  const salePrice = insured + tax;
-  const totalCost =
-    supplyCost + installDirect + installIndirect + commissioning + mobDemob + engineering + thirdParty + insurance + tax;
-  const profit = salePrice - totalCost;
+  const components: Component[] = i.lines.map((l) => ({
+    id: `line.${l.key}`, name: l.key, category: "INSTALLATION", ledger: "COST", method: "FIXED_LUMP_SUM",
+    rate: l.basis * l.rate, enabled: true, source: "erection-chain",
+  }));
+  const r = priceItem({
+    quantities: { weightTon: i.weight },
+    divisorQty: i.weight,
+    profile: "STANDARD",
+    components,
+    externalSupply: { cost: i.supplyCost ?? 0, sale: i.supplySale ?? 0 },
+    layers: {
+      global: {
+        [RATE_KEYS.installHeightFactorPct]: i.heightFactor,
+        [RATE_KEYS.installIndirectPct]: i.installIndirect,
+        [RATE_KEYS.markupInstallation]: i.installMarkup,
+        [RATE_KEYS.engineeringPct]: i.engineering ?? 0,
+        [RATE_KEYS.thirdPartyPct]: i.thirdParty ?? 0,
+        [RATE_KEYS.commissioningLump]: i.commissioning ?? 0,
+        [RATE_KEYS.mobDemobPct]: i.mobDemob ?? 0,
+        [RATE_KEYS.insuranceDivisor]: i.insuranceDivisor,
+        [RATE_KEYS.taxPct]: i.tax,
+      },
+    },
+  });
+  if (!r.ok) throw new Error(`Erection chain failed: ${r.issues.filter((x) => x.severity === "error").map((x) => x.message).join(" ")}`);
+  const v = r.values;
   return {
-    linesTotal, heightFactorAmount, installDirect, installIndirect, installSale, supplyAndInstall,
-    engineering, thirdParty, commissioning, subtotalBeforeMob, mobDemob, totalBeforeInsurance,
-    insurance, tax, salePrice,
-    unitRate: i.weight > 0 ? salePrice / i.weight : 0,
-    totalCost, profit, profitPct: totalCost > 0 ? profit / totalCost : 0,
+    linesTotal: v[N.INSTALL_LINES_SUM], heightFactorAmount: v[N.HEIGHT_FACTOR], installDirect: v[N.INSTALL_DIRECT],
+    installIndirect: v[N.INSTALL_INDIRECT], installSale: v[N.INSTALL_SALE], supplyAndInstall: v[N.SUPPLY_AND_INSTALL],
+    engineering: v[N.ENGINEERING], thirdParty: v[N.THIRD_PARTY], commissioning: v[N.COMMISSIONING],
+    subtotalBeforeMob: v[N.SUBTOTAL], mobDemob: v[N.MOB_DEMOB], totalBeforeInsurance: v[N.TOTAL_BEFORE_INSURANCE],
+    insurance: v[N.INSURANCE_TOTAL], tax: v[N.TAX], salePrice: v[N.SALE_PRICE], unitRate: v[N.UNIT_RATE],
+    totalCost: v[N.TOTAL_COST], profit: v[N.PROFIT], profitPct: v[N.PROFIT_PCT],
   };
 }
