@@ -14,10 +14,8 @@ import {
   calculateScrapRow, calculateScrapScenarios, calculateScrapTotals,
   type ScrapRowInput,
 } from "@/server/calc/scrap-management";
-import {
-  DEFAULT_SCRAP_DEFAULTS, loadScrapState, saveScrapState,
-  type ScrapDefaults, type ScrapRowEdit,
-} from "./storage";
+import { ApplyToSourcesDialog } from "./apply-dialog";
+import { DEFAULT_SCRAP_DEFAULTS, loadScrapState, saveScrapState, type ScrapRowEdit } from "./storage";
 
 type SourceGroup = ScrapSource;
 
@@ -56,8 +54,8 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
   const [hasNesting, setHasNesting] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [groups, setGroups] = React.useState<SourceGroup[]>([]);
-  const [fallback, setFallback] = React.useState<ScrapDefaults>(DEFAULT_SCRAP_DEFAULTS);
-  const [byMaterial, setByMaterial] = React.useState<Record<string, ScrapDefaults>>({});
+  const [selected, setSelected] = React.useState<Set<string>>(new Set());
+  const [applyOpen, setApplyOpen] = React.useState(false);
   const [overrides, setOverrides] = React.useState<Record<string, Partial<ScrapRowEdit>>>({});
   const [runChanged, setRunChanged] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
@@ -83,14 +81,10 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
         const sig = sources.map((g) => `${g.key}:${g.buyQty}:${g.buyWeightKg}:${g.usedWeightKg}`).join("|");
         const saved = loadScrapState(projectId);
         if (saved) {
-          setFallback(saved.defaults);
-          setByMaterial(saved.byMaterial);
           const keep = new Set(sources.map((g) => g.key));
           setOverrides(Object.fromEntries(Object.entries(saved.overrides).filter(([k]) => keep.has(k))));
           setRunChanged(!!saved.nestSignature && saved.nestSignature !== sig);
         } else {
-          setFallback(DEFAULT_SCRAP_DEFAULTS);
-          setByMaterial({});
           setOverrides({});
         }
         setUnplaced(snap.result.un.length);
@@ -107,21 +101,13 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
 
   // 2) Remember the inputs per project.
   React.useEffect(() => {
-    if (projectId && signature && loaded.current) saveScrapState(projectId, { nestSignature: signature, defaults: fallback, byMaterial, overrides });
-  }, [projectId, signature, fallback, byMaterial, overrides]);
+    if (projectId && signature && loaded.current) saveScrapState(projectId, { nestSignature: signature, overrides });
+  }, [projectId, signature, overrides]);
 
   // 3) Apply defaults + per-row edits, then calculate. Instant — no server round-trip.
-  const materials = React.useMemo(
-    () => [...new Set(groups.map((g) => g.material))].map((m) => ({ material: m, sources: groups.filter((g) => g.material === m).length })),
-    [groups],
-  );
-  const defaultsFor = React.useCallback((material: string) => byMaterial[material] ?? fallback, [byMaterial, fallback]);
-  const setMaterialDefault = (material: string, patch: Partial<ScrapDefaults>) =>
-    setByMaterial((m) => ({ ...m, [material]: { ...(m[material] ?? fallback), ...patch } }));
-
   const inputs: ScrapRowInput[] = React.useMemo(() => groups.map((g) => {
     const o = overrides[g.key] ?? {};
-    const defaults = defaultsFor(g.material);
+    const defaults = DEFAULT_SCRAP_DEFAULTS; // starting values until you type or apply your own
     const costPerKg = o.costPerKg ?? defaults.costPerKg;
     return {
       ...g,
@@ -130,12 +116,17 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
       usedLaterPriceLEPerKg: o.usedLaterPriceLEPerKg ?? costPerKg, // kept remnants are valued at cost unless told otherwise
       scrapSellPriceLEPerKg: o.scrapSellPriceLEPerKg ?? defaults.scrapSellPriceLEPerKg,
     };
-  }), [groups, overrides, defaultsFor]);
+  }), [groups, overrides]);
   const rows = React.useMemo(() => inputs.map(calculateScrapRow), [inputs]);
   const totals = React.useMemo(() => calculateScrapTotals(rows), [rows]);
   const scenarios = React.useMemo(() => calculateScrapScenarios(inputs, SCENARIOS), [inputs]);
 
   const setRow = (key: string, patch: Partial<ScrapRowEdit>) => setOverrides((s) => ({ ...s, [key]: { ...s[key], ...patch } }));
+  const targets = selected.size > 0 ? [...selected].filter((k) => groups.some((g) => g.key === k)) : groups.map((g) => g.key);
+  const applyToTargets = (patch: Partial<ScrapRowEdit>) =>
+    setOverrides((s) => ({ ...s, ...Object.fromEntries(targets.map((k) => [k, { ...s[k], ...patch }])) }));
+  const toggleRow = (key: string) => setSelected((s) => { const n = new Set(s); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const allSelected = groups.length > 0 && groups.every((g) => selected.has(g.key));
   const resetRow = (key: string) => setOverrides((s) => { const n = { ...s }; delete n[key]; return n; });
 
   async function handleExport() {
@@ -160,7 +151,7 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
     toast.success("Exported");
   }
 
-  if (!projectId) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="No project selected" description="Choose a project above to manage its scrap." />;
+  if (!projectId) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="No project selected" description="Pick the active project in the sidebar to manage its scrap." />;
   if (loading) return <div className="rounded-xl border border-dashed border-border py-16 text-center text-sm text-muted-foreground">Loading…</div>;
   if (!hasNesting) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="No nesting yet" description="Add parts in 2D Nesting for this project first — Scrap Management reads its saved result." />;
   if (!signature) return <EmptyState icon={<Boxes className="h-5 w-5" />} title="Nesting not run yet" description="Run the 2D Nesting first, then come back — this page always reflects the project's current nest." />;
@@ -199,46 +190,26 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
         <KpiCard label="Effective cost / kg" value={`${fmt(totals.effectiveCostPerKg)} LE`} icon={Banknote} tone="primary" hint={`vs ${fmt(totals.avgCostPerKg)} purchase price — use this in Pricing`} />
       </div>
 
-      {/* Defaults per material */}
-      <div className="space-y-3 rounded-xl border border-border bg-card p-4">
-        <p className="text-xs font-medium text-muted-foreground">
-          Defaults by material — each material has its own prices. They fill every source of that material you haven&apos;t edited in the table; edit a source below to give it its own values.
+      {/* Bulk entry */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card px-4 py-3">
+        <p className="text-sm text-muted-foreground">
+          Same numbers for many sources? Tick the rows you want (or none for all of them) and enter them once.
         </p>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[520px] text-sm">
-            <thead className="text-xs text-muted-foreground">
-              <tr>
-                <th className="py-1 text-left font-medium">Material</th>
-                <th className="py-1 text-right font-medium">Cost / kg (LE)</th>
-                <th className="py-1 text-right font-medium">% Used later</th>
-                <th className="py-1 text-right font-medium">Scrap sell price (LE/kg)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {materials.map(({ material, sources }) => {
-                const d = defaultsFor(material);
-                return (
-                  <tr key={material} className="border-t border-border">
-                    <td className="py-1.5">
-                      <span className="font-medium">{material}</span>
-                      <span className="ml-2 text-xs text-muted-foreground">{sources} source{sources === 1 ? "" : "s"}</span>
-                    </td>
-                    <td className="py-1 text-right"><NumCell className="ml-auto" value={d.costPerKg} onChange={(n) => setMaterialDefault(material, { costPerKg: n })} /></td>
-                    <td className="py-1 text-right"><NumCell className="ml-auto" max={100} value={d.usedLaterPct * 100} onChange={(n) => setMaterialDefault(material, { usedLaterPct: n / 100 })} /></td>
-                    <td className="py-1 text-right"><NumCell className="ml-auto" value={d.scrapSellPriceLEPerKg} onChange={(n) => setMaterialDefault(material, { scrapSellPriceLEPerKg: n })} /></td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+        <Button onClick={() => setApplyOpen(true)}>
+          {selected.size > 0 ? `Apply to ${targets.length} selected` : `Apply to all ${groups.length} sources`}
+        </Button>
       </div>
+      <ApplyToSourcesDialog open={applyOpen} onOpenChange={setApplyOpen} targetCount={targets.length} onApply={applyToTargets} />
 
       {/* Sources table */}
       <div className="overflow-x-auto rounded-xl border border-border bg-card">
-        <table className="w-full min-w-[1250px] text-sm">
+        <table className="w-full min-w-[1290px] text-sm">
           <thead className="bg-muted/50 text-xs text-muted-foreground">
             <tr>
+              <th rowSpan={2} className="w-8 px-3 py-2">
+                <input type="checkbox" aria-label="Select all sources" checked={allSelected}
+                  onChange={() => setSelected(allSelected ? new Set() : new Set(groups.map((g) => g.key)))} />
+              </th>
               <th rowSpan={2} className="px-3 py-2 text-left font-medium">Source</th>
               <th colSpan={3} className="border-l border-border px-3 py-1 text-center font-medium">From nesting</th>
               <th colSpan={4} className="border-l border-border px-3 py-1 text-center font-medium text-sky-700 dark:text-sky-300">Your inputs</th>
@@ -259,6 +230,9 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
               const edited = !!overrides[r.key] && Object.keys(overrides[r.key]).length > 0;
               return (
                 <tr key={r.key} className="border-t border-border align-middle">
+                  <td className="px-3 py-2">
+                    <input type="checkbox" aria-label={`Select ${r.label}`} checked={selected.has(r.key)} onChange={() => toggleRow(r.key)} />
+                  </td>
                   <td className="px-3 py-2">
                     <div className="font-medium">{r.material} {r.thicknessMm} mm</div>
                     <div className="text-xs text-muted-foreground">{r.widthMm} × {r.lengthMm} mm</div>
@@ -285,7 +259,7 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
                   <td className="border-l border-border px-3 py-2 text-right font-semibold tabular-nums">{fmt(r.effectiveCostPerKg)}</td>
                   <td className="px-1">
                     {edited && (
-                      <Button size="icon" variant="ghost" className="h-7 w-7" title="Reset this source to its material defaults" onClick={() => resetRow(r.key)}>
+                      <Button size="icon" variant="ghost" className="h-7 w-7" title="Reset this source to the starting values" onClick={() => resetRow(r.key)}>
                         <RotateCcw className="h-3.5 w-3.5" />
                       </Button>
                     )}
@@ -296,6 +270,7 @@ export function ScrapManagementView({ canExport }: { canExport: boolean }) {
           </tbody>
           <tfoot className="border-t-2 border-border bg-muted/40 font-semibold">
             <tr>
+              <td />
               <td className="px-3 py-2">Total</td>
               <td className="border-l border-border px-3 py-2 text-right tabular-nums" />
               <td className="px-3 py-2 text-right tabular-nums">{fmt(totals.buyWeightKg)}</td>

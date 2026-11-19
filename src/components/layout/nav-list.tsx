@@ -1,6 +1,7 @@
 "use client";
 import * as React from "react";
 import Link from "next/link";
+import { useActiveProject } from "./active-project";
 import { usePathname } from "next/navigation";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -13,9 +14,11 @@ const off = "text-sidebar-foreground/80 hover:bg-sidebar-active/50 hover:text-wh
 /** Shared by the desktop sidebar and the mobile drawer. */
 export function NavList({ items, collapsed, onNavigate }: { items: NavItem[]; collapsed?: boolean; onNavigate?: () => void }) {
   const pathname = usePathname();
+  const { activeProjectId } = useActiveProject();
   // Inside a project, "Planning" opens that project's schedule; elsewhere it opens the latest one.
   const projectId = pathname.match(/^\/projects\/([^/]+)/)?.[1];
-  const inProject = projectId && projectId !== "new" ? projectId : null;
+  // the project in the address wins, otherwise the one picked in the sidebar: each tab opens for it
+  const inProject = (projectId && projectId !== "new" ? projectId : null) ?? (activeProjectId || null);
   const hrefFor = (c: NavChild) =>
     c.key === "planning" ? (inProject ? `/projects/${inProject}/planning` : "/planning")
     : c.key === "quotations" ? (inProject ? `/projects/${inProject}/quotations` : "/quotations")

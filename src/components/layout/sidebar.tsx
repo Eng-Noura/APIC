@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { cn } from "@/lib/utils";
 import { NavList } from "./nav-list";
+import { ProjectPicker } from "./active-project";
 import { SidebarBackdrop } from "./sidebar-backdrop";
 import { visibleNavItems } from "@/lib/nav-config";
 import type { Role } from "@prisma/client";
@@ -25,6 +26,8 @@ export function Sidebar({ role, collapsed, open = true }: { role: Role; collapse
           <p className="text-sm font-semibold text-white">SteelFlow</p>
         )}
       </Link>
+
+      {!collapsed && <ProjectPicker />}
 
       <nav className="relative flex-1 space-y-1 overflow-y-auto px-3 py-4">
         <NavList items={items} collapsed={collapsed} />
