@@ -35,7 +35,7 @@ export const NAV_ITEMS: NavItem[] = [
       { key: "cost", label: "Cost & Summary", icon: PieChart, soon: true },
       { key: "documents", label: "Documents", icon: FolderOpen, href: "/documents" },
       { key: "reports", label: "Reports", icon: BarChart3, href: "/reports" },
-      { key: "scrap", label: "Scrap Management", icon: Recycle, soon: true },
+      { key: "scrap", label: "Scrap Management", icon: Recycle, href: "/takeoff/scrap-management" },
     ],
   },
   { label: "Clients", href: "/customers", icon: Users2, hidden: true },

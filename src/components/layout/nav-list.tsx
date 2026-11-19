@@ -30,6 +30,7 @@ export function NavList({ items, collapsed, onNavigate }: { items: NavItem[]; co
     : c.key === "documents" ? pathname.includes("/documents")
     : c.key === "material" ? pathname.includes("/material-usage")
     : c.key === "reports" ? pathname.includes("/reports")
+    : c.key === "scrap" ? pathname.startsWith("/takeoff/scrap-management")
     : c.key === "list" ? pathname === "/projects" || (pathname.startsWith("/projects/") && !["/planning", "/quotations", "/documents", "/material-usage", "/reports"].some((x) => pathname.includes(x)))
     : false;
 
