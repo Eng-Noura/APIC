@@ -165,6 +165,7 @@ model Project {
   workOrderGroups   WorkOrderGroup[]
   rateProfiles      RateProfile[]
   pricingSheets     PricingSheet[]
+  estimate          ProjectEstimate?
 
   // ---------------------------------------------------------------------
   // Phase 2 extension point (do not remove): future models such as
@@ -788,6 +789,7 @@ model ScopeItem {
   parts TakeoffPart[]
 
   pricingItems PricingItem[]
+  estimateItems EstimateItem[]
 
   @@map("scope_items")
 }
@@ -1230,6 +1232,7 @@ model Quotation {
 
   items  QuotationItem[]
   events QuotationEvent[]
+  estimateOffer EstimateOffer?
 
   @@unique([projectId, number, revision])
   @@index([projectId, issueDate])
@@ -1739,4 +1742,187 @@ model PricingHistory {
 
   @@index([sheetId, createdAt])
   @@map("pricing_history")
+}
+
+
+// ----------------------------------------------------------------------------
+// Pricing & Estimation (four stages: Material -> Manufacturing -> Project -> Commercial).
+// One ProjectEstimate per project. It stores INPUTS only; every total is recalculated on the server from these
+// inputs (src/features/estimation/calc.ts). Part List / Nesting data is never copied as data of its own: auto
+// material lines keep a `sourceRef` and the values they had at the last sync, so a user edit never loses the original.
+// Independent of the older BOQ pricing sheet (pricing_sheets) — nothing there is touched.
+// ----------------------------------------------------------------------------
+model ProjectEstimate {
+  id        String   @id @default(cuid())
+  currency  String   @default("EGP")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Stage completion (set by "Continue"); the commercial stage is "done" once an offer exists.
+  materialDone      Boolean @default(false)
+  manufacturingDone Boolean @default(false)
+  projectCostDone   Boolean @default(false)
+
+  // Scrap inputs (Scrap Management keeps its own only in the browser; the estimate needs them persisted).
+  scrapUsedLaterPct    Float   @default(0) // 0..1 share of the scrap kept for re-use
+  scrapUsedLaterPrice  Float   @default(0) // EGP/kg value of re-used remnants
+  scrapSellPrice       Float   @default(15) // EGP/kg the rest sells for
+  creditRecoveredScrap Boolean @default(false) // deduct recovered scrap value from the material cost
+
+  // Commercial parameters
+  profitMode        String  @default("MARKUP_ON_COST") // MARKUP_ON_COST | MARGIN_ON_PRICE | FIXED
+  profitValue       Float   @default(0)
+  insuranceMode     String  @default("FIXED") // FIXED | PERCENT
+  insuranceValue    Float   @default(0)
+  taxPct            Float   @default(14)
+  paymentTerms      String?
+  offerValidityDays Int     @default(30)
+  deliveryDays      Int?
+  exclusions        String?
+  commercialNotes   String?
+
+  createdById String
+  updatedById String?
+
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  materials    EstimateMaterial[]
+  items        EstimateItem[]
+  subcontracts EstimateSubcontract[]
+  projectCosts EstimateProjectCost[]
+  offers       EstimateOffer[]
+
+  @@map("project_estimates")
+}
+
+model EstimateMaterial {
+  id        String   @id @default(cuid())
+  source    String // NESTING | PART_LIST | MANUAL
+  sourceRef String? // stable key of the source row (de-duplicates re-syncs); null for manual lines
+  name      String
+  grade     String?
+  thicknessMm Float?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Effective values used by the calculation.
+  requiredKg  Float? // null on a manual line = same as purchased
+  purchasedKg Float
+  unitPrice   Float  @default(0) // EGP/kg
+
+  // What the source said at the last sync, and the price suggested by Procurement — never overwritten by user edits.
+  sourceRequiredKg     Float?
+  sourcePurchasedKg    Float?
+  suggestedUnitPrice   Float?
+  suggestedPriceSource String? // PROCUREMENT
+  sourceMissing        Boolean @default(false) // the source row disappeared but the user had edited the line, so it was kept
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@unique([estimateId, sourceRef])
+  @@index([estimateId, sortOrder])
+  @@map("estimate_materials")
+}
+
+// A manufacturing scope. Linked to a project ScopeItem (weight and pieces come live from its parts) or manual.
+model EstimateItem {
+  id             String   @id @default(cuid())
+  name           String
+  manualWeightKg Float?
+  manualPieces   Int?
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  scopeItemId String?
+  scopeItem   ScopeItem? @relation(fields: [scopeItemId], references: [id], onDelete: SetNull)
+
+  operations EstimateOperation[]
+
+  @@unique([estimateId, scopeItemId])
+  @@index([estimateId, sortOrder])
+  @@map("estimate_items")
+}
+
+model EstimateOperation {
+  id          String   @id @default(cuid())
+  name        String
+  costType    String // FIXED | PERCENTAGE | PER_KG | PER_TON | PER_METER | PER_HOUR | PER_PIECE | PER_HOLE | CUSTOM
+  unit        String   @default("")
+  rate        Float    @default(0)
+  quantity    Float? // null = taken from the item (kg / ton / pieces)
+  percentBase String? // ITEM_OPERATIONS | ITEM_MATERIAL_SHARE (percentage only)
+  selected    Boolean  @default(false)
+  source      String   @default("DEFAULT") // DEFAULT | MANUAL
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  itemId String
+  item   EstimateItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId, sortOrder])
+  @@map("estimate_operations")
+}
+
+model EstimateSubcontract {
+  id        String   @id @default(cuid())
+  name      String
+  company   String?
+  unit      String   @default("lot")
+  quantity  Float    @default(1)
+  unitPrice Float    @default(0)
+  notes     String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, sortOrder])
+  @@map("estimate_subcontracts")
+}
+
+model EstimateProjectCost {
+  id          String   @id @default(cuid())
+  name        String
+  method      String // FIXED | PERCENTAGE | PER_TRIP | PER_TON | PER_TEST | PER_UNIT | CUSTOM
+  unit        String   @default("")
+  quantity    Float? // null = 1 (per ton: the project's total tons)
+  rate        Float    @default(0)
+  percentBase String? // MATERIAL_COST | MANUFACTURING_COST | SUBCONTRACTOR_COST | DIRECT_COST
+  enabled     Boolean  @default(true)
+  source      String   @default("DEFAULT") // DEFAULT | MANUAL
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, sortOrder])
+  @@map("estimate_project_costs")
+}
+
+// One row per generated offer. The offer itself is a normal Quotation (DRAFT — generating never approves anything);
+// each new offer is the next revision of the same quotation number, so earlier revisions (and approved ones) stay as they were.
+// `snapshot` freezes the inputs and totals the offer was priced from.
+model EstimateOffer {
+  id         String   @id @default(cuid())
+  snapshot   Json
+  finalPrice Float
+  createdById String
+  createdAt  DateTime @default(now())
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  quotationId String    @unique
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, createdAt])
+  @@map("estimate_offers")
 }
