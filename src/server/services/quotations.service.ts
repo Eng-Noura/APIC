@@ -87,7 +87,7 @@ export async function getQuotationDetail(projectId: string, id: string): Promise
   };
 }
 
-async function nextNumber(projectId: string, year: number) {
+export async function nextNumber(projectId: string, year: number) {
   const numbers = new Set((await prisma.quotation.findMany({ where: { projectId }, select: { number: true } })).map((q) => q.number));
   let seq = numbers.size + 1;
   while (numbers.has(quotationNumber(seq, year))) seq++;
