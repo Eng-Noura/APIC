@@ -1,27 +1,28 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
+import { z } from "zod";
 import { requirePermission } from "@/server/api/guard";
 import { handle, parseBody } from "@/server/api/pricing-route";
-import { createSheetSchema } from "@/server/validators/pricing";
-import { createSheet, findCurrentSheet, getSheetView } from "@/server/services/pricing.service";
+import { componentSchema, materialSchema } from "@/server/validators/pricing";
+import { addComponent, addMaterial, PricingError } from "@/server/services/pricing.service";
 
-// GET /api/pricing?projectId=… → the project's current pricing sheet (computed from live data), or { sheet: null }.
-export async function GET(req: NextRequest) {
-  const { res } = await requirePermission("pricing.view");
+// POST /api/pricing/items/:id/lines  { kind: "material" | "component", ...fields }
+const bodySchema = z.discriminatedUnion("kind", [
+  materialSchema.extend({ kind: z.literal("material") }),
+  componentSchema.extend({ kind: z.literal("component") }),
+]);
+
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { res } = await requirePermission("pricing.edit");
   if (res) return res;
   return handle(async () => {
-    const projectId = req.nextUrl.searchParams.get("projectId");
-    if (!projectId) return NextResponse.json({ error: "projectId is required" }, { status: 400 });
-    const cur = await findCurrentSheet(projectId);
-    return NextResponse.json(cur ? await getSheetView(cur.id) : { sheet: null });
-  });
-}
-
-export async function POST(req: Request) {
-  const { session, res } = await requirePermission("pricing.edit");
-  if (res) return res;
-  return handle(async () => {
-    const { projectId } = await parseBody(req, createSheetSchema);
-    const id = await createSheet(projectId, session!.user.id);
-    return NextResponse.json(await getSheetView(id), { status: 201 });
+    const { id } = await params;
+    const b = await parseBody(req, bodySchema);
+    if (b.kind === "material") { const { kind, ...d } = b; void kind; await addMaterial(id, d); }
+    else {
+      const { kind, ...d } = b; void kind;
+      if (d.method === "PERCENT_OF_BASE" && !d.base) throw new PricingError("Choose what the percentage applies to.");
+      await addComponent(id, d);
+    }
+    return NextResponse.json({ ok: true }, { status: 201 });
   });
 }

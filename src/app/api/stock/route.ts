@@ -1,24 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
 import { parseBody, planningHandler } from "@/server/api/planning-route";
-import { stockCreateSchema } from "@/server/validators/procurement";
-import { addStock, listStock } from "@/server/services/stock.service";
+import { stockAdjustSchema } from "@/server/validators/procurement";
+import { adjustStock, listMovements } from "@/server/services/stock.service";
 
-export async function GET(req: NextRequest) {
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(_req: NextRequest, { params }: Ctx) {
   const { res } = await requirePermission("stock.view");
   if (res) return res;
-  const sp = req.nextUrl.searchParams;
-  const th = Number(sp.get("thicknessMm"));
-  return NextResponse.json(await listStock({ includeEmpty: sp.get("all") === "1", thicknessMm: th > 0 ? th : undefined, material: sp.get("material") ?? undefined }));
+  const { id } = await params;
+  return NextResponse.json(await listMovements(id));
 }
 
-export async function POST(req: NextRequest) {
+// Take from / add to a stock row (used on a project, scrapped, counted again …).
+export async function PATCH(req: NextRequest, { params }: Ctx) {
   const { session, res } = await requirePermission("stock.edit");
   if (res) return res;
-  const body = await parseBody(req, stockCreateSchema);
+  const body = await parseBody(req, stockAdjustSchema);
   if (body.res) return body.res;
   return planningHandler(async () => {
-    const item = await addStock(body.data, { id: session!.user.id, name: session!.user.name ?? "—" }, { reason: "ADDED", origin: "MANUAL" });
-    return NextResponse.json(item, { status: 201 });
+    const { id } = await params;
+    return NextResponse.json(await adjustStock(id, body.data, { id: session!.user.id, name: session!.user.name ?? "—" }));
   });
 }
