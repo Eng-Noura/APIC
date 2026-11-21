@@ -1,0 +1,201 @@
+"use client";
+import * as React from "react";
+import { CheckCircle2, CloudOff, Loader2 } from "lucide-react";
+import { useTakeoffProject } from "@/features/takeoff/project-context";
+
+export type AutosaveState = "idle" | "loading" | "saving" | "saved" | "error" | "reloaded";
+
+interface Options {
+  kind: "2D" | "1D";
+  /** What to save into: a project id, or `h:<id>` for an entry of the user's nesting history ("" = nothing open). */
+  workspaceId: string;
+  /** True once if this workspace was just created for the current import (nothing to load yet). */
+  consumeFresh: (workspaceId: string, kind: string) => boolean;
+  /** Reads the latest state to store. */
+  capture: () => unknown;
+  /** Puts a stored snapshot back; `null` = this workspace has none yet (start empty). */
+  restore: (data: unknown | null) => void;
+  /** Returns true while the user is mid-gesture (holding a part...) — the save waits. */
+  busy?: () => boolean;
+  /** Everything whose change should trigger a save (fixed length). */
+  deps: React.DependencyList;
+}
+
+const DEBOUNCE_MS = 1500;
+
+/** `h:<id>` addresses a history entry, anything else is a project id. */
+const scopeParam = (id: string) => (id.startsWith("h:") ? { historyId: id.slice(2) } : { projectId: id });
+const scopeQuery = (id: string) => {
+  const [k, v] = Object.entries(scopeParam(id))[0];
+  return `${k}=${encodeURIComponent(v)}`;
+};
+
+/**
+ * Loads the workspace of the open project / history entry and then auto-saves every change
+ * (debounced) to /api/nesting/workspace, so work survives a refresh and can be reopened later.
+ */
+export function useNestingAutosave(opts: Options) {
+  const { kind, workspaceId: projectId, deps } = opts; // `projectId` below = the workspace id (project or history)
+  const { registerFlusher } = useTakeoffProject();
+  const latest = React.useRef(opts);
+  React.useEffect(() => {
+    latest.current = opts; // always the newest capture/restore closures, without re-running the effects below
+  });
+
+  const [state, setState] = React.useState<AutosaveState>("idle");
+  const [savedAt, setSavedAt] = React.useState<number | null>(null);
+  const loadedFor = React.useRef(""); // project whose workspace has been loaded (saving is allowed only then)
+  const dirty = React.useRef(false);
+  const lastBody = React.useRef("");
+  const prevProject = React.useRef("");
+  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // version of the project workspace this tab last loaded / saved (history entries are not versioned)
+  const version = React.useRef<number | null>(null);
+
+  // Reads the workspace again and puts it into the tool — used when the server copy moved on (e.g. the BOQ changed a quantity).
+  const reload = React.useCallback(async (pid: string) => {
+    const res = await fetch(`/api/nesting/workspace?${scopeQuery(pid)}&kind=${kind}`);
+    if (!res.ok) throw new Error(String(res.status));
+    const json = (await res.json()) as { data: unknown | null; version?: number | null };
+    if (loadedFor.current !== pid) return;
+    if (json.data) { latest.current.restore(json.data); lastBody.current = JSON.stringify(json.data); }
+    version.current = json.version ?? null;
+    dirty.current = false;
+    setState("reloaded");
+  }, [kind]);
+
+  const save = React.useCallback(async (pid: string, keepalive = false) => {
+    if (!pid || loadedFor.current !== pid) return;
+    const data = JSON.stringify(latest.current.capture());
+    if (data === lastBody.current) { dirty.current = false; return; }
+    const scope = JSON.stringify(scopeParam(pid)).slice(1, -1); // "projectId":"…"  or  "historyId":"…"
+    const baseVersion = !pid.startsWith("h:") && version.current !== null ? `,"baseVersion":${version.current}` : "";
+    const body = `{${scope},"kind":"${kind}"${baseVersion},"data":${data}}`;
+    setState("saving");
+    try {
+      const res = await fetch("/api/nesting/workspace", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: keepalive && body.length < 60000,
+      });
+      if (res.status === 409) {
+        // The server copy is newer (a quantity was synced from the BOQ): take it instead of overwriting it.
+        await reload(pid);
+        return;
+      }
+      if (!res.ok) throw new Error(String(res.status));
+      const saved = (await res.json().catch(() => null)) as { version?: number } | null;
+      if (typeof saved?.version === "number") version.current = saved.version;
+      lastBody.current = data;
+      dirty.current = false;
+      if (loadedFor.current !== pid) return; // the user already moved on to another workspace
+      setSavedAt(Date.now());
+      setState("saved");
+    } catch {
+      if (loadedFor.current === pid) setState("error");
+    }
+  }, [kind, reload]);
+
+  // "Save as project" asks every open tool to write its pending changes first.
+  const flushNow = React.useCallback(async () => {
+    if (timer.current) { clearTimeout(timer.current); timer.current = null; }
+    if (loadedFor.current) await save(loadedFor.current);
+  }, [save]);
+  React.useEffect(() => registerFlusher(flushNow), [registerFlusher, flushNow]);
+
+  // Load when the project changes (flush the previous project's pending changes first).
+  React.useEffect(() => {
+    const prev = prevProject.current;
+    prevProject.current = projectId;
+    loadedFor.current = "";
+    lastBody.current = "";
+    if (!projectId) {
+      // the open project / history entry was closed or deleted: empty the tool, ready for a new import
+      if (prev) { latest.current.restore(null); setState("idle"); setSavedAt(null); }
+      return;
+    }
+    if (latest.current.consumeFresh(projectId, kind)) { loadedFor.current = projectId; return; }
+
+    let cancelled = false;
+    setState("loading");
+    fetch(`/api/nesting/workspace?${scopeQuery(projectId)}&kind=${kind}`)
+      .then((r) => { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
+      .then((json: { data: unknown | null; version?: number | null }) => {
+        if (cancelled) return;
+        version.current = json.version ?? null;
+        if (json.data) {
+          latest.current.restore(json.data);
+          lastBody.current = JSON.stringify(json.data);
+        } else if (prev) {
+          latest.current.restore(null); // switching to a workspace without a nest yet: start clean
+        }
+        loadedFor.current = projectId;
+        setState("idle");
+        if (!json.data && !prev) { dirty.current = true; void save(projectId); } // adopt work done before choosing a project / entry
+      })
+      .catch(() => { if (!cancelled) setState("error"); });
+
+    return () => {
+      cancelled = true;
+      if (timer.current) { clearTimeout(timer.current); timer.current = null; }
+      if (dirty.current) void save(projectId, true); // flush the project we are leaving
+    };
+  }, [projectId, kind, save]);
+
+  // Debounced save on every change.
+  React.useEffect(() => {
+    if (!projectId || loadedFor.current !== projectId) return;
+    dirty.current = true;
+    const tick = () => {
+      if (latest.current.busy?.()) { timer.current = setTimeout(tick, 1000); return; }
+      timer.current = null;
+      void save(projectId);
+    };
+    timer.current = setTimeout(tick, DEBOUNCE_MS);
+    return () => { if (timer.current) { clearTimeout(timer.current); timer.current = null; } };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, save, ...deps]);
+
+  // While nothing is pending, notice (every 15 s) that the project's nest changed on the server and load it.
+  React.useEffect(() => {
+    if (!projectId || projectId.startsWith("h:")) return;
+    const id = setInterval(async () => {
+      if (loadedFor.current !== projectId || dirty.current || latest.current.busy?.() || version.current === null) return;
+      try {
+        const r = await fetch(`/api/nesting/workspace?${scopeQuery(projectId)}&kind=${kind}&versionOnly=1`);
+        if (!r.ok) return;
+        const { version: v } = (await r.json()) as { version: number | null };
+        if (v !== null && version.current !== null && v > version.current && !dirty.current) await reload(projectId);
+      } catch { /* the next tick tries again */ }
+    }, 15000);
+    return () => clearInterval(id);
+  }, [projectId, kind, reload]);
+
+  // Leaving the page / closing the tab: save what is pending.
+  React.useEffect(() => {
+    const flush = () => { if (dirty.current) void save(prevProject.current, true); };
+    window.addEventListener("pagehide", flush);
+    return () => window.removeEventListener("pagehide", flush);
+  }, [save]);
+
+  return { state: projectId ? state : ("idle" as AutosaveState), savedAt };
+}
+
+export function AutosaveBadge({ state, savedAt, projectLabel }: { state: AutosaveState; savedAt: number | null; projectLabel?: string }) {
+  if (state === "idle" && !savedAt) return null;
+  const time = savedAt ? new Date(savedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-muted-foreground" aria-live="polite">
+      {state === "saving" || state === "loading" ? (
+        <><Loader2 className="h-3.5 w-3.5 animate-spin" /> {state === "loading" ? "Loading saved nest…" : "Saving…"}</>
+      ) : state === "reloaded" ? (
+        <><CheckCircle2 className="h-3.5 w-3.5 text-amber-600" /> Updated from the BOQ — the nest was reloaded</>
+      ) : state === "error" ? (
+        <><CloudOff className="h-3.5 w-3.5 text-destructive" /> Auto-save failed — keep this page open and try changing something again</>
+      ) : (
+        <><CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" /> Auto-saved{time ? ` at ${time}` : ""}{projectLabel ? ` to “${projectLabel}”` : ""}</>
+      )}
+    </p>
+  );
+}

@@ -1,0 +1,74 @@
+import { describe, expect, it } from "vitest";
+import { barStats, barTrims, minBarLength, overallStats, runOptimize1D, type Piece1D, type Settings1D, type Source1D } from "./engine";
+
+const S: Settings1D = {
+  kerf: 3, leftTrim: 10, rightTrim: 10, gripping: 5, minimizeLayoutCount: false, maxPartsInLayout: 0,
+  maxDistinctLengthsInLayout: 0, minLengthDiffInLayout: 0, remnantMinLength: 0, restrictedRestFrom: 0, restrictedRestTo: 0,
+};
+const src = (id: number, length: number, qty: number | null = null): Source1D =>
+  ({ id, sn: id, profile: "IPE200", material: "st37", length, qty, cost: 0, description: "" }) as Source1D;
+const piece = (id: number, length: number, qty: number): Piece1D =>
+  ({ id, sn: id, name: `p${id}`, profile: "IPE200", material: "st37", length, qty }) as Piece1D;
+
+describe("a piece as long as the bar gets a bar of its own with no trims", () => {
+  it("12000 mm piece on a 12000 mm bar: cut at 0, no trim / gripping, nothing else on it", () => {
+    const r = runOptimize1D([piece(1, 12000, 1), piece(2, 500, 2)], [src(1, 12000)], S);
+    expect(r.skip).toHaveLength(0);
+    const full = r.layouts.flatMap((l) => l.bars).filter((b) => b.full);
+    expect(full).toHaveLength(1);
+    expect(full[0].cuts).toHaveLength(1);
+    expect(full[0].cuts[0].pos).toBe(0);
+    expect(barTrims(full[0], S)).toEqual({ left: 0, right: 0 });
+    expect(barStats(full[0], S).rest).toBe(0);
+    expect(minBarLength(full[0], S)).toBe(12000);
+    const normal = r.layouts.flatMap((l) => l.bars).filter((b) => !b.full);
+    expect(normal).toHaveLength(1);
+    expect(normal[0].cuts).toHaveLength(2);
+    expect(barTrims(normal[0], S)).toEqual({ left: 10, right: 15 });
+  });
+
+  it("a piece that fits the trimmed bar is cut normally", () => {
+    const r = runOptimize1D([piece(1, 11900, 1)], [src(1, 12000)], S);
+    expect(r.layouts[0].bars[0].full).toBeUndefined();
+  });
+
+  it("a piece longer than the raw bar is split: one full bar + the rest", () => {
+    const r = runOptimize1D([piece(1, 12500, 1)], [src(1, 12000)], S);
+    expect(r.skip).toHaveLength(0);
+    const bars = r.layouts.flatMap((l) => l.bars);
+    expect(bars).toHaveLength(2);
+    const lens = bars.flatMap((b) => b.cuts.map((c) => c.piece.length)).sort((a, b) => b - a);
+    expect(lens).toEqual([12000, 500]);
+    expect(bars.flatMap((b) => b.cuts).every((c) => c.piece.sn === 1 && c.piece.segment?.total === 2)).toBe(true);
+    expect(bars.find((b) => b.full)?.cuts[0].piece.length).toBe(12000);
+    expect(r.problems.some((m) => m.includes("split into 2 segments"))).toBe(true);
+  });
+
+  it("a very long piece is split into several full bars + the rest, per quantity", () => {
+    const r = runOptimize1D([piece(1, 25000, 2)], [src(1, 12000)], S);
+    expect(r.skip).toHaveLength(0);
+    const cuts = r.layouts.flatMap((l) => l.bars).flatMap((b) => b.cuts.map((c) => c.piece.length));
+    expect(cuts.filter((l) => l === 12000)).toHaveLength(4);
+    expect(cuts.filter((l) => l === 1000)).toHaveLength(2);
+    expect(cuts.reduce((a, b) => a + b, 0)).toBe(50000);
+  });
+
+  it("the rest of a split piece shares a bar with other pieces", () => {
+    const r = runOptimize1D([piece(1, 12500, 1), piece(2, 3000, 2)], [src(1, 12000)], S);
+    const bars = r.layouts.flatMap((l) => l.bars);
+    expect(bars).toHaveLength(2);
+    expect(bars.find((b) => !b.full)?.cuts).toHaveLength(3);
+  });
+
+  it("respects limited stock for full-length bars", () => {
+    const r = runOptimize1D([piece(1, 12000, 2)], [src(1, 12000, 1)], S);
+    expect(r.layouts.flatMap((l) => l.bars)).toHaveLength(1);
+    expect(r.skip).toHaveLength(1);
+  });
+
+  it("a split part counts as one cut part in the summary", () => {
+    const sources = [src(1, 6000)];
+    const r = runOptimize1D([piece(1, 8020, 1), piece(2, 1000, 1)], sources, S);
+    expect(overallStats(r, sources).cutParts).toBe(2);
+  });
+});
