@@ -139,3 +139,134 @@ describe("whole estimate", () => {
     expect(r.commercial.finalCents).toBe(7_150_000);
   });
 });
+
+// ------------------------------------------------------------------ v2: item-based estimate
+import { allocateCents, calcEstimate, type EstimateInputs } from "./calc";
+
+const base = (): EstimateInputs => ({
+  scrap, allocationBasis: "WEIGHT",
+  materials: [
+    { id: "m1", itemId: "A", source: "NESTING", name: "S235 10mm", requiredKg: 800, purchasedKg: 1000, unitPrice: 50 },
+    { id: "m2", itemId: "B", source: "PART_LIST", name: "S355 12mm", requiredKg: 500, purchasedKg: 500, unitPrice: 60 },
+    { id: "m3", itemId: null, source: "MANUAL", name: "Consumables", requiredKg: null, purchasedKg: 100, unitPrice: 10 },
+  ],
+  items: [
+    { id: "A", weightKg: 800, pieces: 4, operations: [op({ id: "a1", costType: "PER_KG", rate: 10 }), op({ id: "a2", costType: "FIXED", rate: 5000 })] },
+    { id: "B", weightKg: 200, pieces: 2, operations: [op({ id: "b1", costType: "FIXED", rate: 1000 }), op({ id: "b2", costType: "FIXED", rate: 999, selected: false })] },
+  ],
+  subcontracts: [
+    { id: "s1", itemId: "A", quantity: 800, unitPrice: 6, costType: "PER_UNIT" },
+    { id: "s2", itemId: null, quantity: 1, unitPrice: 2000, costType: "FIXED" },
+    { id: "s3", itemId: "B", quantity: 1, unitPrice: 5, costType: "PERCENTAGE", percentBase: "MATERIAL_COST" },
+    { id: "s4", itemId: "B", quantity: 1, unitPrice: 777, costType: "FIXED", selected: false },
+  ],
+  projectCosts: [
+    { id: "p1", enabled: true, method: "FIXED", rate: 1000, quantity: null, percentBase: null },
+    { id: "p2", enabled: true, method: "FIXED", rate: 500, quantity: null, percentBase: null, itemId: "B" },
+    { id: "p3", enabled: true, method: "PERCENTAGE", rate: 10, quantity: null, percentBase: "MATERIAL_COST", itemId: "A" },
+  ],
+  commercial: { profitMode: "MARKUP_ON_COST", profitValue: 20, insuranceMode: "FIXED", insuranceValue: 1000, taxPct: 14 },
+});
+
+describe("item-based estimate", () => {
+  const r = calcEstimate(base());
+  it("keeps each item's materials, operations and services independent", () => {
+    const [a, b] = r.items;
+    expect(a.materialCents).toBe(50_000_00);
+    expect(b.materialCents).toBe(30_000_00);
+    expect(a.manufacturingCents).toBe(8_000_00 + 5_000_00);
+    expect(b.manufacturingCents).toBe(1_000_00); // unselected 999 ignored
+    expect(a.subcontractCents).toBe(4_800_00);
+    expect(b.subcontractCents).toBe(1_500_00); // 5% of its own material (30,000)
+  });
+  it("counts unselected subcontract lines in no total", () => {
+    expect(r.totals.subcontractorCents).toBe(4_800_00 + 2_000_00 + 1_500_00);
+  });
+  it("shared material and project-level services stay out of the items but inside the totals", () => {
+    expect(r.shared.materialCents).toBe(1_000_00);
+    expect(r.shared.subcontractCents).toBe(2_000_00);
+    expect(r.totals.materialCents).toBe(50_000_00 + 30_000_00 + 1_000_00);
+  });
+  it("assigns item costs to their item and spreads shared ones by weight, once", () => {
+    const [a, b] = r.items;
+    expect(a.projectCents).toBe(5_000_00 /*10% of A material*/ + 800_00); // + 80% of 1000
+    expect(b.projectCents).toBe(500_00 + 200_00);
+    expect(r.totals.projectCents).toBe(1_000_00 + 500_00 + 5_000_00);
+  });
+  it("item costs + shared pool = total estimated cost; item finals add up to the final price", () => {
+    const sum = r.items.reduce((x, i) => x + i.costCents, 0) + r.shared.costCents;
+    expect(sum).toBe(r.totals.estimatedCostCents);
+    expect(r.items.reduce((x, i) => x + i.finalCents, 0) + r.shared.finalCents).toBe(r.commercial.finalCents);
+  });
+  it("gives final rates per kg and per ton", () => {
+    expect(r.rates.totalWeightKg).toBe(1000);
+    expect(r.rates.finalPerTon).toBeCloseTo(r.commercial.finalCents / 100, 2);
+  });
+  it("is deterministic: recalculating the same inputs (a stored snapshot) gives the identical result", () => {
+    const snap = JSON.parse(JSON.stringify(base()));
+    expect(calcEstimate(snap)).toEqual(r);
+  });
+  it("a line pointing at a deleted item becomes shared instead of vanishing", () => {
+    const i = base(); i.materials[0].itemId = "gone";
+    const x = calcEstimate(i);
+    expect(x.totals.materialCents).toBe(r.totals.materialCents);
+    expect(x.shared.materialCents).toBe(1_000_00 + 50_000_00);
+  });
+});
+
+describe("allocateCents", () => {
+  it("always sums to the total", () => { expect(allocateCents(100, [1, 1, 1]).reduce((a, b) => a + b, 0)).toBe(100); });
+  it("falls back to an equal split when all weights are 0", () => { expect(allocateCents(10, [0, 0])).toEqual([5, 5]); });
+  it("handles no items", () => { expect(allocateCents(10, [])).toEqual([]); });
+});
+
+describe("scrap price source", () => {
+  it("SCRAP-priced lines use the kg the parts use and are never credited for recovered scrap again", () => {
+    const lines = [{ id: "x", source: "NESTING" as const, name: "P", requiredKg: 800, purchasedKg: 1000, unitPrice: 60, priceSource: "SCRAP" as const }];
+    const r = calcMaterials(lines, { ...scrap, creditRecoveredScrap: true });
+    expect(r.materialCostCents).toBe(800 * 60 * 100);
+    expect(r.scrap.recoveredCents).toBe(0);
+  });
+  it("warns instead of inventing a price", () => {
+    const r = calcMaterials([{ id: "x", source: "MANUAL", name: "?", requiredKg: null, purchasedKg: 10, unitPrice: 0 }], scrap);
+    expect(r.lines[0].issue).toBeTruthy();
+  });
+});
+
+describe("commercial — margin vs markup, discount, other charges, tax", () => {
+  const c = { insuranceMode: "FIXED" as const, insuranceValue: 0, taxPct: 0 };
+  it("20% markup and 20% margin are different prices", () => {
+    expect(calcCommercial(100_000_00, { ...c, profitMode: "MARKUP_ON_COST", profitValue: 20 }).profitCents).toBe(20_000_00);
+    expect(calcCommercial(100_000_00, { ...c, profitMode: "MARGIN_ON_PRICE", profitValue: 20 }).profitCents).toBe(25_000_00);
+  });
+  it("reports markup and margin separately", () => {
+    const r = calcCommercial(100_000_00, { ...c, profitMode: "MARKUP_ON_COST", profitValue: 25 });
+    expect(r.markupPct).toBe(25); expect(r.marginPct).toBe(20);
+  });
+  it("applies insurance % to cost+profit and tax to the whole taxable amount", () => {
+    const r = calcCommercial(100_000_00, { profitMode: "MARKUP_ON_COST", profitValue: 20, insuranceMode: "PERCENT", insuranceValue: 1, taxPct: 14 });
+    expect(r.insuranceCents).toBe(1_200_00);
+    expect(r.taxCents).toBe(Math.round(121_200_00 * 0.14));
+    expect(r.finalCents).toBe(121_200_00 + r.taxCents);
+  });
+  it("discount before tax lowers the tax; after tax does not", () => {
+    const i = { ...c, taxPct: 10, profitMode: "FIXED" as const, profitValue: 0, discountMode: "FIXED" as const, discountValue: 10_000 };
+    const before = calcCommercial(100_000_00, { ...i, discountTiming: "BEFORE_TAX" });
+    const after = calcCommercial(100_000_00, { ...i, discountTiming: "AFTER_TAX" });
+    expect(before.finalCents).toBe(90_000_00 + 9_000_00);
+    expect(after.finalCents).toBe(100_000_00 + 10_000_00 - 10_000_00);
+  });
+  it("non-taxable other charges are added after tax", () => {
+    const r = calcCommercial(100_000_00, { ...c, taxPct: 10, profitMode: "FIXED", profitValue: 0, otherChargesValue: 2_000, otherChargesTaxable: false });
+    expect(r.taxCents).toBe(10_000_00);
+    expect(r.finalCents).toBe(100_000_00 + 2_000_00 + 10_000_00);
+  });
+  it("rejects impossible values with a message, never NaN", () => {
+    expect(calcCommercial(1000, { ...c, profitMode: "MARGIN_ON_PRICE", profitValue: 100 }).issue).toBeTruthy();
+    expect(calcCommercial(1000_00, { ...c, profitMode: "FIXED", profitValue: 0, discountMode: "PERCENT", discountValue: 150 }).issue).toBeTruthy();
+  });
+  it("reports the gap to a target price without changing the price", () => {
+    const r = calcCommercial(100_000_00, { ...c, profitMode: "FIXED", profitValue: 0, targetSaleCents: 95_000_00 });
+    expect(r.targetGapCents).toBe(5_000_00); expect(r.finalCents).toBe(100_000_00);
+  });
+});

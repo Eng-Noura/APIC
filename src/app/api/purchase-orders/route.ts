@@ -1,17 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
 import { parseBody, planningHandler } from "@/server/api/planning-route";
-import { receiptSchema } from "@/server/validators/procurement";
-import { createGoodsReceipt } from "@/server/services/purchasing.service";
+import { purchaseOrderSchema } from "@/server/validators/procurement";
+import { createPurchaseOrder, listPurchaseOrders } from "@/server/services/purchasing.service";
 
-export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { session, res } = await requirePermission("procurement.receive");
+export async function GET(req: NextRequest) {
+  const { res } = await requirePermission("procurement.view");
   if (res) return res;
-  const body = await parseBody(req, receiptSchema);
+  return NextResponse.json(await listPurchaseOrders({ projectId: req.nextUrl.searchParams.get("projectId") ?? undefined }));
+}
+
+export async function POST(req: NextRequest) {
+  const { session, res } = await requirePermission("procurement.edit");
+  if (res) return res;
+  const body = await parseBody(req, purchaseOrderSchema);
   if (body.res) return body.res;
   return planningHandler(async () => {
-    const { id } = await params;
-    const r = await createGoodsReceipt(id, body.data, { id: session!.user.id, name: session!.user.name ?? "—" });
-    return NextResponse.json(r, { status: 201 });
+    const po = await createPurchaseOrder(body.data, { id: session!.user.id, name: session!.user.name ?? "—" });
+    return NextResponse.json(po, { status: 201 });
   });
 }

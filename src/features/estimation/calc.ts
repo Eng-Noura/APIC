@@ -282,18 +282,43 @@ export type ProfitMode = (typeof PROFIT_MODES)[number];
 export const PROFIT_MODE_LABEL: Record<ProfitMode, string> = { MARKUP_ON_COST: "% markup on cost", MARGIN_ON_PRICE: "% margin on price", FIXED: "Fixed amount" };
 export const INSURANCE_MODES = ["FIXED", "PERCENT"] as const;
 export type InsuranceMode = (typeof INSURANCE_MODES)[number];
+export const DISCOUNT_MODES = ["NONE", "PERCENT", "FIXED"] as const;
+export type DiscountMode = (typeof DISCOUNT_MODES)[number];
+export const DISCOUNT_TIMINGS = ["BEFORE_TAX", "AFTER_TAX"] as const;
+export type DiscountTiming = (typeof DISCOUNT_TIMINGS)[number];
 
-export interface CommercialInput { profitMode: ProfitMode; profitValue: number; insuranceMode: InsuranceMode; insuranceValue: number; taxPct: number }
-export interface CommercialResult { costCents: number; profitCents: number; insuranceCents: number; taxableCents: number; taxCents: number; finalCents: number; issue?: string }
+export interface CommercialInput {
+  profitMode: ProfitMode; profitValue: number; insuranceMode: InsuranceMode; insuranceValue: number; taxPct: number;
+  discountMode?: DiscountMode; discountValue?: number; discountTiming?: DiscountTiming;
+  otherChargesValue?: number; otherChargesTaxable?: boolean;
+  /** optional goal; only compared with the result, never forced onto it */
+  targetSaleCents?: number | null;
+}
+export interface CommercialResult {
+  costCents: number; profitCents: number; insuranceCents: number; otherChargesCents: number; discountCents: number;
+  /** insurance + other charges − discount (tax is separate) */
+  adjustmentsCents: number;
+  /** profit after the discount has been given away */
+  netProfitCents: number;
+  taxableCents: number; taxCents: number; finalCents: number;
+  /** profit ÷ cost (markup) and profit ÷ (cost + profit) (margin) — two different numbers, never interchangeable */
+  markupPct: number; marginPct: number;
+  /** final − target; null when no target was set */
+  targetGapCents: number | null;
+  issue?: string;
+}
 
 /**
- * Chosen formula (no earlier business rule exists in the app — the Quotation model only keeps a profit %):
- *   profit     = cost × p%            (markup on cost)   |  cost × p/(100−p)  (margin on price)  |  fixed amount
- *   insurance  = fixed amount         |  (cost + profit) × i%
- *   taxable    = cost + profit + insurance
- *   tax        = taxable × t%
- *   final      = taxable + tax
- * Tax is charged on the whole price including profit and insurance (VAT-style).
+ * Order of calculation (explicit; the only company rule found in the app is a profit %, so the rest is a documented choice
+ * that the estimator can change through the parameters, and it is labelled for approval):
+ *   1. profit      = cost × p%  (markup on cost)  |  cost × p/(100−p)  (margin on price)  |  fixed amount
+ *   2. insurance   = fixed amount  |  (cost + profit) × i%
+ *   3. other       = fixed amount (taxable or not)
+ *   4. discount    = fixed | % of (cost + profit + insurance + other)
+ *   5. taxable     = cost + profit + insurance + (other if taxable) − (discount when BEFORE_TAX)
+ *   6. tax         = taxable × t%
+ *   7. final       = cost + profit + insurance + other + tax − discount
+ * Costs that already contain tax must not be entered again here (nothing in the cost stages adds tax).
  */
 export function calcCommercial(costCents: number, c: CommercialInput): CommercialResult {
   let profit = 0; let issue: string | undefined;
@@ -303,9 +328,29 @@ export function calcCommercial(costCents: number, c: CommercialInput): Commercia
     else profit = Math.round(roundMoney((costCents * num(c.profitValue)) / (100 - num(c.profitValue))));
   } else profit = toCents(num(c.profitValue));
   const insurance = c.insuranceMode === "FIXED" ? toCents(num(c.insuranceValue)) : Math.round(roundMoney(((costCents + profit) * num(c.insuranceValue)) / 100));
-  const taxable = costCents + profit + insurance;
+  const other = toCents(num(c.otherChargesValue));
+  const otherTaxable = c.otherChargesTaxable !== false;
+  const subtotal = costCents + profit + insurance + other;
+  let discount = 0;
+  const dMode = c.discountMode ?? "NONE";
+  if (dMode === "PERCENT") {
+    if (num(c.discountValue) > 100) issue = issue ?? "A discount cannot exceed 100%";
+    discount = Math.round(roundMoney((subtotal * Math.min(100, num(c.discountValue))) / 100));
+  } else if (dMode === "FIXED") discount = toCents(num(c.discountValue));
+  if (discount > subtotal) { issue = issue ?? "The discount is larger than the price"; discount = subtotal; }
+  const before = (c.discountTiming ?? "BEFORE_TAX") === "BEFORE_TAX";
+  const taxable = Math.max(0, costCents + profit + insurance + (otherTaxable ? other : 0) - (before ? discount : 0));
   const tax = Math.round(roundMoney((taxable * num(c.taxPct)) / 100));
-  return { costCents, profitCents: profit, insuranceCents: insurance, taxableCents: taxable, taxCents: tax, finalCents: taxable + tax, issue };
+  const final = subtotal + tax - discount;
+  return {
+    costCents, profitCents: profit, insuranceCents: insurance, otherChargesCents: other, discountCents: discount,
+    adjustmentsCents: insurance + other - discount, netProfitCents: profit - discount,
+    taxableCents: taxable, taxCents: tax, finalCents: final,
+    markupPct: costCents > 0 ? Math.round((profit / costCents) * 10000) / 100 : 0,
+    marginPct: costCents + profit > 0 ? Math.round((profit / (costCents + profit)) * 10000) / 100 : 0,
+    targetGapCents: c.targetSaleCents != null ? final - c.targetSaleCents : null,
+    issue,
+  };
 }
 
 // --------------------------------------------------------------------------- Whole estimate
@@ -314,23 +359,98 @@ export interface EstimateInputs {
   materials: MaterialInput[]; scrap: ScrapSettings;
   items: ItemInput[]; subcontracts: SubcontractInput[]; projectCosts: ProjectCostInput[];
   commercial: CommercialInput;
+  /** how shared project costs are spread over the items (default WEIGHT) */
+  allocationBasis?: AllocationBasis;
+}
+export interface CalcIssue { level: "error" | "warning"; scope: "material" | "operation" | "subcontract" | "projectCost" | "commercial"; id?: string; message: string }
+export interface ItemSummary {
+  id: string; weightKg: number;
+  materialCents: number; manufacturingCents: number; subcontractCents: number;
+  /** project costs assigned to this item + its allocated share of the shared ones */
+  projectCents: number; costCents: number;
+  /** the item's share of the final price (proportional to cost; shares add up to the final price) */
+  finalCents: number; finalPerKg: number | null;
 }
 export interface EstimateResult {
   materials: MaterialResult; manufacturing: ManufacturingResult;
-  subcontract: ReturnType<typeof calcSubcontract>; project: ReturnType<typeof calcProjectCosts>;
+  subcontract: SubcontractResult; project: ReturnType<typeof calcProjectCosts>;
   totals: { materialCents: number; manufacturingCents: number; subcontractorCents: number; projectCents: number; estimatedCostCents: number };
   commercial: CommercialResult;
+  /** per BOQ item, plus the pool of things not tied to any item (shared materials / services, and shared project costs when there are no items) */
+  items: ItemSummary[];
+  shared: { materialCents: number; subcontractCents: number; projectCents: number; costCents: number; finalCents: number };
+  rates: { totalWeightKg: number; finalPerKg: number | null; finalPerTon: number | null };
+  issues: CalcIssue[];
 }
 
 export function calcEstimate(i: EstimateInputs): EstimateResult {
   const materials = calcMaterials(i.materials, i.scrap);
-  const manufacturing = calcManufacturing(i.items, materials.materialCostCents);
-  const subcontract = calcSubcontract(i.subcontracts);
+  const itemIds = new Set(i.items.map((it) => it.id));
+  // a material line pointing at an item that no longer exists is treated as shared, never dropped
+  const key = (id: string | null | undefined) => (id && itemIds.has(id) ? id : "");
+  const itemMaterial: Record<string, number> = {};
+  for (const it of i.items) if (it.id in materials.byItem) itemMaterial[it.id] = materials.byItem[it.id];
+  const sharedMaterial = materials.materialCostCents - i.items.reduce((a, it) => a + (itemMaterial[it.id] ?? 0), 0);
+  const manufacturing = calcManufacturing(i.items, sharedMaterial, itemMaterial);
+  const manByItem: Record<string, number> = Object.fromEntries(manufacturing.items.map((m) => [m.id, m.totalCents]));
+  const matByItem: Record<string, number> = Object.fromEntries(i.items.map((it) => [it.id, itemMaterial[it.id] ?? 0]));
+  // items without own material lines get a weight share of the shared pool for % bases only (done inside calcManufacturing)
+  const subcontract = calcSubcontract(i.subcontracts.map((s) => ({ ...s, itemId: key(s.itemId) || null })), {
+    materialCents: matByItem, manufacturingCents: manByItem,
+    projectMaterialCents: materials.materialCostCents, projectManufacturingCents: manufacturing.totalCents,
+  });
+  const subByItem: Record<string, number> = {};
+  for (const it of i.items) subByItem[it.id] = subcontract.byItem[it.id] ?? 0;
   const totalWeightKg = i.items.reduce((a, it) => a + num(it.weightKg), 0);
-  const project = calcProjectCosts(i.projectCosts, { materialCents: materials.materialCostCents, manufacturingCents: manufacturing.totalCents, subcontractorCents: subcontract.totalCents, totalWeightKg });
+  const weightByItem = Object.fromEntries(i.items.map((it) => [it.id, num(it.weightKg)]));
+  const project = calcProjectCosts(i.projectCosts.map((c) => ({ ...c, itemId: key(c.itemId) || null })), {
+    materialCents: materials.materialCostCents, manufacturingCents: manufacturing.totalCents, subcontractorCents: subcontract.totalCents, totalWeightKg,
+    itemMaterialCents: matByItem, itemManufacturingCents: manByItem, itemSubcontractorCents: subByItem, itemWeightKg: weightByItem,
+  });
   const totals = {
     materialCents: materials.materialCostCents, manufacturingCents: manufacturing.totalCents, subcontractorCents: subcontract.totalCents, projectCents: project.totalCents,
     estimatedCostCents: materials.materialCostCents + manufacturing.totalCents + subcontract.totalCents + project.totalCents,
   };
-  return { materials, manufacturing, subcontract, project, totals, commercial: calcCommercial(totals.estimatedCostCents, i.commercial) };
+  const commercial = calcCommercial(totals.estimatedCostCents, i.commercial);
+
+  // ---- per item
+  const assigned: Record<string, number> = {}; let sharedProject = 0;
+  for (const l of project.lines) {
+    if (!l.contributes) continue;
+    if (l.itemId) assigned[l.itemId] = (assigned[l.itemId] ?? 0) + l.amountCents; else sharedProject += l.amountCents;
+  }
+  const direct = i.items.map((it) => (matByItem[it.id] ?? 0) + (manByItem[it.id] ?? 0) + (subByItem[it.id] ?? 0));
+  const basis = i.allocationBasis ?? "WEIGHT";
+  const w = basis === "EQUAL" ? i.items.map(() => 1) : basis === "DIRECT_COST" ? direct : i.items.map((it) => num(it.weightKg));
+  const spread = i.items.length ? allocateCents(sharedProject, w) : [];
+  const sharedSub = subcontract.byItem[""] ?? 0;
+  const sharedPool = { materialCents: sharedMaterial, subcontractCents: sharedSub, projectCents: i.items.length ? 0 : sharedProject };
+  const sharedCost = sharedPool.materialCents + sharedPool.subcontractCents + sharedPool.projectCents;
+  const itemCosts = i.items.map((it, n) => direct[n] + (assigned[it.id] ?? 0) + spread[n]);
+  const finals = allocateCents(commercial.finalCents, [...itemCosts, sharedCost]);
+  const items: ItemSummary[] = i.items.map((it, n) => ({
+    id: it.id, weightKg: num(it.weightKg), materialCents: matByItem[it.id] ?? 0, manufacturingCents: manByItem[it.id] ?? 0, subcontractCents: subByItem[it.id] ?? 0,
+    projectCents: (assigned[it.id] ?? 0) + spread[n], costCents: itemCosts[n], finalCents: finals[n],
+    finalPerKg: num(it.weightKg) > 0 ? Math.round((finals[n] / 100 / num(it.weightKg)) * 100) / 100 : null,
+  }));
+
+  // ---- issues
+  const issues: CalcIssue[] = [];
+  for (const l of materials.lines) if (l.issue) issues.push({ level: "warning", scope: "material", id: l.id, message: l.issue });
+  if (materials.scrap.shortageKg > 0) issues.push({ level: "warning", scope: "material", message: `Purchased weight is ${Math.round(materials.scrap.shortageKg)} kg below what the parts need` });
+  for (const it of manufacturing.items) for (const o of it.operations) if (o.contributes && o.issue) issues.push({ level: "error", scope: "operation", id: o.id, message: o.issue });
+  for (const l of subcontract.lines) if (l.contributes && l.issue) issues.push({ level: "error", scope: "subcontract", id: l.id, message: l.issue });
+  for (const l of project.lines) if (l.contributes && l.issue) issues.push({ level: "error", scope: "projectCost", id: l.id, message: l.issue });
+  if (commercial.issue) issues.push({ level: "error", scope: "commercial", message: commercial.issue });
+
+  return {
+    materials, manufacturing, subcontract, project, totals, commercial, items,
+    shared: { ...sharedPool, costCents: sharedCost, finalCents: finals[finals.length - 1] },
+    rates: {
+      totalWeightKg,
+      finalPerKg: totalWeightKg > 0 ? Math.round((commercial.finalCents / 100 / totalWeightKg) * 100) / 100 : null,
+      finalPerTon: totalWeightKg > 0 ? Math.round((commercial.finalCents / 100 / (totalWeightKg / 1000)) * 100) / 100 : null,
+    },
+    issues,
+  };
 }
