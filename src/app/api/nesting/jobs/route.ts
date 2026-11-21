@@ -1,22 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
-import { deleteNestingJob, getNestingJob } from "@/server/services/nesting.service";
+import { nestingJobSchema } from "@/server/validators/nesting";
+import { createNestingJob, listNestingJobs } from "@/server/services/nesting.service";
 
-type Ctx = { params: Promise<{ id: string }> };
-
-export async function GET(_req: NextRequest, { params }: Ctx) {
+export async function GET(req: NextRequest) {
   const { res } = await requirePermission("nesting.view");
   if (res) return res;
-  const { id } = await params;
-  const job = await getNestingJob(id);
-  if (!job) return NextResponse.json({ error: "Not found" }, { status: 404 });
-  return NextResponse.json(job);
+  const projectId = req.nextUrl.searchParams.get("projectId");
+  if (!projectId) return NextResponse.json({ error: "projectId is required" }, { status: 400 });
+  return NextResponse.json(await listNestingJobs(projectId));
 }
 
-export async function DELETE(_req: NextRequest, { params }: Ctx) {
-  const { session, res } = await requirePermission("nesting.delete");
+export async function POST(req: NextRequest) {
+  const { session, res } = await requirePermission("nesting.create");
   if (res) return res;
-  const { id } = await params;
-  await deleteNestingJob(id, session!.user.id);
-  return NextResponse.json({ ok: true });
+
+  const body = await req.json();
+  const parsed = nestingJobSchema.safeParse(body);
+  if (!parsed.success) return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
+
+  const job = await createNestingJob(parsed.data, session!.user.id);
+  return NextResponse.json(job, { status: 201 });
 }
