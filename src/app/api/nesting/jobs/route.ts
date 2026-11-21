@@ -1,17 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
-import { nestingSourceSchema } from "@/server/validators/nesting";
-import { addNestingSource } from "@/server/services/nesting.service";
+import { nestingJobSchema } from "@/server/validators/nesting";
+import { createNestingJob, listNestingJobs } from "@/server/services/nesting.service";
 
-export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { session, res } = await requirePermission("nesting.edit");
+export async function GET(req: NextRequest) {
+  const { res } = await requirePermission("nesting.view");
   if (res) return res;
-  const { id } = await params;
+  const projectId = req.nextUrl.searchParams.get("projectId");
+  if (!projectId) return NextResponse.json({ error: "projectId is required" }, { status: 400 });
+  return NextResponse.json(await listNestingJobs(projectId));
+}
+
+export async function POST(req: NextRequest) {
+  const { session, res } = await requirePermission("nesting.create");
+  if (res) return res;
 
   const body = await req.json();
-  const parsed = nestingSourceSchema.safeParse(body);
+  const parsed = nestingJobSchema.safeParse(body);
   if (!parsed.success) return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
 
-  const source = await addNestingSource(id, parsed.data, session!.user.id);
-  return NextResponse.json(source, { status: 201 });
+  const job = await createNestingJob(parsed.data, session!.user.id);
+  return NextResponse.json(job, { status: 201 });
 }
