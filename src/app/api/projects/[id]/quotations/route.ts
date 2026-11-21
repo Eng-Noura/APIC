@@ -1,18 +1,29 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
-import { planningHandler } from "@/server/api/planning-route";
-import { importQuotationFromExcel, QuotationError } from "@/server/services/quotations.service";
+import { parseBody, planningHandler } from "@/server/api/planning-route";
+import { quotationPatchSchema } from "@/server/validators/quotations";
+import { deleteQuotation, updateQuotation } from "@/server/services/quotations.service";
 
-export const maxDuration = 60;
+type Ctx = { params: Promise<{ id: string; qid: string }> };
 
-export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function PATCH(req: NextRequest, { params }: Ctx) {
   const { session, res } = await requirePermission("quotations.edit");
   if (res) return res;
+  const body = await parseBody(req, quotationPatchSchema);
+  if (body.res) return body.res;
   return planningHandler(async () => {
-    const { id } = await params;
-    const file = (await req.formData().catch(() => null))?.get("file");
-    if (!(file instanceof File)) throw new QuotationError("Choose an .xlsx file to import.");
-    if (file.size > 10 * 1024 * 1024) throw new QuotationError("The file is larger than 10 MB.");
-    return NextResponse.json(await importQuotationFromExcel(id, await file.arrayBuffer(), file.name, { id: session!.user.id, name: session!.user.name ?? "—" }));
+    const { id, qid } = await params;
+    await updateQuotation(id, qid, body.data, { id: session!.user.id, name: session!.user.name ?? "—" });
+    return NextResponse.json({ ok: true });
+  });
+}
+
+export async function DELETE(_req: NextRequest, { params }: Ctx) {
+  const { session, res } = await requirePermission("quotations.delete");
+  if (res) return res;
+  return planningHandler(async () => {
+    const { id, qid } = await params;
+    await deleteQuotation(id, qid, session!.user.id);
+    return NextResponse.json({ ok: true });
   });
 }

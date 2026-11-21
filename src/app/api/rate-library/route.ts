@@ -1,16 +1,17 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
 import { handle, parseBody } from "@/server/api/pricing-route";
-import { profilePatchSchema } from "@/server/validators/pricing";
-import { deleteProfile, patchProfile } from "@/server/services/rate-library.service";
+import { profileCreateSchema } from "@/server/validators/pricing";
+import { createProfile, listProfiles } from "@/server/services/rate-library.service";
 
-export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
-  const { res } = await requirePermission("rateLibrary.manage");
+// GET /api/rate-library?projectId=… → global profiles plus that project's own.
+export async function GET(req: NextRequest) {
+  const { res } = await requirePermission("pricing.view");
   if (res) return res;
-  return handle(async () => { await patchProfile((await params).id, await parseBody(req, profilePatchSchema)); return NextResponse.json({ ok: true }); });
+  return handle(async () => NextResponse.json({ profiles: await listProfiles(req.nextUrl.searchParams.get("projectId")) }));
 }
-export async function DELETE(_req: Request, { params }: { params: Promise<{ id: string }> }) {
-  const { res } = await requirePermission("rateLibrary.manage");
+export async function POST(req: Request) {
+  const { session, res } = await requirePermission("rateLibrary.manage");
   if (res) return res;
-  return handle(async () => { await deleteProfile((await params).id); return NextResponse.json({ ok: true }); });
+  return handle(async () => NextResponse.json(await createProfile(await parseBody(req, profileCreateSchema), session!.user.id), { status: 201 }));
 }
