@@ -4,7 +4,6 @@ import { prisma } from "@/server/db/client";
 export const dynamic = "force-dynamic";
 
 const POLL_INTERVAL_MS = 2000;
-const NOTIFICATIONS_ENABLED = false;
 
 function formatMessage(log: {
   id: string;
@@ -38,9 +37,6 @@ function formatMessage(log: {
 }
 
 export async function GET(request: Request) {
-  // Disabled: 204 tells EventSource to stop (no reconnect loop), and no DB polling happens.
-  if (!NOTIFICATIONS_ENABLED) return new Response(null, { status: 204 });
-
   const session = await auth();
   if (!session?.user) {
     return new Response("Unauthorized", { status: 401 });

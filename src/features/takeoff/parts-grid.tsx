@@ -1,7 +1,7 @@
 "use client";
 import { isNestable, nestKindOf } from "@/features/nesting/part-routing";
 import * as React from "react";
-import { Pencil, Trash2, Plus, Sigma, X, Upload, FileCheck2, FileX2, Loader2, Download, TriangleAlert, Layers, FileUp, FileSpreadsheet, ListTree, Target, ClipboardList } from "lucide-react";
+import { Pencil, Trash2, Plus, Sigma, X, Upload, FileCheck2, FileX2, Loader2, Download, TriangleAlert, Layers, FileUp, FileSpreadsheet } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useTakeoffProject } from "./project-context";
 import { Button } from "@/components/ui/button";
@@ -12,8 +12,6 @@ import { explainTakeoffPart } from "@/server/calc/takeoff";
 import { PartForm } from "./part-form";
 import { DxfImportDialog } from "./dxf-import-dialog";
 import { CsvImportDialog } from "./csv-import-dialog";
-import { GroupSelectedDialog, type GroupKind } from "./group-selected-dialog";
-import type { GroupingsData } from "@/server/services/part-grouping.service";
 import type { TakeoffPartRow, PartType } from "./types";
 
 // Defensive: legacy/partial rows can come back from the API as null —
@@ -49,14 +47,8 @@ function geometrySummary(part: TakeoffPartRow): string {
   }
 }
 
-/** A small label chip for the Assembly / Scope / Work Order columns ("—" when the part has none). */
-function GroupChip({ text, title }: { text: string | null; title?: string }) {
-  if (!text) return <span className="text-muted-foreground/50">—</span>;
-  return <span title={title ?? text} className="inline-block max-w-[9rem] truncate rounded bg-muted px-1.5 py-0.5 align-middle text-[11px] font-medium text-foreground">{text}</span>;
-}
-
 export function PartsGrid({
-  drawingId, projectId, parts, canCreate, canDelete, onChanged, groupings = null, onGroupingsChanged,
+  drawingId, projectId, parts, canCreate, canDelete, onChanged,
 }: {
   drawingId: string;
   projectId: string;
@@ -64,16 +56,7 @@ export function PartsGrid({
   canCreate: boolean;
   canDelete: boolean;
   onChanged: () => void;
-  /** the project's assemblies / scopes / work orders — used for the three group columns and the "Group as…" buttons */
-  groupings?: GroupingsData | null;
-  onGroupingsChanged?: () => void;
 }) {
-  const [groupKind, setGroupKind] = React.useState<GroupKind>("assembly");
-  const [groupOpen, setGroupOpen] = React.useState(false);
-  const openGroup = (k: GroupKind) => { setGroupKind(k); setGroupOpen(true); };
-  const asmById = React.useMemo(() => new Map((groupings?.assemblies ?? []).map((a) => [a.id, a])), [groupings]);
-  const scopeById = React.useMemo(() => new Map((groupings?.scopes ?? []).map((s) => [s.id, s])), [groupings]);
-  const woById = React.useMemo(() => new Map((groupings?.workOrders ?? []).map((w) => [w.id, w])), [groupings]);
   const [formOpen, setFormOpen] = React.useState(false);
   const [importOpen, setImportOpen] = React.useState(false);
   const [csvOpen, setCsvOpen] = React.useState(false);
@@ -234,9 +217,6 @@ export function PartsGrid({
               <th className="border-l border-border px-2 py-1.5 text-right font-medium">Total Area</th>
               <th className="px-2 py-1.5 text-right font-medium">Paint Area</th>
               <th className="px-2 py-1.5 text-right font-medium">Weight (kg)</th>
-              <th className="border-l border-border px-2 py-1.5 font-medium">Assembly</th>
-              <th className="px-2 py-1.5 font-medium">Scope</th>
-              <th className="px-2 py-1.5 font-medium">Work Order</th>
               <th className="border-l border-border px-2 py-1.5 text-center font-medium">DXF</th>
               <th className="px-1 py-1.5" />
               <th className="px-1 py-1.5" />
@@ -245,7 +225,7 @@ export function PartsGrid({
           <tbody>
             {parts.length === 0 && (
               <tr>
-                <td colSpan={19} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                <td colSpan={16} className="px-4 py-8 text-center text-sm text-muted-foreground">
                   No items yet — use &quot;Add Item&quot; to enter the first part.
                 </td>
               </tr>
@@ -284,9 +264,6 @@ export function PartsGrid({
                     <td className="border-l border-border px-2 py-1.5 text-right tabular-nums">{n(part.totalArea).toFixed(3)}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{n(part.paintAreaSqm).toFixed(3)}</td>
                     <td className="px-2 py-1.5 text-right font-medium tabular-nums text-primary">{n(part.weightKg).toFixed(1)}</td>
-                    <td className="border-l border-border px-2 py-1.5"><GroupChip text={part.groupId ? asmById.get(part.groupId)?.code ?? "?" : null} title={part.groupId ? `${asmById.get(part.groupId)?.code ?? ""} — ${asmById.get(part.groupId)?.name ?? ""}` : undefined} /></td>
-                    <td className="px-2 py-1.5"><GroupChip text={part.scopeId ? scopeById.get(part.scopeId)?.description ?? "?" : null} /></td>
-                    <td className="px-2 py-1.5"><GroupChip text={part.workOrderGroupId ? woById.get(part.workOrderGroupId)?.code ?? "?" : null} title={part.workOrderGroupId ? `${woById.get(part.workOrderGroupId)?.code ?? ""} — ${woById.get(part.workOrderGroupId)?.name ?? ""}` : undefined} /></td>
                     <td className="border-l border-border px-2 py-1.5 text-center">
                       {uploadingId === part.id ? (
                         <Loader2 className="mx-auto h-3.5 w-3.5 animate-spin text-muted-foreground" />
@@ -359,7 +336,7 @@ export function PartsGrid({
                   </tr>
                   {isExpanded && explanation && (
                     <tr className="border-b border-border bg-primary/5">
-                      <td colSpan={18} className="px-4 py-3">
+                      <td colSpan={15} className="px-4 py-3">
                         <div className="flex flex-wrap gap-x-8 gap-y-1.5 text-xs">
                           {explanation.lines.map((line) => (
                             <div key={line.label} className="min-w-[180px]">
@@ -406,14 +383,6 @@ export function PartsGrid({
             >
               <Layers className="h-3.5 w-3.5" /> Send selected to Nesting
             </Button>
-            {canCreate && (
-              <>
-                <span className="ml-1 text-muted-foreground">Group as:</span>
-                <Button size="sm" variant="secondary" onClick={() => openGroup("assembly")} title="Put the selected parts in an assembly"><ListTree className="h-3.5 w-3.5" /> Assembly</Button>
-                <Button size="sm" variant="secondary" onClick={() => openGroup("scope")} title="Put the selected parts in a scope"><Target className="h-3.5 w-3.5" /> Scope</Button>
-                <Button size="sm" variant="secondary" onClick={() => openGroup("workOrder")} title="Put the selected parts in a work order"><ClipboardList className="h-3.5 w-3.5" /> Work Order</Button>
-              </>
-            )}
             {canDelete && (
               <Button size="sm" variant="outline" className="text-destructive" onClick={() => setBulkDeleteOpen(true)}>
                 <Trash2 className="h-3.5 w-3.5" /> Delete selected
@@ -457,7 +426,11 @@ export function PartsGrid({
         open={!!deletingId}
         onOpenChange={(v) => !v && setDeletingId(null)}
         title="Are you sure you want to delete this item?"
-        description="This will remove this part from the drawing. This cannot be undone."
+        description={
+          parts.find((p) => p.id === deletingId)?.nestPartId != null
+            ? "This will remove this part from the drawing. It came from a nest, so it is added again while it is still in that nest — remove it from the nest too to get rid of it for good. This cannot be undone."
+            : "This will remove this part from the drawing. This cannot be undone."
+        }
         confirmLabel="Delete"
         loading={deleteLoading}
         onConfirm={handleDelete}
@@ -472,18 +445,6 @@ export function PartsGrid({
         loading={bulkDeleteLoading}
         onConfirm={handleBulkDelete}
       />
-
-      {canCreate && (
-        <GroupSelectedDialog
-          open={groupOpen}
-          onOpenChange={setGroupOpen}
-          kind={groupKind}
-          projectId={projectId}
-          partIds={[...selected]}
-          data={groupings}
-          onDone={() => { setSelected(new Set()); onChanged(); onGroupingsChanged?.(); }}
-        />
-      )}
     </div>
   );
 }

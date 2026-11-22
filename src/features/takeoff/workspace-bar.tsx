@@ -228,7 +228,7 @@ function HistoryDialog({
  */
 export function WorkspaceBar() {
   const {
-    projects, projectId, history, historyId, startNewImport,
+    projects, projectId, setProjectId, history, historyId, startNewImport,
     createProject, renameProject, deleteProject, renameHistory, deleteHistory, saveHistoryAsProject, assignHistoryToProject,
   } = useTakeoffProject();
   const [prompt, setPrompt] = React.useState<Prompt>(null);
@@ -299,10 +299,15 @@ export function WorkspaceBar() {
             <FolderKanban className="h-5 w-5" />
           </div>
           <div className="min-w-64">
-            <p className="mb-0.5 block text-[11px] font-medium text-muted-foreground">Project</p>
-            <p className="truncate text-sm font-semibold" title={project ? project.name : undefined}>
-              {project ? `${project.number} — ${project.name}` : entry ? "No project (standalone nest)" : "None — pick one in the sidebar"}
-            </p>
+            <label className="mb-0.5 block text-[11px] font-medium text-muted-foreground">Project</label>
+            <Select value={projectId} onValueChange={setProjectId}>
+              <SelectTrigger><SelectValue placeholder={entry ? "No project (standalone nest)" : "No project — or select one"} /></SelectTrigger>
+              <SelectContent>
+                {projects.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>{p.number} — {p.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           {project && (
             <div className="flex items-center gap-1">

@@ -98,18 +98,18 @@ export async function saveWorkspace(projectId: string, kind: WorkspaceKind, data
 }
 
 /**
- * Writes quantities into the project's 2D nest (BOQ -> nest). The write is conditional on the version that was read,
- * so it can never overwrite a browser save that landed in between; on a race it re-reads and tries again.
+ * Writes quantities into the project's 2D or 1D nest (BOQ -> nest). The write is conditional on the version that was
+ * read, so it can never overwrite a browser save that landed in between; on a race it re-reads and tries again.
  * Returns the nest part ids that were changed.
  */
-export async function pushQuantitiesToNest(projectId: string, changes: { nestPartId: number; qty: number }[], userId: string): Promise<number[]> {
+export async function pushQuantitiesToNest(projectId: string, changes: { nestPartId: number; qty: number }[], userId: string, kind: WorkspaceKind = "2D"): Promise<number[]> {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const ws = await prisma.nestingWorkspace.findUnique({ where: { projectId_kind: { projectId, kind: "2D" } }, select: { dataJson: true, version: true } });
+    const ws = await prisma.nestingWorkspace.findUnique({ where: { projectId_kind: { projectId, kind } }, select: { dataJson: true, version: true } });
     if (!ws) return [];
-    const { data, applied } = applyQuantityChanges(ws.dataJson, changes);
+    const { data, applied } = applyQuantityChanges(ws.dataJson, changes, kind);
     if (applied.length === 0) return [];
     const hit = await prisma.nestingWorkspace.updateMany({
-      where: { projectId, kind: "2D", version: ws.version },
+      where: { projectId, kind, version: ws.version },
       data: { dataJson: data as object, updatedById: userId, version: { increment: 1 } },
     });
     if (hit.count === 1) return applied;

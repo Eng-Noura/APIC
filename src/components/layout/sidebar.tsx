@@ -1,8 +1,6 @@
 "use client";
-import Link from "next/link";
 import { cn } from "@/lib/utils";
 import { NavList } from "./nav-list";
-import { ProjectPicker } from "./active-project";
 import { SidebarBackdrop } from "./sidebar-backdrop";
 import { visibleNavItems } from "@/lib/nav-config";
 import type { Role } from "@prisma/client";
@@ -19,15 +17,13 @@ export function Sidebar({ role, collapsed, open = true }: { role: Role; collapse
       )}
     >
       {!collapsed && <SidebarBackdrop />}
-      <Link href="/start" title="Start screen" className="relative flex h-16 items-center gap-2.5 px-5">
+      <div className="relative flex h-16 items-center gap-2.5 px-5">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src="/logo-icon.png" alt="SteelFlow" className="h-8 w-8 shrink-0 object-contain" />
         {!collapsed && (
           <p className="text-sm font-semibold text-white">SteelFlow</p>
         )}
-      </Link>
-
-      {!collapsed && <ProjectPicker />}
+      </div>
 
       <nav className="relative flex-1 space-y-1 overflow-y-auto px-3 py-4">
         <NavList items={items} collapsed={collapsed} />

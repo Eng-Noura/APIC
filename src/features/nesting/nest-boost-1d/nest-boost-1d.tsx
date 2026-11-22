@@ -4,6 +4,7 @@ import { ChevronDown, Download, FileSpreadsheet, FolderInput, Gauge, Loader2, Pa
 import { toast } from "sonner";
 import { useTakeoffProject } from "@/features/takeoff/project-context";
 import type { TakeoffDrawingRow } from "@/features/takeoff/types";
+import { partListLabel } from "@/features/takeoff/nest-1d-parts";
 import { PARTS_CSV_TEMPLATE, parsePartsCsv } from "../csv-parts";
 import { AutosaveBadge, useNestingAutosave } from "../use-nesting-autosave";
 import { dxfToPiece } from "../dxf-piece";
@@ -412,11 +413,14 @@ export function NestBoost1D() {
           for (const part of d.parts) {
             if (wanted && !wanted.has(part.id)) continue;
             if (nestKindOf(part.partType) !== "1D") continue; // plates belong to the 2D tool
-            const label = `${d.drawingNumber} #${part.itemNo} ${part.description}`;
+            const label = partListLabel(d.drawingNumber, part.itemNo, part.description);
+            // a part that was made FROM this nest (Part List took it from here) is already in the nest: sending it back would duplicate it
+            if (part.nestKind === "1D" && part.nestPartId !== null) { skipped.push(`${label}: it came from this nest`); continue; }
             if (importedIds.current.has(part.id)) { skipped.push(`${label}: already imported`); continue; }
             const r = partTo1DPiece(part);
             if ("error" in r) { skipped.push(`${label}: ${r.error}`); continue; }
-            next = addPiece(next, { ...r.piece, name: label }, pieceCounters.current);
+            // `partId` marks the piece as coming from this part, so Part List never takes it back as a new part
+            next = addPiece(next, { ...r.piece, name: label, partId: part.id }, pieceCounters.current);
             importedIds.current.add(part.id);
             ok++;
             done.push(`${label}: ${r.piece.qty} × ${r.piece.length} mm ${r.piece.profile}`);

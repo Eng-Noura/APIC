@@ -102,21 +102,32 @@ export function summarizePlan(plan: SyncPlan): Record<SyncStatus, number> & { un
 
 // ---------------------------------------------------------------------------------------------------------------
 // Writing BOQ quantities into the nest snapshot (the `data` of /api/nesting/workspace). Same effect as typing the
-// quantity into the part list of the nest tool: only `groups[].qty` changes; placements and results are left as they
-// are (the tool treats them as out of date until it is run again). Paired-triangle copies (`cid`) and pieces of a
-// segmented part are not parts of their own and are never touched.
+// quantity into the part list of the nest tool: only the quantity changes.
+//   2D: `groups[].qty`; placements and results are left as they are (the tool treats them as out of date until run
+//       again). Paired-triangle copies (`cid`) and pieces of a segmented part are not parts of their own.
+//   1D: `pieces[].qty`; the saved cutting result no longer matches the quantities, so it is dropped (the 1D tool does
+//       the same whenever a piece changes) and the tool shows an empty result until it is run again. Segments of a
+//       part that is longer than every bar are never touched.
 
-export function applyQuantityChanges(data: unknown, changes: { nestPartId: number; qty: number }[]): { data: unknown; applied: number[] } {
-  const groups = (data as { groups?: unknown } | null)?.groups;
-  if (!Array.isArray(groups) || changes.length === 0) return { data, applied: [] };
+export type NestKind = "2D" | "1D";
+
+export function applyQuantityChanges(data: unknown, changes: { nestPartId: number; qty: number }[], kind: NestKind = "2D"): { data: unknown; applied: number[] } {
+  const key = kind === "1D" ? "pieces" : "groups";
+  const rows = (data as Record<string, unknown> | null)?.[key];
+  if (!Array.isArray(rows) || changes.length === 0) return { data, applied: [] };
   const want = new Map(changes.map((c) => [c.nestPartId, Math.max(0, Math.round(c.qty))]));
   const applied: number[] = [];
-  const next = (groups as Record<string, unknown>[]).map((g) => {
-    if (!g || typeof g !== "object" || g.cid != null || (g.seg as { role?: unknown } | null | undefined)?.role === "child") return g;
+  const next = (rows as Record<string, unknown>[]).map((g) => {
+    if (!g || typeof g !== "object") return g;
+    if (kind === "2D" && (g.cid != null || (g.seg as { role?: unknown } | null | undefined)?.role === "child")) return g;
+    if (kind === "1D" && g.segment != null) return g;
     const id = g.id;
     if (typeof id !== "number" || !want.has(id)) return g;
     applied.push(id);
     return { ...g, qty: want.get(id) };
   });
-  return { data: { ...(data as object), groups: next }, applied };
+  if (applied.length === 0) return { data, applied };
+  const out = { ...(data as object), [key]: next } as Record<string, unknown>;
+  if (kind === "1D") { out.result = null; out.resS = null; }
+  return { data: out, applied };
 }

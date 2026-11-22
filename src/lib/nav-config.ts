@@ -1,10 +1,9 @@
 import {
   LayoutDashboard, FolderKanban, Users2, UserCog, Settings, Ruler, BookOpen,
-  List, CalendarRange, FileText, Boxes, PieChart, BarChart3, Recycle, FolderOpen, Truck, Layers, BadgeDollarSign, BookMarked,
+  List, CalendarRange, FileText, Boxes, PieChart, BarChart3, Recycle, FolderOpen, Truck,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { Role } from "@prisma/client";
-import { can, type PermissionKey } from "@/server/rbac/permissions";
 
 export interface NavChild {
   key: string;
@@ -12,7 +11,6 @@ export interface NavChild {
   icon: LucideIcon;
   href?: string;
   soon?: boolean; // shown greyed-out until its screen exists
-  permission?: PermissionKey; // hidden for roles without it
 }
 
 export interface NavItem {
@@ -25,10 +23,9 @@ export interface NavItem {
 }
 
 export const NAV_ITEMS: NavItem[] = [
-  { label: "Start", href: "/start", icon: LayoutDashboard, hidden: true }, // landing screen; kept out of the sidebar (the logo links to it)
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard, hidden: true },
   {
-    label: "Projects", href: "/projects", icon: FolderKanban,
+    label: "Projects", href: "/projects", icon: FolderKanban, roles: ["ADMIN"],
     children: [
       { key: "list", label: "Projects List", icon: List, href: "/projects" },
       { key: "planning", label: "Planning", icon: CalendarRange, href: "/planning" },
@@ -37,19 +34,12 @@ export const NAV_ITEMS: NavItem[] = [
       { key: "cost", label: "Cost & Summary", icon: PieChart, soon: true },
       { key: "documents", label: "Documents", icon: FolderOpen, href: "/documents" },
       { key: "reports", label: "Reports", icon: BarChart3, href: "/reports" },
-      { key: "scrap", label: "Scrap Management", icon: Recycle, href: "/takeoff/scrap-management" },
+      { key: "scrap", label: "Scrap Management", icon: Recycle, soon: true },
     ],
   },
   { label: "Clients", href: "/customers", icon: Users2, hidden: true },
   // { label: "Documents", href: "/documents", icon: FileText },
-  {
-    label: "Nesting & Costing", href: "/takeoff", icon: Ruler,
-    children: [
-      { key: "takeoff", label: "Part List & Nesting", icon: Layers, href: "/takeoff" },
-      { key: "pricing", label: "Pricing", icon: BadgeDollarSign, href: "/takeoff/pricing", permission: "pricing.view" },
-      { key: "rates", label: "Rate Library", icon: BookMarked, href: "/takeoff/rate-library", permission: "pricing.view" },
-    ],
-  },
+  { label: "Nesting & Costing", href: "/takeoff", icon: Ruler },
   { label: "Procurement & Stock", href: "/procurement", icon: Truck },
   // { label: "Reports", href: "/reports", icon: BarChart3 },
   { label: "Users", href: "/users", icon: UserCog, roles: ["ADMIN"], hidden: true },
@@ -66,7 +56,5 @@ export const NAV_ITEMS: NavItem[] = [
 ];
 
 export function visibleNavItems(role: Role | undefined) {
-  return NAV_ITEMS.filter((item) => !item.hidden)
-    .filter((item) => !item.roles || (role && item.roles.includes(role)))
-    .map((item) => (item.children ? { ...item, children: item.children.filter((c) => !c.permission || can(role, c.permission)) } : item));
+  return NAV_ITEMS.filter((item) => !item.hidden).filter((item) => !item.roles || (role && item.roles.includes(role)));
 }

@@ -38,36 +38,25 @@ export const nestingRunConfigSchema = z.object({
 });
 export type NestingRunConfigInput = z.infer<typeof nestingRunConfigSchema>;
 
-// Scrap Management: per-source inputs entered by the user (everything else comes from the nesting run).
-const money = z.number().min(0, "Price cannot be negative").max(1_000_000);
-export const scrapRowInputsSchema = z.object({
-  costPerKg: money,
-  usedLaterPct: z.number().min(0).max(1, "Used-later % must be between 0 and 100"),
-  usedLaterPriceLEPerKg: money,
-  scrapSellPriceLEPerKg: money,
+// Scrap & Material pricing inputs (PROJECT.md — Scrap & Material Calculation
+// spec). These are the ONLY values a user may enter manually; everything
+// else is derived from the Nesting Engine's actual results.
+const scrapPricingGroupOverrideSchema = z.object({
+  costPerKg: z.number().min(0, "Cost per kg cannot be negative").optional(),
+  usedLaterPct: z.number().min(0).max(1, "Used-later % must be between 0 and 1").optional(),
+  usedLaterPriceLEPerKg: z.number().min(0, "Price cannot be negative").optional(),
+  scrapSellPriceLEPerKg: z.number().min(0, "Price cannot be negative").optional(),
 });
-const nonNeg = z.number().min(0).max(1e9);
-export const scrapManagementExportSchema = z.object({
-  projectId: z.string().min(1),
-  rows: z
-    .array(
-      scrapRowInputsSchema.extend({
-        key: z.string().min(1).max(200),
-        label: z.string().max(300),
-        material: z.string().max(100),
-        thicknessMm: nonNeg,
-        widthMm: nonNeg,
-        lengthMm: nonNeg,
-        usedAreaSqm: nonNeg,
-        usedWeightKg: nonNeg,
-        buyQty: nonNeg,
-        buyAreaSqm: nonNeg,
-        buyWeightKg: nonNeg,
-      }),
-    )
-    .min(1)
-    .max(500),
+
+export const scrapPricingInputsSchema = z.object({
+  nestingRunId: z.string().min(1),
+  costPerKg: z.number().min(0, "Cost per kg cannot be negative"),
+  usedLaterPct: z.number().min(0).max(1, "Used-later % must be between 0 and 1"),
+  usedLaterPriceLEPerKg: z.number().min(0, "Price cannot be negative"),
+  scrapSellPriceLEPerKg: z.number().min(0, "Price cannot be negative"),
+  overridesByGroupKey: z.record(z.string(), scrapPricingGroupOverrideSchema).optional(),
 });
+export type ScrapPricingInputs = z.infer<typeof scrapPricingInputsSchema>;
 
 // ----------------------------------------------------------------------------
 // Phase 2C — Assisted Nesting save payload. The client already validates

@@ -2,7 +2,6 @@
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { visibleNavItems } from "@/lib/nav-config";
 import { NavList } from "./nav-list";
-import { ProjectPicker } from "./active-project";
 import { SidebarBackdrop } from "./sidebar-backdrop";
 import type { Role } from "@prisma/client";
 
@@ -19,7 +18,6 @@ export function MobileNav({ role, open, onOpenChange }: { role: Role; open: bool
           <img src="/logo-icon.png" alt="SteelFlow" className="h-8 w-8 shrink-0 object-contain" />
           <p className="text-sm font-semibold text-white">SteelFlow</p>
         </div>
-        <div className="relative"><ProjectPicker /></div>
         <nav className="relative space-y-1 p-3">
           <NavList items={items} onNavigate={() => onOpenChange(false)} />
         </nav>

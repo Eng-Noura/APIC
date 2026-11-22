@@ -98,3 +98,50 @@ describe("applyQuantityChanges", () => {
     expect(applyQuantityChanges(null, [{ nestPartId: 1, qty: 1 }]).applied).toEqual([]);
   });
 });
+
+describe("applyQuantityChanges — 1D nest", () => {
+  const snap1d = {
+    v: 1,
+    pieces: [
+      { id: 1, sn: 1, name: "A", profile: "IPE200", material: "S235", length: 3000, qty: 4 },
+      { id: 2, sn: 2, name: "B", profile: "IPE200", material: "S235", length: 1000, qty: 2 },
+      // a segment of a part that is longer than every bar: never a part of its own
+      { id: 1, sn: 3, name: "A", profile: "IPE200", material: "S235", length: 6000, qty: 1, segment: { index: 1, total: 2, parentId: 1, parentLength: 12000 } },
+    ],
+    sources: [{ id: 100001, qty: 5 }],
+    result: { bars: [1, 2, 3] },
+    resS: { kerf: 3 },
+  };
+
+  it("writes the quantity into pieces[] and leaves everything else as it is", () => {
+    const r = applyQuantityChanges(snap1d, [{ nestPartId: 1, qty: 6 }], "1D");
+    const d = r.data as typeof snap1d;
+    expect(r.applied).toEqual([1]);
+    expect(d.pieces[0].qty).toBe(6);
+    expect(d.pieces[1].qty).toBe(2);
+    expect(d.sources).toEqual(snap1d.sources);
+    expect(snap1d.pieces[0].qty).toBe(4); // input not mutated
+  });
+
+  it("never touches a segment, even when its id matches", () => {
+    const r = applyQuantityChanges(snap1d, [{ nestPartId: 1, qty: 6 }], "1D");
+    expect((r.data as typeof snap1d).pieces[2].qty).toBe(1);
+  });
+
+  it("drops the saved cutting result (it no longer matches the quantities)", () => {
+    const d = applyQuantityChanges(snap1d, [{ nestPartId: 2, qty: 9 }], "1D").data as { result: unknown; resS: unknown };
+    expect(d.result).toBeNull();
+    expect(d.resS).toBeNull();
+  });
+
+  it("keeps the result when nothing was written", () => {
+    const r = applyQuantityChanges(snap1d, [{ nestPartId: 99, qty: 1 }], "1D");
+    expect(r.applied).toEqual([]);
+    expect(r.data).toBe(snap1d);
+  });
+
+  it("a 1D change does not look at groups[] and a 2D change does not look at pieces[]", () => {
+    expect(applyQuantityChanges(snap1d, [{ nestPartId: 1, qty: 6 }]).applied).toEqual([]);
+    expect(applyQuantityChanges({ groups: [{ id: 1, qty: 1 }] }, [{ nestPartId: 1, qty: 6 }], "1D").applied).toEqual([]);
+  });
+});
