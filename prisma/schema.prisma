@@ -97,6 +97,11 @@ model User {
   quotations         Quotation[]      @relation("QuotationCreatedBy")
   quotationEvents    QuotationEvent[] @relation("QuotationEventBy")
 
+  rateProfiles RateProfile[] @relation("RateProfileCreatedBy")
+  pricingSheets PricingSheet[] @relation("PricingSheetCreatedBy")
+  pricingSnapshots PricingSnapshot[] @relation("PricingSnapshotCreatedBy")
+
+
   @@map("users")
 }
 
@@ -166,6 +171,12 @@ model Project {
   // Quotation, MaterialUsage, ScrapEntry, CostSummary will each declare
   // `projectId` and relate back here. No change to Project is required.
   // ---------------------------------------------------------------------
+
+  workOrderGroups WorkOrderGroup[]
+  rateProfiles RateProfile[]
+  pricingSheets PricingSheet[]
+  estimate ProjectEstimate?
+
 
   @@map("projects")
 }
@@ -292,6 +303,15 @@ model TakeoffPart {
   @@index([groupId])
   @@index([nestKind, nestPartId])
   @@map("takeoff_parts")
+
+  scopeId String?
+  scope   ScopeItem? @relation(fields: [scopeId], references: [id], onDelete: SetNull)
+
+  workOrderGroupId String?
+  workOrderGroup   WorkOrderGroup? @relation(fields: [workOrderGroupId], references: [id], onDelete: SetNull)
+
+  @@index([scopeId])
+  @@index([workOrderGroupId])
 }
 
 // BOQ assemblies. Drawing -> Assembly (PartGroup) -> Part. Groups can nest (a hatch inside a wall):
@@ -747,6 +767,11 @@ model ScopeItem {
   createdById String
   createdBy   User   @relation("ScopeItemCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
 
+  parts TakeoffPart[]
+  pricingItems PricingItem[]
+  estimateItems EstimateItem[]
+
+
   @@map("scope_items")
 }
 
@@ -1189,6 +1214,9 @@ model Quotation {
   items  QuotationItem[]
   events QuotationEvent[]
 
+  estimateOffer EstimateOffer?
+
+
   @@unique([projectId, number, revision])
   @@index([projectId, issueDate])
   @@map("quotations")
@@ -1427,4 +1455,551 @@ model WorkOrderPiece {
 
   @@unique([workOrderId, seq])
   @@map("work_order_pieces")
+}
+
+
+// ----------------------------------------------------------------------------
+// Work order groups (parts grouped by work order) — migration 20260909090000
+// ----------------------------------------------------------------------------
+model WorkOrderGroup {
+  id        String    @id @default(cuid())
+  code      String
+  name      String
+  dueDate   DateTime?
+  remark    String?
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  parts TakeoffPart[]
+
+  @@unique([projectId, code])
+  @@index([projectId, sortOrder])
+  @@map("work_order_groups")
+}
+
+// ----------------------------------------------------------------------------
+// BOQ Pricing module — migration 20260910090000
+// ----------------------------------------------------------------------------
+enum RateProfileType {
+  MATERIAL
+  FABRICATION
+  INSTALLATION
+  SUBCONTRACTOR
+  TRANSPORT
+  INDIRECT
+  PROFIT
+  ADD_ON
+  TAX_INSURANCE
+}
+
+enum RateScope {
+  GLOBAL
+  PROJECT
+}
+
+enum PricingSheetStatus {
+  DRAFT
+  CALCULATED
+  APPROVED
+  SUPERSEDED
+}
+
+enum PricingMaterialSource {
+  NESTING
+  STOCK
+  PROCUREMENT
+  MANUAL
+}
+
+model RateProfile {
+  id          String          @id @default(cuid())
+  type        RateProfileType
+  name        String
+  description String?
+  scope       RateScope       @default(GLOBAL)
+  active      Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("RateProfileCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  components RateComponent[]
+
+  @@index([scope, type])
+  @@index([projectId, type])
+  @@map("rate_profiles")
+}
+
+model RateComponent {
+  id        String   @id @default(cuid())
+  key       String
+  name      String
+  category  String
+  method    String
+  rate      Float
+  fixed     Float?
+  unit      String?
+  base      String?
+  enabled   Boolean  @default(true)
+  sortOrder Int      @default(0)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  profileId String
+  profile   RateProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, key])
+  @@index([profileId, sortOrder])
+  @@map("rate_components")
+}
+
+model PricingSheet {
+  id           String             @id @default(cuid())
+  reference    String
+  version      Int                @default(1)
+  date         DateTime
+  status       PricingSheetStatus @default(DRAFT)
+  currency     String             @default("EGP")
+  calcProfile  String             @default("STANDARD")
+  notes        String?
+  basedOnId    String?
+  approvedById String?
+  approvedAt   DateTime?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("PricingSheetCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  items     PricingItem[]
+  snapshots PricingSnapshot[]
+  history   PricingHistory[]
+
+  @@unique([projectId, reference, version])
+  @@index([projectId, status])
+  @@map("pricing_sheets")
+}
+
+model PricingItem {
+  id           String   @id @default(cuid())
+  itemNo       String
+  description  String
+  unit         String
+  qty          Float
+  unitWeightKg Float?
+  scopeType    String   @default("")
+  calcProfile  String?
+  profileRefs  Json?
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sheetId String
+  sheet   PricingSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+
+  scopeItemId String?
+  scopeItem   ScopeItem? @relation(fields: [scopeItemId], references: [id], onDelete: SetNull)
+
+  materials  PricingMaterialLine[]
+  components PricingItemComponent[]
+  overrides  PricingItemOverride[]
+
+  @@unique([sheetId, scopeItemId])
+  @@index([sheetId, sortOrder])
+  @@map("pricing_items")
+}
+
+model PricingMaterialLine {
+  id          String                @id @default(cuid())
+  source      PricingMaterialSource @default(MANUAL)
+  name        String
+  grade       String?
+  qty         Float
+  unit        String
+  unitCost    Float
+  notes       String?
+  importedRef String?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  itemId String
+  item   PricingItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, importedRef])
+  @@index([itemId])
+  @@map("pricing_material_lines")
+}
+
+model PricingItemComponent {
+  id        String   @id @default(cuid())
+  category  String
+  name      String
+  method    String
+  rate      Float
+  fixed     Float?
+  unit      String?
+  base      String?
+  enabled   Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  itemId String
+  item   PricingItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId, sortOrder])
+  @@map("pricing_item_components")
+}
+
+model PricingItemOverride {
+  id        String   @id @default(cuid())
+  rateKey   String
+  value     Float
+  reason    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  itemId String
+  item   PricingItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, rateKey])
+  @@map("pricing_item_overrides")
+}
+
+// Immutable (a DB trigger rejects UPDATE).
+model PricingSnapshot {
+  id             String   @id @default(cuid())
+  kind           String
+  sheetVersion   Int
+  engineVersion  String
+  roundingPolicy Json
+  ratesUsed      Json
+  inputs         Json
+  totals         Json
+  createdAt      DateTime @default(now())
+
+  sheetId String
+  sheet   PricingSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+
+  createdById String
+  createdBy   User   @relation("PricingSnapshotCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  items PricingSnapshotItem[]
+
+  @@index([sheetId, kind, createdAt])
+  @@map("pricing_snapshots")
+}
+
+// Immutable (a DB trigger rejects UPDATE).
+model PricingSnapshotItem {
+  id            String  @id @default(cuid())
+  pricingItemId String?
+  scopeItemId   String?
+  itemNo        String
+  description   String
+  unit          String
+  qty           Float
+  unitRate      Float
+  salePrice     Float
+  totalCost     Float
+  profit        Float
+  profitPct     Float
+  data          Json
+
+  snapshotId String
+  snapshot   PricingSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@index([snapshotId])
+  @@index([scopeItemId])
+  @@map("pricing_snapshot_items")
+}
+
+model PricingHistory {
+  id        String   @id @default(cuid())
+  action    String
+  message   String
+  data      Json?
+  userId    String?
+  createdAt DateTime @default(now())
+
+  sheetId String
+  sheet   PricingSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+
+  @@index([sheetId, createdAt])
+  @@map("pricing_history")
+}
+
+// ----------------------------------------------------------------------------
+// Pricing & Estimation — migrations 20260911090000 and 20260912090000
+// ----------------------------------------------------------------------------
+model ProjectEstimate {
+  id                   String    @id @default(cuid())
+  currency             String    @default("EGP")
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  materialDone         Boolean   @default(false)
+  manufacturingDone    Boolean   @default(false)
+  projectCostDone      Boolean   @default(false)
+  scrapUsedLaterPct    Float     @default(0)
+  scrapUsedLaterPrice  Float     @default(0)
+  scrapSellPrice       Float     @default(15)
+  creditRecoveredScrap Boolean   @default(false)
+  profitMode           String    @default("MARKUP_ON_COST")
+  profitValue          Float     @default(0)
+  insuranceMode        String    @default("FIXED")
+  insuranceValue       Float     @default(0)
+  taxPct               Float     @default(14)
+  paymentTerms         String?
+  offerValidityDays    Int       @default(30)
+  deliveryDays         Int?
+  exclusions           String?
+  commercialNotes      String?
+  createdById          String
+  updatedById          String?
+
+  // v2
+  discountMode        String    @default("NONE")
+  discountValue       Float     @default(0)
+  discountTiming      String    @default("BEFORE_TAX")
+  otherChargesLabel   String?
+  otherChargesValue   Float     @default(0)
+  otherChargesTaxable Boolean   @default(true)
+  targetSalePrice     Float?
+  advancePct          Float?
+  milestones          String?
+  warrantyMonths      Int?
+  allocationBasis     String    @default("WEIGHT")
+  sheetNumber         String?
+  version             Int       @default(1)
+  status              String    @default("DRAFT")
+  calculatedAt        DateTime?
+  approvedAt          DateTime?
+  approvedById        String?
+
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  materials    EstimateMaterial[]
+  items        EstimateItem[]
+  subcontracts EstimateSubcontract[]
+  projectCosts EstimateProjectCost[]
+  offers       EstimateOffer[]
+  snapshots    EstimateSnapshot[]
+  audit        EstimateAuditEntry[]
+
+  @@map("project_estimates")
+}
+
+model EstimateMaterial {
+  id                   String   @id @default(cuid())
+  source               String
+  sourceRef            String?
+  name                 String
+  grade                String?
+  thicknessMm          Float?
+  sortOrder            Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  requiredKg           Float?
+  purchasedKg          Float
+  unitPrice            Float    @default(0)
+  sourceRequiredKg     Float?
+  sourcePurchasedKg    Float?
+  suggestedUnitPrice   Float?
+  suggestedPriceSource String?
+  sourceMissing        Boolean  @default(false)
+
+  // v2
+  materialType String?
+  dimensions   String?
+  unit         String   @default("KG")
+  netKg        Float?
+  priceSource  String   @default("MANUAL")
+  priceOptions Json?
+  notes        String?
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  itemId String?
+  item   EstimateItem? @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([estimateId, sourceRef])
+  @@index([estimateId, sortOrder])
+  @@index([itemId])
+  @@map("estimate_materials")
+}
+
+model EstimateItem {
+  id             String   @id @default(cuid())
+  name           String
+  manualWeightKg Float?
+  manualPieces   Int?
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+  notes          String?
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  scopeItemId String?
+  scopeItem   ScopeItem? @relation(fields: [scopeItemId], references: [id], onDelete: SetNull)
+
+  operations   EstimateOperation[]
+  materials    EstimateMaterial[]
+  subcontracts EstimateSubcontract[]
+  projectCosts EstimateProjectCost[]
+
+  @@unique([estimateId, scopeItemId])
+  @@index([estimateId, sortOrder])
+  @@map("estimate_items")
+}
+
+model EstimateOperation {
+  id          String   @id @default(cuid())
+  name        String
+  costType    String
+  unit        String   @default("")
+  rate        Float    @default(0)
+  quantity    Float?
+  percentBase String?
+  selected    Boolean  @default(false)
+  source      String   @default("DEFAULT")
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  description String?
+  notes       String?
+
+  itemId String
+  item   EstimateItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId, sortOrder])
+  @@map("estimate_operations")
+}
+
+model EstimateSubcontract {
+  id          String   @id @default(cuid())
+  name        String
+  company     String?
+  unit        String   @default("lot")
+  quantity    Float    @default(1)
+  unitPrice   Float    @default(0)
+  notes       String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  description String?
+  costType    String   @default("PER_UNIT")
+  percentBase String?
+  selected    Boolean  @default(true)
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  itemId String?
+  item   EstimateItem? @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, sortOrder])
+  @@index([itemId])
+  @@map("estimate_subcontracts")
+}
+
+model EstimateProjectCost {
+  id          String   @id @default(cuid())
+  name        String
+  method      String
+  unit        String   @default("")
+  quantity    Float?
+  rate        Float    @default(0)
+  percentBase String?
+  enabled     Boolean  @default(true)
+  source      String   @default("DEFAULT")
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  category    String   @default("")
+  notes       String?
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  itemId String?
+  item   EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
+
+  @@index([estimateId, sortOrder])
+  @@map("estimate_project_costs")
+}
+
+model EstimateOffer {
+  id          String   @id @default(cuid())
+  snapshot    Json
+  finalPrice  Float
+  createdById String
+  createdAt   DateTime @default(now())
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  quotationId String    @unique
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, createdAt])
+  @@map("estimate_offers")
+}
+
+model EstimateSnapshot {
+  id          String   @id @default(cuid())
+  version     Int
+  kind        String
+  inputs      Json
+  result      Json
+  costTotal   Decimal  @db.Decimal(18, 2)
+  finalPrice  Decimal  @db.Decimal(18, 2)
+  note        String?
+  createdById String
+  createdAt   DateTime @default(now())
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, version, createdAt])
+  @@map("estimate_snapshots")
+}
+
+model EstimateAuditEntry {
+  id        String   @id @default(cuid())
+  action    String
+  summary   String
+  changes   Json?
+  version   Int      @default(1)
+  userId    String
+  createdAt DateTime @default(now())
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, createdAt])
+  @@map("estimate_audit")
+}
+
+model EstimateTemplate {
+  id          String   @id @default(cuid())
+  kind        String
+  name        String
+  data        Json
+  createdById String
+  createdAt   DateTime @default(now())
+
+  @@unique([kind, name])
+  @@map("estimate_templates")
 }
