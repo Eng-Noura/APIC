@@ -48,7 +48,7 @@ function geometrySummary(part: TakeoffPartRow): string {
 }
 
 export function PartsGrid({
-  drawingId, projectId, parts, canCreate, canDelete, onChanged,
+  drawingId, projectId, parts, canCreate, canDelete, onChanged, accessoriesDefault = false,
 }: {
   drawingId: string;
   projectId: string;
@@ -56,6 +56,8 @@ export function PartsGrid({
   canCreate: boolean;
   canDelete: boolean;
   onChanged: () => void;
+  /** This drawing is the Accessories section (CSV rows default to Accessory). */
+  accessoriesDefault?: boolean;
 }) {
   const [formOpen, setFormOpen] = React.useState(false);
   const [importOpen, setImportOpen] = React.useState(false);
@@ -366,7 +368,7 @@ export function PartsGrid({
             <Button size="sm" variant="ghost" onClick={() => setImportOpen(true)} title="Import DXF files — a sheet with several labelled parts is split into items">
               <FileUp className="h-3.5 w-3.5" /> Import DXF
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => setCsvOpen(true)} title="Import hot-rolled sections and pipes from a CSV file">
+            <Button size="sm" variant="ghost" onClick={() => setCsvOpen(true)} title="Import hot-rolled sections, pipes and accessories (bolts, nuts, washers) from a CSV file">
               <FileSpreadsheet className="h-3.5 w-3.5" /> Import CSV
             </Button>
           </div>
@@ -408,7 +410,7 @@ export function PartsGrid({
       )}
 
       {canCreate && (
-        <CsvImportDialog open={csvOpen} onOpenChange={setCsvOpen} drawingId={drawingId} nextItemNo={nextItemNo} onImported={onChanged} />
+        <CsvImportDialog open={csvOpen} onOpenChange={setCsvOpen} drawingId={drawingId} nextItemNo={nextItemNo} onImported={onChanged} accessoriesDefault={accessoriesDefault} />
       )}
 
       {canCreate && (

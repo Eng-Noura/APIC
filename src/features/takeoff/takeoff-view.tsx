@@ -13,6 +13,7 @@ import { PartsGrid } from "./parts-grid";
 import { BoqPanel } from "./boq-panel";
 import { sideAreas } from "./side-areas";
 import { autoImportNestParts, autoImportNestPieces } from "./nest-auto-import";
+import { ACCESSORIES_DRAWING, ACCESSORIES_DRAWING_TITLE } from "./parts-csv";
 import { useTakeoffProject } from "./project-context";
 import type { TakeoffDrawingRow, TakeoffPartRow, PartType, PartSide } from "./types";
 import { toast } from "sonner";
@@ -154,6 +155,21 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
 
   const selectedProject = projects.find((p) => p.id === projectId);
 
+  const [addingAcc, setAddingAcc] = React.useState(false);
+  // Creates the ACCESSORIES section (bolts, nuts, washers...), the same kind of section as NESTING / NESTING-1D.
+  async function addAccessoriesSection() {
+    if (!projectId) return;
+    setAddingAcc(true);
+    const res = await fetch("/api/takeoff/drawings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId, drawingNumber: ACCESSORIES_DRAWING, title: ACCESSORIES_DRAWING_TITLE, weightFromDwg: null }),
+    }).catch(() => null);
+    setAddingAcc(false);
+    if (!res?.ok) { toast.error("Could not create the Accessories section"); return; }
+    toast.success("Accessories section added: use Import CSV or Add Item inside it");
+    loadDrawings(projectId);
+  }
+
   const [syncing, setSyncing] = React.useState(false);
   // Pulls quantity changes made in the 2D nest into the BOQ; everything that needs a decision is listed, not guessed.
   async function syncWithNest() {
@@ -231,6 +247,16 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
           >
             <PackagePlus className="h-4 w-4" /> Take parts from 1D Nesting
           </Button>
+          {!drawings.some((d) => d.drawingNumber === ACCESSORIES_DRAWING) && (
+            <Button
+              variant="outline"
+              onClick={addAccessoriesSection}
+              disabled={!projectId || addingAcc}
+              title="Create the ACCESSORIES section for bolts, nuts, washers and other bought-out items (like NESTING and NESTING-1D)"
+            >
+              <Plus className="h-4 w-4" /> Add Accessories section
+            </Button>
+          )}
           <Button onClick={() => setDrawingFormOpen(true)} disabled={!projectId}>
             <Plus className="h-4 w-4" /> Add Drawing
           </Button>
@@ -357,6 +383,7 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
                   canCreate={canCreate}
                   canDelete={canDelete}
                   onChanged={() => loadDrawings(projectId)}
+                  accessoriesDefault={drawing.drawingNumber === ACCESSORIES_DRAWING}
                 />
               </div>
             );
