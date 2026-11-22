@@ -46,14 +46,6 @@ export const PERMISSIONS = {
   "steelPricing.view": ["ADMIN"],
   "steelPricing.export": ["ADMIN"],
 
-  // Pricing & Estimation (four-stage workflow, BOQ pricing sheets, rate library). Prices and margins are
-  // sensitive, so viewing / editing is for managers and admins; approving a sheet and managing the
-  // rate library is admin-only.
-  "pricing.view": ["ADMIN", "MANAGER"],
-  "pricing.edit": ["ADMIN", "MANAGER"],
-  "pricing.approve": ["ADMIN"],
-  "rateLibrary.manage": ["ADMIN"],
-
   // Planning & follow-up (Primavera-style schedule). Anyone can view; editing the
   // schedule / recording progress follows the project-edit tiers; deleting a whole
   // schedule is limited to managers and admins.

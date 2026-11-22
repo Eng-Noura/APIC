@@ -13,6 +13,13 @@ export async function handle(fn: () => Promise<Response>): Promise<Response> {
 }
 
 /** Reads a JSON request body; a missing or malformed body is a 400, not a crash. */
+/** Like readJson, but an empty body is {} (for routes whose body is optional). */
+export async function readOptionalJson(req: Request): Promise<unknown> {
+  const raw = await req.text();
+  if (!raw.trim()) return {};
+  try { return JSON.parse(raw); } catch { throw new EstimationError("Invalid JSON body", 400); }
+}
+
 export async function readJson(req: Request): Promise<unknown> {
   try { return await req.json(); } catch { throw new EstimationError("Invalid JSON body", 400); }
 }

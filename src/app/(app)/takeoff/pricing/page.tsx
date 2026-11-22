@@ -7,5 +7,5 @@ import { ActiveProjectEstimation } from "@/features/estimation/ui/active-project
 export default async function PricingPage() {
   const role = (await auth())?.user.role;
   if (!can(role, "pricing.view")) redirect("/takeoff");
-  return <ActiveProjectEstimation canEdit={can(role, "pricing.edit")} canOffer={can(role, "pricing.edit") && can(role, "quotations.edit")} />;
+  return <ActiveProjectEstimation canEdit={can(role, "pricing.edit")} canOffer={can(role, "pricing.edit") && can(role, "quotations.edit")} canApprove={can(role, "pricing.approve")} canManageTemplates={can(role, "pricing.edit")} />;
 }

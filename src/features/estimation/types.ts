@@ -1,4 +1,4 @@
-import type { AllocationBasis, CalcIssue, CommercialResult, CostType, DiscountMode, DiscountTiming, InsuranceMode, ItemSummary, OpPercentBase, PriceSource, ProfitMode, ProjectMethod, ProjectPercentBase, SubCostType, SubPercentBase } from "./calc";
+import type { AllocationBasis, CalcIssue, CommercialResult, CostType, DiscountMode, DiscountTiming, EstimateInputs, EstimateResult, InsuranceMode, ItemSummary, OpPercentBase, PriceSource, ProfitMode, ProjectMethod, ProjectPercentBase, SubCostType, SubPercentBase } from "./calc";
 import type { PriceOptions, SheetStatus } from "./workflow";
 
 export interface EstMaterial { id: string; source: "NESTING" | "PART_LIST" | "PROCUREMENT" | "MANUAL"; name: string; grade: string | null; thicknessMm: number | null; requiredKg: number | null; purchasedKg: number; unitPrice: number; sourceRequiredKg: number | null; sourcePurchasedKg: number | null; suggestedUnitPrice: number | null; sourceMissing: boolean;
@@ -17,7 +17,7 @@ export interface EstSettings {
   discountMode?: DiscountMode; discountValue?: number; discountTiming?: DiscountTiming; otherChargesLabel?: string | null; otherChargesValue?: number; otherChargesTaxable?: boolean;
   targetSalePrice?: number | null; advancePct?: number | null; milestones?: string | null; warrantyMonths?: number | null; allocationBasis?: AllocationBasis;
 }
-export interface EstOffer { id: string; quotationId: string; number: string; revision: number; status: string; finalPrice: number; createdAt: string }
+export interface EstOffer { id: string; quotationId: string; number: string; revision: number; status: string; finalPrice: number; createdAt: string; /** the approved snapshot version it was built from, and its layout (null on older offers) */ snapshotVersion: number | null; layout: string | null }
 
 /** What the server returns (and what the page edits). `totals` is the server's own recalculation. */
 export interface EstimateDoc {
@@ -36,3 +36,5 @@ export interface EstimateDoc {
 
 export interface EstVersionRow { id: string; version: number; kind: "CALCULATED" | "APPROVED"; costTotal: number; finalPrice: number; note: string | null; createdAt: string; createdById: string; verified: boolean }
 export interface EstAuditRow { id: string; action: string; summary: string; changes: unknown; version: number; userId: string; createdAt: string }
+/** One stored snapshot in full: the exact inputs and the result that was calculated from them. */
+export interface EstSnapshotFull extends EstVersionRow { inputs: EstimateInputs; result: EstimateResult }

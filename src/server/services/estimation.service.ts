@@ -9,7 +9,6 @@ import { prisma } from "@/server/db/client";
 import { logActivity } from "./activity-log.service";
 import { getMaterialRequirements } from "./material-usage.service";
 import { ensureNestInSync } from "./nest-sync-guard";
-import { nextNumber } from "./quotations.service";
 import { can } from "@/server/rbac/permissions";
 import {
   calcEstimate, fromCents, toCents,
@@ -21,7 +20,7 @@ import {
 } from "@/features/estimation/workflow";
 import { DEFAULT_OPERATIONS, DEFAULT_PROJECT_COSTS } from "@/features/estimation/defaults";
 import type { SaveEstimateInput } from "@/server/validators/estimation";
-import type { EstAuditRow, EstimateDoc, EstVersionRow } from "@/features/estimation/types";
+import type { EstAuditRow, EstimateDoc, EstSnapshotFull, EstVersionRow } from "@/features/estimation/types";
 
 export class EstimationError extends Error {
   constructor(message: string, public status = 400) { super(message); }
@@ -319,7 +318,7 @@ async function loadDoc(projectId: string): Promise<EstimateDoc> {
     })),
     subcontracts: e.subcontracts.map((s) => ({ id: s.id, name: s.name, company: s.company, unit: s.unit, quantity: s.quantity, unitPrice: s.unitPrice, notes: s.notes, description: s.description, costType: s.costType as SubCostType, percentBase: s.percentBase as SubPercentBase | null, selected: s.selected, itemId: s.itemId })),
     projectCosts: e.projectCosts.map((c) => ({ id: c.id, name: c.name, method: c.method as never, unit: c.unit, quantity: c.quantity, rate: c.rate, percentBase: c.percentBase as never, enabled: c.enabled, source: c.source as never, category: c.category, notes: c.notes, itemId: c.itemId })),
-    offers: e.offers.map((o) => ({ id: o.id, quotationId: o.quotation.id, number: o.quotation.number, revision: o.quotation.revision, status: o.quotation.status, finalPrice: o.finalPrice, createdAt: o.createdAt.toISOString() })),
+    offers: e.offers.map((o) => ({ id: o.id, quotationId: o.quotation.id, number: o.quotation.number, revision: o.quotation.revision, status: o.quotation.status, finalPrice: o.finalPrice, createdAt: o.createdAt.toISOString(), snapshotVersion: o.snapshotVersion, layout: o.layout })),
     totals: { ...result.totals, ...result.commercial },
   };
 }
@@ -635,6 +634,15 @@ export async function listVersions(projectId: string): Promise<EstVersionRow[]> 
   return rows.map(versionRow);
 }
 
+/** One stored snapshot in full (inputs + result): "what exactly was calculated / approved". Only if it belongs to THIS project's sheet. */
+export async function getSnapshot(projectId: string, snapshotId: string): Promise<EstSnapshotFull> {
+  const e = await prisma.projectEstimate.findUnique({ where: { projectId }, select: { id: true } });
+  if (!e) throw new EstimationError("Estimate not found", 404);
+  const s = await prisma.estimateSnapshot.findFirst({ where: { id: snapshotId, estimateId: e.id } });
+  if (!s) throw new EstimationError("This version does not belong to this project's estimate", 404);
+  return { ...versionRow(s), inputs: s.inputs as unknown as EstimateInputs, result: s.result as unknown as EstimateResult };
+}
+
 export async function compareVersions(projectId: string, fromId: string, toId: string) {
   const e = await prisma.projectEstimate.findUnique({ where: { projectId }, select: { id: true } });
   if (!e) throw new EstimationError("Estimate not found", 404);
@@ -653,50 +661,5 @@ export async function listAudit(projectId: string, take = 100): Promise<EstAudit
 export type { SheetAction };
 
 // ---------------------------------------------------------------- offer
-
-const addDays = (d: Date, n: number) => new Date(d.getTime() + n * 86_400_000);
-
-/**
- * Turns the saved estimate into a DRAFT quotation. The first offer gets a new quotation number; every later one is the
- * next revision of that number, so earlier revisions — approved ones included — are never overwritten or reset.
- */
-export async function createOffer(projectId: string, user: { id: string; name: string }) {
-  const doc = await loadDoc(projectId);
-  if (doc.totals.estimatedCostCents <= 0) throw new EstimationError("There is no cost to price yet. Complete the earlier stages first.", 422);
-  if (doc.totals.issue) throw new EstimationError(doc.totals.issue, 422);
-  const bad = [...doc.projectCosts.filter((c) => c.enabled && c.method === "PERCENTAGE" && !c.percentBase)];
-  if (bad.length) throw new EstimationError(`Choose what the percentage applies to for "${bad[0].name}".`, 422);
-
-  const estimate = await prisma.projectEstimate.findUniqueOrThrow({ where: { projectId }, select: { id: true } });
-  const last = await prisma.estimateOffer.findFirst({ where: { estimateId: estimate.id }, orderBy: { createdAt: "desc" }, include: { quotation: { select: { number: true } } } });
-  const today = new Date();
-  const s = doc.settings;
-  const terms = [s.paymentTerms ? `Payment terms: ${s.paymentTerms}` : null, s.deliveryDays != null ? `Delivery period: ${s.deliveryDays} days` : null, s.exclusions ? `Exclusions: ${s.exclusions}` : null].filter(Boolean).join("\n");
-  const profitPct = doc.totals.costCents > 0 ? Math.round((doc.totals.profitCents / doc.totals.costCents) * 10000) / 100 : null;
-
-  const created = await prisma.$transaction(async (tx) => {
-    let number: string; let revision = 0;
-    if (last) {
-      number = last.quotation.number;
-      const top = await tx.quotation.findFirst({ where: { projectId, number }, orderBy: { revision: "desc" }, select: { revision: true } });
-      revision = (top?.revision ?? -1) + 1;
-    } else number = await nextNumber(projectId, today.getFullYear());
-    const q = await tx.quotation.create({
-      data: {
-        projectId, number, revision, description: `${doc.project.name} — commercial offer`, status: "DRAFT", currency: doc.currency,
-        issueDate: today, validUntil: addDays(today, s.offerValidityDays), profitMargin: profitPct, preparedBy: user.name,
-        terms: terms || null, notes: s.commercialNotes || null, createdById: user.id,
-        items: { create: [{ sortOrder: 0, description: `${doc.project.name} — supply & fabrication (all inclusive)`, qty: 1, unit: "lot", unitRate: fromCents(doc.totals.finalCents), type: "SUPPLY" }] },
-        events: { create: [{ kind: revision ? "REVISED" : "CREATED", message: `Offer generated from the pricing estimate${revision ? ` (Rev. ${revision})` : ""}`, userId: user.id }] },
-      },
-    });
-    await tx.estimateOffer.create({
-      data: { estimateId: estimate.id, quotationId: q.id, finalPrice: fromCents(doc.totals.finalCents), createdById: user.id, snapshot: JSON.parse(JSON.stringify({ settings: doc.settings, totals: doc.totals, materials: doc.materials, items: doc.items, subcontracts: doc.subcontracts, projectCosts: doc.projectCosts })) },
-    });
-    return q;
-  });
-  await logActivity({ userId: user.id, action: "CREATE", entity: "QUOTATION", entityId: created.id, detail: `${created.number} Rev. ${created.revision} (from estimate)` });
-  return { quotationId: created.id, number: created.number, revision: created.revision };
-}
 
 export { loadDoc as getSavedEstimate };

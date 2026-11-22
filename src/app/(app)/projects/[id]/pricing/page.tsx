@@ -19,7 +19,7 @@ export default async function ProjectPricingPage({ params }: { params: Promise<{
         <Link href={`/projects/${project.id}`} className="max-w-[240px] truncate hover:text-foreground">{project.name}</Link><ChevronRight className="h-3.5 w-3.5" />
         <span className="font-medium text-foreground">Pricing</span>
       </nav>
-      <EstimationView projectId={project.id} canEdit={can(role, "pricing.edit")} canOffer={can(role, "pricing.edit") && can(role, "quotations.edit")} />
+      <EstimationView projectId={project.id} canEdit={can(role, "pricing.edit")} canOffer={can(role, "pricing.edit") && can(role, "quotations.edit")} canApprove={can(role, "pricing.approve")} canManageTemplates={can(role, "pricing.edit")} />
     </div>
   );
 }

@@ -12,7 +12,7 @@ const m = vi.hoisted(() => {
     asked: [] as string[],
     role: "ADMIN" as string,
     allow: true,
-    calculateSheet: vi.fn(), approveSheet: vi.fn(), reopenSheet: vi.fn(), restoreMaterialLine: vi.fn(), listVersions: vi.fn(), compareVersions: vi.fn(), listAudit: vi.fn(),
+    calculateSheet: vi.fn(), approveSheet: vi.fn(), reopenSheet: vi.fn(), restoreMaterialLine: vi.fn(), listVersions: vi.fn(), compareVersions: vi.fn(), listAudit: vi.fn(), getSnapshot: vi.fn(), createOffer: vi.fn(),
     applyTemplate: vi.fn(), createTemplate: vi.fn(), updateTemplate: vi.fn(), deleteTemplate: vi.fn(), listTemplates: vi.fn(),
   };
 });
@@ -27,8 +27,9 @@ vi.mock("@/server/api/guard", () => ({
 vi.mock("@/server/services/estimation.service", () => ({
   EstimationError: m.EstimationError,
   calculateSheet: m.calculateSheet, approveSheet: m.approveSheet, reopenSheet: m.reopenSheet, restoreMaterialLine: m.restoreMaterialLine,
-  listVersions: m.listVersions, compareVersions: m.compareVersions, listAudit: m.listAudit,
+  listVersions: m.listVersions, compareVersions: m.compareVersions, listAudit: m.listAudit, getSnapshot: m.getSnapshot,
 }));
+vi.mock("@/server/services/estimation-offer.service", () => ({ createOffer: m.createOffer }));
 vi.mock("@/server/services/estimation-templates.service", () => ({
   applyTemplate: m.applyTemplate, createTemplate: m.createTemplate, updateTemplate: m.updateTemplate, deleteTemplate: m.deleteTemplate, listTemplates: m.listTemplates,
 }));
@@ -38,6 +39,8 @@ import * as approve from "@/app/api/projects/[id]/estimation/approve/route";
 import * as reopen from "@/app/api/projects/[id]/estimation/reopen/route";
 import * as restore from "@/app/api/projects/[id]/estimation/restore/route";
 import * as versions from "@/app/api/projects/[id]/estimation/versions/route";
+import * as snapshot from "@/app/api/projects/[id]/estimation/versions/[snapshotId]/route";
+import * as offer from "@/app/api/projects/[id]/estimation/offer/route";
 import * as compare from "@/app/api/projects/[id]/estimation/versions/compare/route";
 import * as auditRoute from "@/app/api/projects/[id]/estimation/audit/route";
 import * as apply from "@/app/api/projects/[id]/estimation/apply-template/route";
@@ -45,6 +48,7 @@ import * as templates from "@/app/api/estimation-templates/route";
 import * as templateById from "@/app/api/estimation-templates/[templateId]/route";
 
 const ctx = { params: Promise.resolve({ id: "p1" }) };
+const sctx = { params: Promise.resolve({ id: "p1", snapshotId: "s1" }) };
 const tctx = { params: Promise.resolve({ templateId: "t1" }) };
 const req = (method: string, body?: unknown, url = "http://localhost/api/x") =>
   new NextRequest(url, { method, ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }) });
@@ -53,7 +57,7 @@ const validOpTemplate = { kind: "OPERATION", name: "Welding", data: { costType: 
 
 beforeEach(() => {
   m.asked.length = 0; m.role = "ADMIN"; m.allow = true;
-  for (const k of ["calculateSheet", "approveSheet", "reopenSheet", "restoreMaterialLine", "listVersions", "compareVersions", "listAudit", "applyTemplate", "createTemplate", "updateTemplate", "deleteTemplate", "listTemplates"] as const) m[k].mockReset();
+  for (const k of ["calculateSheet", "approveSheet", "reopenSheet", "restoreMaterialLine", "listVersions", "compareVersions", "listAudit", "getSnapshot", "createOffer", "applyTemplate", "createTemplate", "updateTemplate", "deleteTemplate", "listTemplates"] as const) m[k].mockReset();
 });
 
 describe("permissions", () => {
@@ -64,6 +68,7 @@ describe("permissions", () => {
     ["restore", () => restore.POST(req("POST", { materialId: "m1" }), ctx), "pricing.edit", m.restoreMaterialLine],
     ["versions", () => versions.GET(req("GET"), ctx), "pricing.view", m.listVersions],
     ["compare", () => compare.GET(req("GET", undefined, "http://localhost/api/x?from=a&to=b"), ctx), "pricing.view", m.compareVersions],
+    ["snapshot", () => snapshot.GET(req("GET"), sctx), "pricing.view", m.getSnapshot],
     ["audit", () => auditRoute.GET(req("GET"), ctx), "pricing.view", m.listAudit],
     ["apply-template", () => apply.POST(req("POST", { templateId: "t1", itemId: "i1" }), ctx), "pricing.edit", m.applyTemplate],
     ["templates GET", () => templates.GET(req("GET")), "pricing.view", m.listTemplates],
@@ -215,5 +220,74 @@ describe("template routes", () => {
     expect(m.updateTemplate.mock.calls[0][0]).toBe("t1");
     expect(await (await templateById.DELETE(req("DELETE"), tctx)).json()).toEqual({ ok: true });
     expect(m.deleteTemplate).toHaveBeenCalledWith("t1", "u1");
+  });
+});
+
+describe("snapshot route (what exactly was calculated / approved)", () => {
+  it("passes the project id and the snapshot id from the URL to the service and returns the snapshot as is", async () => {
+    const snap = { id: "s1", kind: "APPROVED", version: 2, verified: true, inputs: { materials: [] }, result: { totals: {} } };
+    m.getSnapshot.mockResolvedValue(snap);
+    const r = await snapshot.GET(req("GET"), sctx);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual(snap);
+    expect(m.getSnapshot).toHaveBeenCalledWith("p1", "s1");
+  });
+
+  it("a snapshot of another project's sheet is a 404 from the service, passed through", async () => {
+    m.getSnapshot.mockRejectedValue(new m.EstimationError("This version does not belong to this project's estimate", 404));
+    const r = await snapshot.GET(req("GET"), sctx);
+    expect(r.status).toBe(404);
+    expect((await r.json()).error).toContain("does not belong");
+  });
+
+  it("an empty snapshot id is a 400 and never reaches the service", async () => {
+    const r = await snapshot.GET(req("GET"), { params: Promise.resolve({ id: "p1", snapshotId: "" }) });
+    expect(r.status).toBe(400);
+    expect(m.getSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("is read-only: a viewer-level permission is enough, no edit or approve permission is asked", async () => {
+    m.getSnapshot.mockResolvedValue({});
+    await snapshot.GET(req("GET"), sctx);
+    expect(m.asked).toEqual(["pricing.view"]);
+  });
+});
+
+describe("offer route (built from the approved snapshot)", () => {
+  const user = { id: "u1", name: "Tester" };
+  it("asks for pricing.edit, needs quotations.edit too, and creates with the default when the body is empty", async () => {
+    m.createOffer.mockResolvedValue({ quotationId: "q1" });
+    const r = await offer.POST(req("POST"), ctx);
+    expect(r.status).toBe(201);
+    expect(m.asked).toEqual(["pricing.edit"]);
+    expect(m.createOffer).toHaveBeenCalledWith("p1", user, {});
+  });
+  it("passes the chosen layout to the service", async () => {
+    m.createOffer.mockResolvedValue({});
+    await offer.POST(req("POST", { layout: "PER_ITEM" }), ctx);
+    expect(m.createOffer).toHaveBeenCalledWith("p1", user, { layout: "PER_ITEM" });
+  });
+  it("an unknown layout or malformed JSON is a 400 and never reaches the service", async () => {
+    expect((await offer.POST(req("POST", { layout: "WHATEVER" }), ctx)).status).toBe(400);
+    const bad = await offer.POST(req("POST", "{nope"), ctx);
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toBe("Invalid JSON body");
+    expect(m.createOffer).not.toHaveBeenCalled();
+  });
+  it("a role without quotations.edit gets 403 even with pricing.edit, and nothing runs", async () => {
+    m.role = "VIEWER";
+    expect((await offer.POST(req("POST"), ctx)).status).toBe(403);
+    expect(m.createOffer).not.toHaveBeenCalled();
+  });
+  it("does nothing when the guard refuses", async () => {
+    m.allow = false;
+    expect((await offer.POST(req("POST"), ctx)).status).toBe(403);
+    expect(m.createOffer).not.toHaveBeenCalled();
+  });
+  it("'no approved sheet' is a 409 from the service, passed through", async () => {
+    m.createOffer.mockRejectedValue(new m.EstimationError("There is no approved pricing sheet yet.", 409));
+    const r = await offer.POST(req("POST"), ctx);
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toContain("approved");
   });
 });

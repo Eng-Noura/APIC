@@ -16,8 +16,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  url      = env("DATABASE_URL")
 }
 
 // ----------------------------------------------------------------------------
@@ -81,26 +80,24 @@ model User {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  createdProjects    Project[]        @relation("ProjectCreatedBy")
-  uploadedDocs       Document[]       @relation("DocumentUploadedBy")
+  createdProjects    Project[]         @relation("ProjectCreatedBy")
+  uploadedDocs       Document[]        @relation("DocumentUploadedBy")
   activityLogs       ActivityLog[]
-  scopeItems         ScopeItem[]      @relation("ScopeItemCreatedBy")
-  notices            Notice[]         @relation("NoticeCreatedBy")
-  meetingMinutes     MeetingMinute[]  @relation("MeetingMinuteCreatedBy")
-  uploadedDxfFiles   PartDxf[]        @relation("PartDxfUploadedBy")
-  createdNestingJobs NestingJob[]     @relation("NestingJobCreatedBy")
-  createdNestingRuns NestingRun[]     @relation("NestingRunCreatedBy")
+  scopeItems         ScopeItem[]       @relation("ScopeItemCreatedBy")
+  notices            Notice[]          @relation("NoticeCreatedBy")
+  meetingMinutes     MeetingMinute[]   @relation("MeetingMinuteCreatedBy")
+  uploadedDxfFiles   PartDxf[]         @relation("PartDxfUploadedBy")
+  createdNestingJobs NestingJob[]      @relation("NestingJobCreatedBy")
+  createdNestingRuns NestingRun[]      @relation("NestingRunCreatedBy")
   nestingHistory     NestingHistory[]
-  planSchedules      PlanSchedule[]   @relation("PlanScheduleCreatedBy")
-  planBaselines      PlanBaseline[]   @relation("PlanBaselineCreatedBy")
-  planMaterials      PlanMaterial[]   @relation("PlanMaterialCreatedBy")
-  quotations         Quotation[]      @relation("QuotationCreatedBy")
-  quotationEvents    QuotationEvent[] @relation("QuotationEventBy")
-
-  rateProfiles RateProfile[] @relation("RateProfileCreatedBy")
-  pricingSheets PricingSheet[] @relation("PricingSheetCreatedBy")
-  pricingSnapshots PricingSnapshot[] @relation("PricingSnapshotCreatedBy")
-
+  planSchedules      PlanSchedule[]    @relation("PlanScheduleCreatedBy")
+  planBaselines      PlanBaseline[]    @relation("PlanBaselineCreatedBy")
+  planMaterials      PlanMaterial[]    @relation("PlanMaterialCreatedBy")
+  quotations         Quotation[]       @relation("QuotationCreatedBy")
+  quotationEvents    QuotationEvent[]  @relation("QuotationEventBy")
+  rateProfiles       RateProfile[]     @relation("RateProfileCreatedBy")
+  pricingSheets      PricingSheet[]    @relation("PricingSheetCreatedBy")
+  pricingSnapshots   PricingSnapshot[] @relation("PricingSnapshotCreatedBy")
 
   @@map("users")
 }
@@ -165,18 +162,16 @@ model Project {
   purchaseOrders    PurchaseOrder[]
   workOrders        WorkOrder[]
   partGroups        PartGroup[]
+  workOrderGroups   WorkOrderGroup[]
+  rateProfiles      RateProfile[]
+  pricingSheets     PricingSheet[]
+  estimate          ProjectEstimate?
 
   // ---------------------------------------------------------------------
   // Phase 2 extension point (do not remove): future models such as
   // Quotation, MaterialUsage, ScrapEntry, CostSummary will each declare
   // `projectId` and relate back here. No change to Project is required.
   // ---------------------------------------------------------------------
-
-  workOrderGroups WorkOrderGroup[]
-  rateProfiles RateProfile[]
-  pricingSheets PricingSheet[]
-  estimate ProjectEstimate?
-
 
   @@map("projects")
 }
@@ -284,6 +279,14 @@ model TakeoffPart {
   qtyPerAssembly Int        @default(1)
   remark         String?
 
+  // Two more ways to group parts, independent of the assembly (a part has at most one of each):
+  //   scope          — which scope of work the part belongs to (the project's Scope list, see ScopeItem)
+  //   workOrderGroup — which work order (package of parts sent to the shop together) it belongs to
+  scopeId          String?
+  scope            ScopeItem?      @relation(fields: [scopeId], references: [id], onDelete: SetNull)
+  workOrderGroupId String?
+  workOrderGroup   WorkOrderGroup? @relation(fields: [workOrderGroupId], references: [id], onDelete: SetNull)
+
   // Link to the part (2D) or piece (1D) of the project's nesting workspace this part came from (the workspace is unique per
   // project + kind, so kind + part id is enough). `nestSyncedQty` is the quantity both sides had at the last sync:
   // comparing it with each side's current quantity tells WHO changed (see src/server/calc/nest-sync.ts).
@@ -301,17 +304,10 @@ model TakeoffPart {
   nestingPlacements NestingPlacement[] @relation("TakeoffPartNestingPlacements")
 
   @@index([groupId])
-  @@index([nestKind, nestPartId])
-  @@map("takeoff_parts")
-
-  scopeId String?
-  scope   ScopeItem? @relation(fields: [scopeId], references: [id], onDelete: SetNull)
-
-  workOrderGroupId String?
-  workOrderGroup   WorkOrderGroup? @relation(fields: [workOrderGroupId], references: [id], onDelete: SetNull)
-
   @@index([scopeId])
   @@index([workOrderGroupId])
+  @@index([nestKind, nestPartId])
+  @@map("takeoff_parts")
 }
 
 // BOQ assemblies. Drawing -> Assembly (PartGroup) -> Part. Groups can nest (a hatch inside a wall):
@@ -341,6 +337,28 @@ model PartGroup {
   @@unique([projectId, code])
   @@index([projectId, sortOrder])
   @@map("part_groups")
+}
+
+// A work order GROUP: the parts that go to the shop together (e.g. "WO-01 — Gable wall"). Parts point to it with
+// `workOrderGroupId`. This is the planning side; the shop-floor tracking items (WorkOrder / pieces) are separate.
+model WorkOrderGroup {
+  id        String    @id @default(cuid())
+  code      String
+  name      String
+  dueDate   DateTime?
+  remark    String?
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  parts TakeoffPart[]
+
+  @@unique([projectId, code])
+  @@index([projectId, sortOrder])
+  @@map("work_order_groups")
 }
 
 enum PartType {
@@ -767,10 +785,11 @@ model ScopeItem {
   createdById String
   createdBy   User   @relation("ScopeItemCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
 
+  // Take-off parts that belong to this scope (Part List -> "Group as Scope").
   parts TakeoffPart[]
-  pricingItems PricingItem[]
-  estimateItems EstimateItem[]
 
+  pricingItems  PricingItem[]
+  estimateItems EstimateItem[]
 
   @@map("scope_items")
 }
@@ -1211,11 +1230,9 @@ model Quotation {
   createdById String
   createdBy   User   @relation("QuotationCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
 
-  items  QuotationItem[]
-  events QuotationEvent[]
-
+  items         QuotationItem[]
+  events        QuotationEvent[]
   estimateOffer EstimateOffer?
-
 
   @@unique([projectId, number, revision])
   @@index([projectId, issueDate])
@@ -1267,7 +1284,6 @@ model DocumentFolder {
   @@unique([projectId, path])
   @@map("document_folders")
 }
-
 
 // ----------------------------------------------------------------------------
 // Procurement: suppliers, purchase orders, goods receipts (with heat number / mill
@@ -1411,7 +1427,6 @@ model StockMovement {
   @@map("stock_movements")
 }
 
-
 // ----------------------------------------------------------------------------
 // Production tracking. A work order covers one takeoff part (qty pieces); every piece is
 // followed through cutting → assembly → welding → painting by the time each stage was
@@ -1419,8 +1434,8 @@ model StockMovement {
 // schedule's fabrication activities, so the S-curve "actual" is fed by the shop floor.
 // ----------------------------------------------------------------------------
 model WorkOrder {
-  id            String   @id @default(cuid())
-  number        String   @unique // WO-2026-0001
+  id            String    @id @default(cuid())
+  number        String    @unique // WO-2026-0001
   description   String // copied from the part, so the order stays readable if the part is edited
   partNo        Int? // the part's item no.
   partId        String? // takeoff part it was made from (no foreign key: the order outlives the part)
@@ -1431,7 +1446,7 @@ model WorkOrder {
   notes         String?
   createdById   String
   createdByName String
-  createdAt     DateTime @default(now())
+  createdAt     DateTime  @default(now())
 
   projectId String
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -1457,33 +1472,13 @@ model WorkOrderPiece {
   @@map("work_order_pieces")
 }
 
-
 // ----------------------------------------------------------------------------
-// Work order groups (parts grouped by work order) — migration 20260909090000
+// BOQ Pricing — rate library, pricing sheets, immutable snapshots.
+// The pricing unit is the ScopeItem (Part List -> "Group as Scope"); manual lines have no scopeItemId.
+// Method / category / base / calcProfile are plain strings validated by the pricing engine
+// (src/features/pricing/engine), so adding a method never needs a migration.
 // ----------------------------------------------------------------------------
-model WorkOrderGroup {
-  id        String    @id @default(cuid())
-  code      String
-  name      String
-  dueDate   DateTime?
-  remark    String?
-  sortOrder Int       @default(0)
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
 
-  projectId String
-  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
-
-  parts TakeoffPart[]
-
-  @@unique([projectId, code])
-  @@index([projectId, sortOrder])
-  @@map("work_order_groups")
-}
-
-// ----------------------------------------------------------------------------
-// BOQ Pricing module — migration 20260910090000
-// ----------------------------------------------------------------------------
 enum RateProfileType {
   MATERIAL
   FABRICATION
@@ -1505,7 +1500,7 @@ enum PricingSheetStatus {
   DRAFT
   CALCULATED
   APPROVED
-  SUPERSEDED
+  SUPERSEDED // an approved sheet that was re-opened: a new version took its place
 }
 
 enum PricingMaterialSource {
@@ -1525,6 +1520,7 @@ model RateProfile {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
+  // Set when scope = PROJECT.
   projectId String?
   project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
@@ -1540,14 +1536,14 @@ model RateProfile {
 
 model RateComponent {
   id        String   @id @default(cuid())
-  key       String
+  key       String // engine rate key, e.g. "installation.indirectPct" or "install.crane"
   name      String
   category  String
   method    String
   rate      Float
-  fixed     Float?
+  fixed     Float? // FIXED_PLUS_VARIABLE
   unit      String?
-  base      String?
+  base      String? // PERCENT_OF_BASE / DIVISOR / MARKUP
   enabled   Boolean  @default(true)
   sortOrder Int      @default(0)
   notes     String?
@@ -1564,14 +1560,14 @@ model RateComponent {
 
 model PricingSheet {
   id           String             @id @default(cuid())
-  reference    String
+  reference    String // e.g. "PRC-2026-001"
   version      Int                @default(1)
   date         DateTime
   status       PricingSheetStatus @default(DRAFT)
   currency     String             @default("EGP")
-  calcProfile  String             @default("STANDARD")
+  calcProfile  String             @default("STANDARD") // default calculation profile for its items
   notes        String?
-  basedOnId    String?
+  basedOnId    String? // the sheet this version re-prices
   approvedById String?
   approvedAt   DateTime?
   createdAt    DateTime           @default(now())
@@ -1596,12 +1592,12 @@ model PricingItem {
   id           String   @id @default(cuid())
   itemNo       String
   description  String
-  unit         String
+  unit         String // KG | TON | EA | SQM | M (validated by the engine)
   qty          Float
   unitWeightKg Float?
   scopeType    String   @default("")
-  calcProfile  String?
-  profileRefs  Json?
+  calcProfile  String? // overrides the sheet's calculation profile
+  profileRefs  Json? // { INSTALLATION: "<rateProfileId>", … } chosen Rate Profiles
   sortOrder    Int      @default(0)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
@@ -1609,6 +1605,7 @@ model PricingItem {
   sheetId String
   sheet   PricingSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
 
+  // null = manual line (e.g. equipment). Kept (SetNull) if the scope is deleted later.
   scopeItemId String?
   scopeItem   ScopeItem? @relation(fields: [scopeItemId], references: [id], onDelete: SetNull)
 
@@ -1630,7 +1627,7 @@ model PricingMaterialLine {
   unit        String
   unitCost    Float
   notes       String?
-  importedRef String?
+  importedRef String? // stable key of the imported source row — de-duplicates re-imports
   createdAt   DateTime              @default(now())
   updatedAt   DateTime              @updatedAt
 
@@ -1642,6 +1639,8 @@ model PricingMaterialLine {
   @@map("pricing_material_lines")
 }
 
+// Extra cost lines on one item beyond what its Rate Profiles provide (fabrication, installation,
+// subcontractor, add-on, transportation …).
 model PricingItemComponent {
   id        String   @id @default(cuid())
   category  String
@@ -1663,6 +1662,7 @@ model PricingItemComponent {
   @@map("pricing_item_components")
 }
 
+// Item-level rate override: always wins over profile / project / global.
 model PricingItemOverride {
   id        String   @id @default(cuid())
   rateKey   String
@@ -1678,16 +1678,17 @@ model PricingItemOverride {
   @@map("pricing_item_overrides")
 }
 
-// Immutable (a DB trigger rejects UPDATE).
+// Immutable once written (a database trigger rejects UPDATE). Changing rates later never alters a snapshot;
+// re-pricing creates a new sheet version and new snapshots.
 model PricingSnapshot {
   id             String   @id @default(cuid())
-  kind           String
+  kind           String // CALCULATED | APPROVED
   sheetVersion   Int
   engineVersion  String
-  roundingPolicy Json
-  ratesUsed      Json
-  inputs         Json
-  totals         Json
+  roundingPolicy Json // { money, rate, factor }
+  ratesUsed      Json // every rate layer value that fed the calculation
+  inputs         Json // quantities, components, profile choices
+  totals         Json // { directCost, indirectCost, totalCost, salePrice, profit, profitPct } (rounded)
   createdAt      DateTime @default(now())
 
   sheetId String
@@ -1702,21 +1703,20 @@ model PricingSnapshot {
   @@map("pricing_snapshots")
 }
 
-// Immutable (a DB trigger rejects UPDATE).
 model PricingSnapshotItem {
   id            String  @id @default(cuid())
-  pricingItemId String?
+  pricingItemId String? // plain reference (the live item may change or be deleted)
   scopeItemId   String?
   itemNo        String
   description   String
   unit          String
   qty           Float
-  unitRate      Float
-  salePrice     Float
+  unitRate      Float // rounded to 4 dp
+  salePrice     Float // rounded to 2 dp
   totalCost     Float
   profit        Float
   profitPct     Float
-  data          Json
+  data          Json // full engine values + trace
 
   snapshotId String
   snapshot   PricingSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
@@ -1728,7 +1728,7 @@ model PricingSnapshotItem {
 
 model PricingHistory {
   id        String   @id @default(cuid())
-  action    String
+  action    String // CREATED | CALCULATED | APPROVED | REOPENED | RATE_CHANGED | …
   message   String
   data      Json?
   userId    String?
@@ -1742,51 +1742,64 @@ model PricingHistory {
 }
 
 // ----------------------------------------------------------------------------
-// Pricing & Estimation — migrations 20260911090000 and 20260912090000
+// Pricing & Estimation (four stages: Material -> Manufacturing -> Project -> Commercial).
+// One ProjectEstimate per project. It stores INPUTS only; every total is recalculated on the server from these
+// inputs (src/features/estimation/calc.ts). Part List / Nesting data is never copied as data of its own: auto
+// material lines keep a `sourceRef` and the values they had at the last sync, so a user edit never loses the original.
+// Independent of the older BOQ pricing sheet (pricing_sheets) — nothing there is touched.
 // ----------------------------------------------------------------------------
 model ProjectEstimate {
-  id                   String    @id @default(cuid())
-  currency             String    @default("EGP")
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
-  materialDone         Boolean   @default(false)
-  manufacturingDone    Boolean   @default(false)
-  projectCostDone      Boolean   @default(false)
-  scrapUsedLaterPct    Float     @default(0)
-  scrapUsedLaterPrice  Float     @default(0)
-  scrapSellPrice       Float     @default(15)
-  creditRecoveredScrap Boolean   @default(false)
-  profitMode           String    @default("MARKUP_ON_COST")
-  profitValue          Float     @default(0)
-  insuranceMode        String    @default("FIXED")
-  insuranceValue       Float     @default(0)
-  taxPct               Float     @default(14)
-  paymentTerms         String?
-  offerValidityDays    Int       @default(30)
-  deliveryDays         Int?
-  exclusions           String?
-  commercialNotes      String?
-  createdById          String
-  updatedById          String?
+  id        String   @id @default(cuid())
+  currency  String   @default("EGP")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  // v2
-  discountMode        String    @default("NONE")
-  discountValue       Float     @default(0)
-  discountTiming      String    @default("BEFORE_TAX")
+  // Stage completion (set by "Continue"); the commercial stage is "done" once an offer exists.
+  materialDone      Boolean @default(false)
+  manufacturingDone Boolean @default(false)
+  projectCostDone   Boolean @default(false)
+
+  // Scrap inputs (Scrap Management keeps its own only in the browser; the estimate needs them persisted).
+  scrapUsedLaterPct    Float   @default(0) // 0..1 share of the scrap kept for re-use
+  scrapUsedLaterPrice  Float   @default(0) // EGP/kg value of re-used remnants
+  scrapSellPrice       Float   @default(15) // EGP/kg the rest sells for
+  creditRecoveredScrap Boolean @default(false) // deduct recovered scrap value from the material cost
+
+  // Commercial parameters
+  profitMode        String  @default("MARKUP_ON_COST") // MARKUP_ON_COST | MARGIN_ON_PRICE | FIXED
+  profitValue       Float   @default(0)
+  insuranceMode     String  @default("FIXED") // FIXED | PERCENT
+  insuranceValue    Float   @default(0)
+  taxPct            Float   @default(14)
+  paymentTerms      String?
+  offerValidityDays Int     @default(30)
+  deliveryDays      Int?
+  exclusions        String?
+  commercialNotes   String?
+
+  // v2 commercial parameters. Order of calculation is documented in features/estimation/calc.ts (calcCommercial).
+  discountMode        String  @default("NONE") // NONE | PERCENT | FIXED
+  discountValue       Float   @default(0)
+  discountTiming      String  @default("BEFORE_TAX") // BEFORE_TAX | AFTER_TAX
   otherChargesLabel   String?
-  otherChargesValue   Float     @default(0)
-  otherChargesTaxable Boolean   @default(true)
+  otherChargesValue   Float   @default(0)
+  otherChargesTaxable Boolean @default(true)
   targetSalePrice     Float?
   advancePct          Float?
   milestones          String?
   warrantyMonths      Int?
-  allocationBasis     String    @default("WEIGHT")
-  sheetNumber         String?
-  version             Int       @default(1)
-  status              String    @default("DRAFT")
-  calculatedAt        DateTime?
-  approvedAt          DateTime?
-  approvedById        String?
+  allocationBasis     String  @default("WEIGHT") // how project costs not assigned to an item are spread: WEIGHT | DIRECT_COST | EQUAL
+
+  // v2 sheet identity and workflow: DRAFT -> CALCULATED -> APPROVED. An approved sheet is locked; reopening bumps `version`.
+  sheetNumber  String?
+  version      Int       @default(1)
+  status       String    @default("DRAFT")
+  calculatedAt DateTime?
+  approvedAt   DateTime?
+  approvedById String?
+
+  createdById String
+  updatedById String?
 
   projectId String  @unique
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -1803,45 +1816,50 @@ model ProjectEstimate {
 }
 
 model EstimateMaterial {
-  id                   String   @id @default(cuid())
-  source               String
-  sourceRef            String?
-  name                 String
-  grade                String?
-  thicknessMm          Float?
-  sortOrder            Int      @default(0)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-  requiredKg           Float?
-  purchasedKg          Float
-  unitPrice            Float    @default(0)
+  id          String   @id @default(cuid())
+  source      String // NESTING | PART_LIST | MANUAL
+  sourceRef   String? // stable key of the source row (de-duplicates re-syncs); null for manual lines
+  name        String
+  grade       String?
+  thicknessMm Float?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Effective values used by the calculation.
+  requiredKg  Float? // null on a manual line = same as purchased
+  purchasedKg Float
+  unitPrice   Float  @default(0) // EGP/kg
+
+  // What the source said at the last sync, and the price suggested by Procurement — never overwritten by user edits.
   sourceRequiredKg     Float?
   sourcePurchasedKg    Float?
   suggestedUnitPrice   Float?
-  suggestedPriceSource String?
-  sourceMissing        Boolean  @default(false)
+  suggestedPriceSource String? // PROCUREMENT
+  sourceMissing        Boolean @default(false) // the source row disappeared but the user had edited the line, so it was kept
 
-  // v2
-  materialType String?
+  // v2: item scope (null = project-level / not tied to one BOQ item), specification, and price provenance.
+  materialType String? // Plate | Pipe | Profile | Flat | Accessory
   dimensions   String?
-  unit         String   @default("KG")
-  netKg        Float?
-  priceSource  String   @default("MANUAL")
-  priceOptions Json?
+  unit         String  @default("KG")
+  netKg        Float? // net part weight (what the parts weigh), as imported
+  priceSource  String  @default("MANUAL") // MANUAL | PROCUREMENT | STOCK | SCRAP — which price unitPrice currently holds
+  priceOptions Json? // { procurement?, stock?, scrap? } EGP/kg offered by each source at the last sync
   notes        String?
-
-  estimateId String
-  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
 
   itemId String?
   item   EstimateItem? @relation(fields: [itemId], references: [id], onDelete: Cascade)
 
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
   @@unique([estimateId, sourceRef])
-  @@index([estimateId, sortOrder])
   @@index([itemId])
+  @@index([estimateId, sortOrder])
   @@map("estimate_materials")
 }
 
+// A manufacturing scope. Linked to a project ScopeItem (weight and pieces come live from its parts) or manual.
 model EstimateItem {
   id             String   @id @default(cuid())
   name           String
@@ -1849,13 +1867,14 @@ model EstimateItem {
   manualPieces   Int?
   sortOrder      Int      @default(0)
   createdAt      DateTime @default(now())
-  notes          String?
 
   estimateId String
   estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
 
   scopeItemId String?
   scopeItem   ScopeItem? @relation(fields: [scopeItemId], references: [id], onDelete: SetNull)
+
+  notes String?
 
   operations   EstimateOperation[]
   materials    EstimateMaterial[]
@@ -1870,17 +1889,17 @@ model EstimateItem {
 model EstimateOperation {
   id          String   @id @default(cuid())
   name        String
-  costType    String
+  costType    String // FIXED | PERCENTAGE | PER_KG | PER_TON | PER_METER | PER_HOUR | PER_PIECE | PER_HOLE | CUSTOM
   unit        String   @default("")
   rate        Float    @default(0)
-  quantity    Float?
-  percentBase String?
+  quantity    Float? // null = taken from the item (kg / ton / pieces)
+  percentBase String? // ITEM_OPERATIONS | ITEM_MATERIAL_SHARE (percentage only)
   selected    Boolean  @default(false)
-  source      String   @default("DEFAULT")
-  sortOrder   Int      @default(0)
-  createdAt   DateTime @default(now())
+  source      String   @default("DEFAULT") // DEFAULT | MANUAL
   description String?
   notes       String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
 
   itemId String
   item   EstimateItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
@@ -1890,25 +1909,27 @@ model EstimateOperation {
 }
 
 model EstimateSubcontract {
-  id          String   @id @default(cuid())
-  name        String
-  company     String?
-  unit        String   @default("lot")
-  quantity    Float    @default(1)
-  unitPrice   Float    @default(0)
-  notes       String?
-  sortOrder   Int      @default(0)
-  createdAt   DateTime @default(now())
-  description String?
-  costType    String   @default("PER_UNIT")
-  percentBase String?
-  selected    Boolean  @default(true)
+  id        String   @id @default(cuid())
+  name      String
+  company   String?
+  unit      String   @default("lot")
+  quantity  Float    @default(1)
+  unitPrice Float    @default(0)
+  notes     String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
 
-  estimateId String
-  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  // v2: per-item scope (null = whole project), cost method, enable flag.
+  description String?
+  costType    String  @default("PER_UNIT") // FIXED | PERCENTAGE | PER_UNIT
+  percentBase String? // MATERIAL_COST | MANUFACTURING_COST | MATERIAL_PLUS_MANUFACTURING (of the item, or of the project when itemId is null)
+  selected    Boolean @default(true)
 
   itemId String?
   item   EstimateItem? @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  estimateId String
+  estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
 
   @@index([estimateId, sortOrder])
   @@index([itemId])
@@ -1918,28 +1939,32 @@ model EstimateSubcontract {
 model EstimateProjectCost {
   id          String   @id @default(cuid())
   name        String
-  method      String
+  method      String // FIXED | PERCENTAGE | PER_TRIP | PER_TON | PER_TEST | PER_UNIT | CUSTOM
   unit        String   @default("")
-  quantity    Float?
+  quantity    Float? // null = 1 (per ton: the project's total tons)
   rate        Float    @default(0)
-  percentBase String?
+  percentBase String? // MATERIAL_COST | MANUFACTURING_COST | SUBCONTRACTOR_COST | DIRECT_COST
   enabled     Boolean  @default(true)
-  source      String   @default("DEFAULT")
+  source      String   @default("DEFAULT") // DEFAULT | MANUAL
+  category    String   @default("") // Engineering | Quality | Logistics | Installation | Management | Other (free text)
+  notes       String?
   sortOrder   Int      @default(0)
   createdAt   DateTime @default(now())
-  category    String   @default("")
-  notes       String?
+
+  // null = shared by the whole project (spread over the items by the sheet's allocationBasis); set = belongs to that item only.
+  itemId String?
+  item   EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
 
   estimateId String
   estimate   ProjectEstimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-
-  itemId String?
-  item   EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
 
   @@index([estimateId, sortOrder])
   @@map("estimate_project_costs")
 }
 
+// One row per generated offer. The offer itself is a normal Quotation (DRAFT — generating never approves anything);
+// each new offer is the next revision of the same quotation number, so earlier revisions (and approved ones) stay as they were.
+// `snapshot` freezes the inputs and totals the offer was priced from.
 model EstimateOffer {
   id          String   @id @default(cuid())
   snapshot    Json
@@ -1953,14 +1978,21 @@ model EstimateOffer {
   quotationId String    @unique
   quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
 
+  // Which approved snapshot the offer was built from, and how its lines were laid out (LUMP_SUM | PER_ITEM). Null on older offers.
+  snapshotId      String?
+  snapshotVersion Int?
+  layout          String?
+
   @@index([estimateId, createdAt])
   @@map("estimate_offers")
 }
 
+// Immutable record of one calculation. `inputs` is exactly what calcEstimate() was given, `result` what it returned, so a
+// snapshot can always be re-verified (calcEstimate(inputs) must equal result). Rows are inserted, never updated.
 model EstimateSnapshot {
   id          String   @id @default(cuid())
   version     Int
-  kind        String
+  kind        String // CALCULATED | APPROVED
   inputs      Json
   result      Json
   costTotal   Decimal  @db.Decimal(18, 2)
@@ -1976,9 +2008,10 @@ model EstimateSnapshot {
   @@map("estimate_snapshots")
 }
 
+// Who changed what on a pricing sheet. `changes` is a list of { entity, label, field, from, to }.
 model EstimateAuditEntry {
   id        String   @id @default(cuid())
-  action    String
+  action    String // SAVE | RECALCULATE | APPROVE | REOPEN | SYNC | RESTORE | TEMPLATE | OFFER
   summary   String
   changes   Json?
   version   Int      @default(1)
@@ -1992,9 +2025,10 @@ model EstimateAuditEntry {
   @@map("estimate_audit")
 }
 
+// Reusable lines saved by estimators: custom operations, project costs and subcontractor services.
 model EstimateTemplate {
   id          String   @id @default(cuid())
-  kind        String
+  kind        String // OPERATION | PROJECT_COST | SUBCONTRACT
   name        String
   data        Json
   createdById String
