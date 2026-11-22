@@ -77,6 +77,15 @@ export const PERMISSIONS = {
 
   "users.manage": ["ADMIN"],
   "settings.manage": ["ADMIN"],
+
+  // BOQ Pricing: prices and margins are visible to everyone who can see quotations (same as quotations.view);
+  // editing a pricing sheet is for managers and admins, and only an admin approves one (mirrors quotations.approve).
+  // The Rate Library (reusable rate profiles) is managed by managers and admins.
+  "pricing.view": ["ADMIN", "MANAGER", "ENGINEER", "VIEWER"],
+  "pricing.edit": ["ADMIN", "MANAGER"],
+  "pricing.approve": ["ADMIN"],
+  "rateLibrary.manage": ["ADMIN", "MANAGER"],
+
 } as const;
 
 export type PermissionKey = keyof typeof PERMISSIONS;
