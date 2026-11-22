@@ -80,14 +80,23 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
     setGroupings(res?.ok ? ((await res.json()) as GroupingsData) : null);
   }, []);
 
+  // "Loading…" replaces the whole grid, so it is shown only the first time a project is opened. Later reloads (auto-sync,
+  // coming back to the tab, after an import) refresh the data in place; otherwise the grid — and any open window inside
+  // it, like the CSV import preview — would be thrown away in the middle of what the person is doing.
+  const loadedFor = React.useRef("");
   const loadDrawings = React.useCallback(async (pid: string): Promise<TakeoffDrawingRow[]> => {
     if (!pid) return [];
-    setLoading(true);
-    const [res] = await Promise.all([fetch(`/api/takeoff/drawings?projectId=${pid}`), loadGroupings(pid)]);
-    const list: TakeoffDrawingRow[] = res.ok ? await res.json() : [];
-    setDrawings(list);
-    setLoading(false);
-    return list;
+    const first = loadedFor.current !== pid;
+    if (first) setLoading(true);
+    try {
+      const [res] = await Promise.all([fetch(`/api/takeoff/drawings?projectId=${pid}`), loadGroupings(pid)]);
+      const list: TakeoffDrawingRow[] = res.ok ? await res.json() : [];
+      setDrawings(list);
+      if (res.ok) loadedFor.current = pid;
+      return list;
+    } finally {
+      if (first) setLoading(false);
+    }
   }, [loadGroupings]);
 
   // Automatic: opening the Part List (coming back to this browser tab, or the nest being saved from another tab)
