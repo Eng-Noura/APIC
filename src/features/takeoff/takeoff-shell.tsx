@@ -28,13 +28,14 @@ function NestingTabLinks({ isNesting }: { isNesting: boolean }) {
   );
 }
 
-function TakeoffTopBar({ showScrap, showSteelPricing }: { showScrap: boolean; showSteelPricing: boolean }) {
+function TakeoffTopBar({ showScrap, showPricing }: { showScrap: boolean; showPricing: boolean }) {
   const pathname = usePathname();
   const isNesting = pathname?.startsWith("/takeoff/nesting") ?? false;
-  const isScrap = pathname?.startsWith("/takeoff/scrap-material") ?? false;
-  const isSteelPricing = pathname?.startsWith("/takeoff/steel-pricing") ?? false;
+  const isScrap = pathname?.startsWith("/takeoff/scrap-management") ?? false;
   const isNozzles = pathname?.startsWith("/takeoff/nozzles") ?? false;
-  const isStandard = !isNesting && !isScrap && !isSteelPricing && !isNozzles;
+  const isPricing = pathname?.startsWith("/takeoff/pricing") ?? false;
+  const isRates = pathname?.startsWith("/takeoff/rate-library") ?? false;
+  const isStandard = !isNesting && !isScrap && !isNozzles && !isPricing && !isRates;
 
   return (
     <div className="space-y-4">
@@ -54,19 +55,26 @@ function TakeoffTopBar({ showScrap, showSteelPricing }: { showScrap: boolean; sh
         >
           <NestingTabLinks isNesting={isNesting} />
         </React.Suspense>
+        {showScrap && (
+          <Link href="/takeoff/scrap-management" className={activeTabClass(isScrap)}>
+            Scrap Management
+          </Link>
+        )}
+        {showPricing && (
+          <Link href="/takeoff/pricing" className={activeTabClass(isPricing)}>
+            Pricing
+          </Link>
+        )}
+        {showPricing && (
+          <Link href="/takeoff/rate-library" className={activeTabClass(isRates)}>
+            Rate Library
+          </Link>
+        )}
+        {/* TEMP-HIDDEN (Nozzles) - uncomment to restore, or delete for good later.
         <Link href="/takeoff/nozzles" className={activeTabClass(isNozzles)}>
           Nozzles
         </Link>
-        {showScrap && (
-          <Link href="/takeoff/scrap-material" className={activeTabClass(isScrap)}>
-            Scrap & Material
-          </Link>
-        )}
-        {showSteelPricing && (
-          <Link href="/takeoff/steel-pricing" className={activeTabClass(isSteelPricing)}>
-            Steel Pricing
-          </Link>
-        )}
+        */}
       </div>
     </div>
   );
@@ -75,16 +83,16 @@ function TakeoffTopBar({ showScrap, showSteelPricing }: { showScrap: boolean; sh
 export function TakeoffShell({
   children,
   showScrap = false,
-  showSteelPricing = false,
+  showPricing = false,
 }: {
   children: React.ReactNode;
   showScrap?: boolean;
-  showSteelPricing?: boolean;
+  showPricing?: boolean;
 }) {
   return (
     <TakeoffProjectProvider>
       <div className="space-y-6">
-        <TakeoffTopBar showScrap={showScrap} showSteelPricing={showSteelPricing} />
+        <TakeoffTopBar showScrap={showScrap} showPricing={showPricing} />
         <ProjectGate>{children}</ProjectGate>
       </div>
     </TakeoffProjectProvider>

@@ -1,5 +1,6 @@
 "use client";
 import * as React from "react";
+import { useActiveProject } from "@/components/layout/active-project";
 import type { HistoryEntry, ProjectOption } from "./types";
 
 interface TakeoffProjectContextValue {
@@ -78,22 +79,47 @@ function localStamp() {
 
 /**
  * Holds the single "active workspace" for the whole Takeoff section (Part List + DXF
- * Nesting tabs): either a project or an entry of the user's nesting history. Intentionally does NOT
- * auto-select anything — the user lands on the page with nothing chosen.
+ * Nesting tabs): the app's active project, or an entry of the user's nesting history.
  */
 export function TakeoffProjectProvider({ children }: { children: React.ReactNode }) {
-  const [projects, setProjects] = React.useState<ProjectOption[]>([]);
+  // The project is the app-wide "Active project" picked in the sidebar. This provider only adds what is
+  // specific to Nesting & Costing: an open history entry (a standalone nest) or a blank import.
+  const { projects, setProjects, loadingProjects, activeProjectId, setActiveProjectId, removeProject } = useActiveProject();
   const [history, setHistory] = React.useState<HistoryEntry[]>([]);
-  const [projectId, setProjectIdState] = React.useState("");
   const [historyId, setHistoryIdState] = React.useState("");
-  const projectIdRef = React.useRef("");
-  const historyIdRef = React.useRef("");
-  const select = React.useCallback((p: string, h: string) => {
-    projectIdRef.current = p;
-    historyIdRef.current = h;
-    setProjectIdState(p);
-    setHistoryIdState(h);
-  }, []);
+  const [blank, setBlank] = React.useState(false);
+  // Picking another project in the sidebar leaves any open history entry / blank import and shows that project.
+  const [seenActive, setSeenActive] = React.useState(activeProjectId);
+  if (seenActive !== activeProjectId) {
+    setSeenActive(activeProjectId);
+    setHistoryIdState("");
+    setBlank(false);
+  }
+  const projectId = historyId || blank ? "" : activeProjectId;
+  const projectIdRef = React.useRef(projectId);
+  const historyIdRef = React.useRef(historyId);
+  React.useEffect(() => {
+    projectIdRef.current = projectId;
+    historyIdRef.current = historyId;
+  });
+  const select = React.useCallback(
+    (p: string, h: string) => {
+      projectIdRef.current = p;
+      historyIdRef.current = h;
+      if (p) {
+        setHistoryIdState("");
+        setBlank(false);
+        setActiveProjectId(p);
+      } else if (h) {
+        setHistoryIdState(h);
+        setBlank(false);
+      } else {
+        setHistoryIdState("");
+        setBlank(true); // nothing open: the Nesting tabs are empty, ready for a new import
+      }
+    },
+    [setActiveProjectId],
+  );
   const setProjectId = React.useCallback((id: string) => select(id, ""), [select]);
   const openHistory = React.useCallback((id: string) => select("", id), [select]);
   const startNewImport = React.useCallback(() => select("", ""), [select]);
@@ -101,7 +127,6 @@ export function TakeoffProjectProvider({ children }: { children: React.ReactNode
   const pendingWorkspace = React.useRef<Promise<string> | null>(null);
   const freshRef = React.useRef<Set<string>>(new Set());
   const flushers = React.useRef<Set<() => Promise<void>>>(new Set());
-  const [loadingProjects, setLoadingProjects] = React.useState(true);
   const [nestingQueue, setNestingQueue] = React.useState<string[]>([]);
   const [nestingQueue1D, setNestingQueue1D] = React.useState<string[]>([]);
   const queueForNesting = React.useCallback((ids: string[], kind: "1D" | "2D" = "2D") => {
@@ -179,7 +204,7 @@ export function TakeoffProjectProvider({ children }: { children: React.ReactNode
       select(proj.id, ""); // continue working in the project
       return proj;
     },
-    [select],
+    [select, setProjects],
   );
 
   const assignHistoryToProject = React.useCallback(
@@ -205,22 +230,21 @@ export function TakeoffProjectProvider({ children }: { children: React.ReactNode
       select(proj.id, ""); // opens empty: its (missing) workspace clears the Nesting tabs
       return proj;
     },
-    [select],
+    [select, setProjects],
   );
 
   const renameProject = React.useCallback(async (id: string, name: string) => {
     const r = await api<{ name: string }>(`/api/projects/${id}`, json("PATCH", { name }), { 403: "You are not allowed to rename projects" });
     setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, name: r.name } : p)));
-  }, []);
+  }, [setProjects]);
 
   const deleteProject = React.useCallback(
     async (id: string) => {
       await api(`/api/projects/${id}`, { method: "DELETE" }, { 403: "You are not allowed to delete projects" });
-      setProjects((prev) => prev.filter((p) => p.id !== id));
+      removeProject(id); // also clears the sidebar selection if it was this project
       setHistory((prev) => prev.map((h) => (h.savedProjectId === id ? { ...h, savedProjectId: null } : h)));
-      if (projectIdRef.current === id) select("", "");
     },
-    [select],
+    [removeProject],
   );
 
   const registerFlusher = React.useCallback((fn: () => Promise<void>) => {
@@ -231,10 +255,6 @@ export function TakeoffProjectProvider({ children }: { children: React.ReactNode
   }, []);
 
   React.useEffect(() => {
-    fetch("/api/projects")
-      .then((r) => r.json())
-      .then((data) => setProjects(data))
-      .finally(() => setLoadingProjects(false));
     fetch("/api/nesting/history")
       .then((r) => (r.ok ? r.json() : []))
       .then((data) => setHistory(Array.isArray(data) ? data : []))

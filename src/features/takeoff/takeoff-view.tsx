@@ -11,6 +11,8 @@ import { NestingImportDialog } from "./nesting-import-dialog";
 import { Nesting1DImportDialog } from "./nesting-import-1d-dialog";
 import { PartsGrid } from "./parts-grid";
 import { BoqPanel } from "./boq-panel";
+import { GroupingsPanel } from "./groupings-panel";
+import type { GroupingsData } from "@/server/services/part-grouping.service";
 import { sideAreas } from "./side-areas";
 import { autoImportNestParts, autoImportNestPieces } from "./nest-auto-import";
 import { ACCESSORIES_DRAWING, ACCESSORIES_DRAWING_TITLE } from "./parts-csv";
@@ -70,15 +72,23 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
   const [deletingDrawing, setDeletingDrawing] = React.useState<TakeoffDrawingRow | null>(null);
   const [deleteLoading, setDeleteLoading] = React.useState(false);
 
+  // The project's assemblies / scopes / work orders: feeds the three group columns, the "Group as…" window and the panel.
+  // Reloaded together with the drawings, so the part counts always match what is on screen.
+  const [groupings, setGroupings] = React.useState<GroupingsData | null>(null);
+  const loadGroupings = React.useCallback(async (pid: string) => {
+    const res = await fetch(`/api/part-groupings?projectId=${pid}`).catch(() => null);
+    setGroupings(res?.ok ? ((await res.json()) as GroupingsData) : null);
+  }, []);
+
   const loadDrawings = React.useCallback(async (pid: string): Promise<TakeoffDrawingRow[]> => {
     if (!pid) return [];
     setLoading(true);
-    const res = await fetch(`/api/takeoff/drawings?projectId=${pid}`);
+    const [res] = await Promise.all([fetch(`/api/takeoff/drawings?projectId=${pid}`), loadGroupings(pid)]);
     const list: TakeoffDrawingRow[] = res.ok ? await res.json() : [];
     setDrawings(list);
     setLoading(false);
     return list;
-  }, []);
+  }, [loadGroupings]);
 
   // Automatic: opening the Part List (coming back to this browser tab, or the nest being saved from another tab)
   // brings in the parts of the 2D nest AND the 1D nest that are not in the list yet, and carries quantity changes
@@ -155,21 +165,6 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
 
   const selectedProject = projects.find((p) => p.id === projectId);
 
-  const [addingAcc, setAddingAcc] = React.useState(false);
-  // Creates the ACCESSORIES section (bolts, nuts, washers...), the same kind of section as NESTING / NESTING-1D.
-  async function addAccessoriesSection() {
-    if (!projectId) return;
-    setAddingAcc(true);
-    const res = await fetch("/api/takeoff/drawings", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId, drawingNumber: ACCESSORIES_DRAWING, title: ACCESSORIES_DRAWING_TITLE, weightFromDwg: null }),
-    }).catch(() => null);
-    setAddingAcc(false);
-    if (!res?.ok) { toast.error("Could not create the Accessories section"); return; }
-    toast.success("Accessories section added: use Import CSV or Add Item inside it");
-    loadDrawings(projectId);
-  }
-
   const [syncing, setSyncing] = React.useState(false);
   // Pulls quantity changes made in the 2D nest into the BOQ; everything that needs a decision is listed, not guessed.
   async function syncWithNest() {
@@ -192,6 +187,21 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
     if (moved) toast.success(moved, { description: detail || undefined });
     else if (lines.length) toast.warning("Nest and BOQ are not fully in step", { description: detail });
     else toast.success("Nest and BOQ are in step");
+  }
+
+  const [addingAcc, setAddingAcc] = React.useState(false);
+  // Creates the ACCESSORIES section (bolts, nuts, washers...), the same kind of section as NESTING / NESTING-1D.
+  async function addAccessoriesSection() {
+    if (!projectId) return;
+    setAddingAcc(true);
+    const res = await fetch("/api/takeoff/drawings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId, drawingNumber: ACCESSORIES_DRAWING, title: ACCESSORIES_DRAWING_TITLE, weightFromDwg: null }),
+    }).catch(() => null);
+    setAddingAcc(false);
+    if (!res?.ok) { toast.error("Could not create the Accessories section"); return; }
+    toast.success("Accessories section added: use Import CSV or Add Item inside it");
+    loadDrawings(projectId);
   }
 
   async function handleDeleteDrawing() {
@@ -317,10 +327,6 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
         </div>
       )}
 
-      {projectId && drawings.length > 0 && (
-        <BoqPanel projectId={projectId} drawings={drawings} canCreate={canCreate} canDelete={canDelete} refreshKey={drawings} onChanged={() => loadDrawings(projectId)} />
-      )}
-
       {!projectId ? (
         <EmptyState icon={<FolderKanban className="h-5 w-5" />} title="No project selected" description="Choose a project above to see its material take-off data." />
       ) : loading ? (
@@ -383,12 +389,22 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
                   canCreate={canCreate}
                   canDelete={canDelete}
                   onChanged={() => loadDrawings(projectId)}
+                  groupings={groupings}
+                  onGroupingsChanged={() => void loadGroupings(projectId)}
                   accessoriesDefault={drawing.drawingNumber === ACCESSORIES_DRAWING}
                 />
               </div>
             );
           })}
         </div>
+      )}
+
+      {projectId && drawings.length > 0 && (
+        <BoqPanel projectId={projectId} drawings={drawings} canCreate={canCreate} canDelete={canDelete} refreshKey={drawings} onChanged={() => loadDrawings(projectId)} />
+      )}
+
+      {projectId && drawings.length > 0 && (
+        <GroupingsPanel projectId={projectId} data={groupings} canCreate={canCreate} canDelete={canDelete} onChanged={() => { void loadGroupings(projectId); loadDrawings(projectId); }} />
       )}
 
       {projectId && canCreate && (

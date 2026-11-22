@@ -398,7 +398,7 @@ function ImportForm({ onOpenChange, projectId, hasSchedule }: { onOpenChange: (o
 
   return (
     <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
-      <DialogHeader><DialogTitle>Import from Primavera P6 (XER)</DialogTitle><DialogDescription>In P6: File → Export → Primavera PM (XER), then choose the file here.</DialogDescription></DialogHeader>
+      <DialogHeader><DialogTitle>Import schedule (Primavera XER or Microsoft Project XML)</DialogTitle><DialogDescription>Primavera P6: File → Export → Primavera PM (XER). Microsoft Project: File → Save As → XML Format (.xml). Then choose the file here.</DialogDescription></DialogHeader>
       {report ? (
         <div className="space-y-3 text-sm">
           <div className="font-medium text-green-700">{report.mode === "update" ? "Schedule updated." : "Imported."}</div>
@@ -418,9 +418,9 @@ function ImportForm({ onOpenChange, projectId, hasSchedule }: { onOpenChange: (o
           )}
           <label className="flex cursor-pointer flex-col items-center gap-2 rounded-xl border border-dashed border-border p-6 text-center hover:bg-secondary/50">
             <Upload className="h-5 w-5 text-muted-foreground" />
-            <span className="text-sm font-medium">{file ? file.name : "Choose an .xer file"}</span>
+            <span className="text-sm font-medium">{file ? file.name : "Choose an .xer or .xml file"}</span>
             <span className="text-xs text-muted-foreground">Up to 25 MB</span>
-            <input type="file" accept=".xer,.txt" className="hidden" onChange={(e) => { setFile(e.target.files?.[0] ?? null); resetPreview(); setP6Project(""); }} />
+            <input type="file" accept=".xer,.xml,.txt" className="hidden" onChange={(e) => { setFile(e.target.files?.[0] ?? null); resetPreview(); setP6Project(""); }} />
           </label>
           {preview && preview.projects.length > 1 && (
             <div>

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
 import { planningHandler } from "@/server/api/planning-route";
-import { exportXer, getPlanningData, PlanningError } from "@/server/services/planning.service";
+import { exportMsp, exportXer, getPlanningData, PlanningError } from "@/server/services/planning.service";
 import { buildScheduleWorkbook } from "@/server/services/planning-export.service";
 import { getProject } from "@/server/services/project.service";
 
@@ -12,7 +12,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
   if (res) return res;
   return planningHandler(async () => {
     const { id } = await params;
-    const format = req.nextUrl.searchParams.get("format") === "xlsx" ? "xlsx" : "xer";
+    const q = req.nextUrl.searchParams.get("format");
+    const format = q === "xlsx" ? "xlsx" : q === "msp" ? "msp" : "xer";
     const project = await getProject(id);
     if (!project) throw new PlanningError("Project not found", 404);
     const base = safe(`${project.number}_schedule`);
@@ -21,6 +22,12 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
       const text = await exportXer(id);
       return new NextResponse(text, {
         headers: { "Content-Type": "application/octet-stream", "Content-Disposition": `attachment; filename="${base}.xer"`, "Cache-Control": "no-store" },
+      });
+    }
+    if (format === "msp") {
+      const text = await exportMsp(id);
+      return new NextResponse(text, {
+        headers: { "Content-Type": "application/xml; charset=utf-8", "Content-Disposition": `attachment; filename="${base}.xml"`, "Cache-Control": "no-store" },
       });
     }
     const data = await getPlanningData(id);

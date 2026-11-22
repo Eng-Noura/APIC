@@ -15,7 +15,7 @@ export default auth((req) => {
   }
 
   if (isLoggedIn && isAuthPage) {
-    return NextResponse.redirect(new URL("/dashboard", req.nextUrl.origin));
+    return NextResponse.redirect(new URL("/start", req.nextUrl.origin));
   }
 
   if (isLoggedIn && ADMIN_ONLY_PREFIXES.some((p) => pathname.startsWith(p))) {
@@ -29,5 +29,8 @@ export default auth((req) => {
 });
 
 export const config = {
-  matcher: ["/((?!api|_next/static|_next/image|favicon.ico|uploads).*)"],
+  // Skip auth for API routes, Next internals, uploads and any static file in /public (logo, images, fonts...).
+  // Without the file-extension rule, /atec-apic-logo.png etc. were redirected to /login for logged-out visitors,
+  // so the splash/login logo showed as a broken image on first open.
+  matcher: ["/((?!api|_next/static|_next/image|favicon.ico|uploads|.*\\.(?:png|jpg|jpeg|gif|svg|webp|avif|ico|woff2?|ttf|otf|txt|xml|json|webmanifest)$).*)"],
 };

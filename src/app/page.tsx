@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 
-// Root URL → dashboard. Logged-out visitors are then sent to /login by src/proxy.ts.
+// Root URL → start screen (Free Nesting / Open project / New project). Logged-out visitors are sent to /login by src/proxy.ts.
 export default function Home() {
-  redirect("/dashboard");
+  redirect("/start");
 }

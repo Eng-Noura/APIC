@@ -4,10 +4,12 @@ import { usePathname } from "next/navigation";
 import { Sidebar } from "./sidebar";
 import { MobileNav } from "./mobile-nav";
 import { Topbar } from "./topbar";
+import { ActiveProjectProvider } from "./active-project";
 import { NAV_ITEMS } from "@/lib/nav-config";
 import type { Role } from "@prisma/client";
 
 const SUBTITLES: Record<string, string> = {
+  "/start": "Choose how you want to start",
   "/dashboard": "Operational overview across all active projects",
   "/projects": "Manage engineering projects and their lifecycle",
   "/customers": "Manage your customer directory",
@@ -58,6 +60,7 @@ export function AppShell({
   const subtitle = activeItem ? SUBTITLES[activeItem.href] : undefined;
 
   return (
+    <ActiveProjectProvider>
     <div className="flex h-screen overflow-hidden bg-background">
       <Sidebar role={user.role} open={sidebarOpen} />
       <MobileNav role={user.role} open={mobileOpen} onOpenChange={setMobileOpen} />
@@ -66,5 +69,6 @@ export function AppShell({
         <main className="flex-1 space-y-6 overflow-y-auto p-4 md:p-6">{children}</main>
       </div>
     </div>
+    </ActiveProjectProvider>
   );
 }

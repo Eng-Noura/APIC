@@ -53,11 +53,11 @@ export function PlanningView({
         <EmptyState
           icon={<GanttChartSquare />}
           title="No schedule for this project yet"
-          description={canEdit ? "Build a schedule here, or import one you already made in Primavera P6 (XER)." : "A schedule has not been created for this project."}
+          description={canEdit ? "Build a schedule here, or import one you already made in Primavera P6 (XER) or Microsoft Project (XML)." : "A schedule has not been created for this project."}
           action={canEdit ? (
             <div className="flex flex-wrap justify-center gap-2">
               <Button onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" /> New schedule</Button>
-              <Button variant="outline" onClick={() => setImportOpen(true)}><Upload className="h-4 w-4" /> Import from P6 (XER)</Button>
+              <Button variant="outline" onClick={() => setImportOpen(true)}><Upload className="h-4 w-4" /> Import (P6 XER / MS Project XML)</Button>
             </div>
           ) : undefined}
         />
@@ -87,6 +87,7 @@ function Loaded({ projectId, projectLabel, data, materials, canEdit, canDelete, 
   const exportBtns = (
     <>
       <Button variant="outline" size="sm" className={softBtn} asChild><a href={`${base}/export?format=xer`}><Download className="h-4 w-4 text-primary" /> Export to P6</a></Button>
+      <Button variant="outline" size="sm" className={softBtn} asChild><a href={`${base}/export?format=msp`}><Download className="h-4 w-4 text-primary" /> Export MS Project</a></Button>
       <Button variant="outline" size="sm" className={softBtn} asChild><a href={`${base}/export?format=xlsx`}><FileSpreadsheet className="h-4 w-4 text-green-600" /> Export Excel</a></Button>
       <Button variant="outline" size="sm" className={softBtn} asChild><a href={`/print/projects/${projectId}/planning`} target="_blank" rel="noreferrer"><FileText className="h-4 w-4 text-red-600" /> Export PDF</a></Button>
     </>
@@ -221,8 +222,9 @@ function Overview({ data, base, canEdit, onImport, materials, onOpenMaterials }:
 
         <Card><CardHeader><CardTitle className="flex items-center gap-2 text-sm"><ClipboardList className="h-4 w-4 text-muted-foreground" /> Quick Actions</CardTitle></CardHeader>
           <CardContent className="grid grid-cols-2 gap-3">
-            <QuickAction icon={<Upload className="h-5 w-5 text-primary" />} label="Import from P6 (XER)" onClick={canEdit ? onImport : undefined} />
+            <QuickAction icon={<Upload className="h-5 w-5 text-primary" />} label="Import (P6 XER / MS Project XML)" onClick={canEdit ? onImport : undefined} />
             <QuickAction icon={<Download className="h-5 w-5 text-primary" />} label="Export to P6 (XER)" href={`${base}/export?format=xer`} />
+            <QuickAction icon={<Download className="h-5 w-5 text-primary" />} label="Export to MS Project (XML)" href={`${base}/export?format=msp`} />
             <QuickAction icon={<FileText className="h-5 w-5 text-red-600" />} label="Export Report (PDF)" href={`${base.replace("/api/projects/", "/print/projects/")}`} newTab />
             <QuickAction icon={<FileSpreadsheet className="h-5 w-5 text-green-600" />} label="Export Excel" href={`${base}/export?format=xlsx`} />
           </CardContent></Card>
