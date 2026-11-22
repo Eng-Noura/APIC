@@ -139,7 +139,7 @@ export function lotKey(profile: string, material: string): string {
   return `${n(profile)}\u0000${n(material)}`;
 }
 
-/** Merges a manually entered piece into `pieces` (identical pieces share one row with a higher quantity). */
+/** Merges a manually entered piece into `pieces` (identical pieces — same name too — share one row with a higher quantity). */
 export function addPiece(
   pieces: Piece1D[],
   input: { name: string; profile: string; material: string; length: number; qty: number; partType?: PartType1D; partId?: string },
@@ -151,10 +151,15 @@ export function addPiece(
   const qty = Math.max(1, Math.round(input.qty || 1));
   const partType = input.partType ?? DEFAULT_PART_TYPE_1D;
   const out = pieces.slice();
+  // a piece with a name of its own is merged only into a piece with the SAME name: same profile / material / length but a
+  // different name stays a row of its own. A piece entered without a name is not "differently named", so it still merges.
+  const nm = (x: string) => x.trim().replace(/\s+/g, " ").toLowerCase();
+  const wantName = nm(input.name ?? "");
   // a piece that stands for one Part List part keeps its own row (the link would be lost in a merge)
   const m = input.partId ? undefined : out.find(
     (p) =>
       !p.partId &&
+      (wantName === "" || nm(p.name) === wantName) &&
       p.profile === profile &&
       p.material === material &&
       (p.partType ?? DEFAULT_PART_TYPE_1D) === partType &&
