@@ -58,6 +58,29 @@ export const scrapPricingInputsSchema = z.object({
 });
 export type ScrapPricingInputs = z.infer<typeof scrapPricingInputsSchema>;
 
+// Scrap Management workbook export — the page posts the rows it is showing.
+export const scrapManagementExportSchema = z.object({
+  projectId: z.string().min(1),
+  rows: z.array(z.object({
+    key: z.string(),
+    label: z.string(),
+    material: z.string(),
+    thicknessMm: z.number(),
+    widthMm: z.number(),
+    lengthMm: z.number(),
+    usedAreaSqm: z.number(),
+    usedWeightKg: z.number(),
+    buyQty: z.number(),
+    buyAreaSqm: z.number(),
+    buyWeightKg: z.number(),
+    costPerKg: z.number().min(0),
+    usedLaterPct: z.number().min(0).max(1),
+    usedLaterPriceLEPerKg: z.number().min(0),
+    scrapSellPriceLEPerKg: z.number().min(0),
+  })),
+});
+export type ScrapManagementExportInput = z.infer<typeof scrapManagementExportSchema>;
+
 // ----------------------------------------------------------------------------
 // Phase 2C — Assisted Nesting save payload. The client already validates
 // this session with validateSessionForExport() before sending it, and the
