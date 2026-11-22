@@ -14,6 +14,7 @@ import { BoqPanel } from "./boq-panel";
 import { GroupingsPanel } from "./groupings-panel";
 import type { GroupingsData } from "@/server/services/part-grouping.service";
 import { sideAreas } from "./side-areas";
+import { UNASSIGNED, assemblyScope, dropStaleFilters, emptyFilters, filtersActive as hasActiveFilters, matchesFilters, type PartFilters } from "./part-filters";
 import { autoImportNestParts, autoImportNestPieces } from "./nest-auto-import";
 import { ACCESSORIES_DRAWING, ACCESSORIES_DRAWING_TITLE } from "./parts-csv";
 import { useTakeoffProject } from "./project-context";
@@ -36,33 +37,11 @@ const PART_TYPE_LABEL: Record<PartType, string> = {
   ACCESSORY: "Accessory",
 };
 
-interface Filters {
-  type: PartType | "ALL";
-  thickness: string; // exact-match text, blank = any
-  description: string; // substring search, case-insensitive
-  side: PartSide | "ALL";
-}
-
-const emptyFilters: Filters = { type: "ALL", thickness: "", description: "", side: "ALL" };
-
-function matchesFilters(part: TakeoffPartRow, f: Filters): boolean {
-  if (f.type !== "ALL" && part.partType !== f.type) return false;
-  if (f.side !== "ALL" && part.side !== f.side) return false;
-  if (f.thickness.trim() !== "") {
-    const wanted = Number(f.thickness);
-    if (!Number.isFinite(wanted) || part.thicknessMm !== wanted) return false;
-  }
-  if (f.description.trim() !== "") {
-    if (!part.description.toLowerCase().includes(f.description.trim().toLowerCase())) return false;
-  }
-  return true;
-}
-
 export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canDelete: boolean }) {
   const { projects, projectId, setProjectId } = useTakeoffProject();
   const [drawings, setDrawings] = React.useState<TakeoffDrawingRow[]>([]);
   const [loading, setLoading] = React.useState(false);
-  const [filters, setFilters] = React.useState<Filters>(emptyFilters);
+  const [rawFilters, setFilters] = React.useState<PartFilters>(emptyFilters);
 
   const [drawingFormOpen, setDrawingFormOpen] = React.useState(false);
   // "Take parts from 2D Nesting": `key` changes on every opening so the popup always starts fresh
@@ -224,21 +203,24 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
     loadDrawings(projectId);
   }
 
-  const filtersActive = filters.type !== "ALL" || filters.side !== "ALL" || filters.thickness.trim() !== "" || filters.description.trim() !== "";
+  // a filter on an assembly / scope / work order that was deleted meanwhile counts as "All"
+  const filters = React.useMemo(() => dropStaleFilters(rawFilters, groupings), [rawFilters, groupings]);
+  const filtersActive = hasActiveFilters(filters);
 
-  // Filtered view of every drawing — filters apply across the whole
-  // project, not just one drawing, so grand totals below always reflect
-  // exactly what's visible on screen.
+  // Filtered view of every drawing — filters apply across the whole project, not just one drawing, so the totals
+  // above the list are those of exactly what is visible: no filter = every part, a filter = only the matching parts.
   const filteredDrawings = React.useMemo(() => {
     if (!filtersActive) return drawings;
-    return drawings.map((d) => ({ ...d, parts: d.parts.filter((p) => matchesFilters(p, filters)) }));
-  }, [drawings, filters, filtersActive]);
+    const asmIds = assemblyScope(filters, groupings?.assemblies ?? []);
+    return drawings.map((d) => ({ ...d, parts: d.parts.filter((p) => matchesFilters(p, filters, asmIds)) }));
+  }, [drawings, filters, filtersActive, groupings]);
 
   const allVisibleParts = React.useMemo(
     () => filteredDrawings.flatMap((d) => d.parts),
     [filteredDrawings],
   );
 
+  const totalPartCount = drawings.reduce((n, d) => n + d.parts.length, 0);
   const grandTotalWeight = allVisibleParts.reduce((s, p) => s + num(p.weightKg), 0);
   const grandTotalArea = allVisibleParts.reduce((s, p) => s + num(p.totalArea), 0);
   const { internalSqm: grandInternalArea, externalSqm: grandExternalArea } = sideAreas(allVisibleParts);
@@ -290,7 +272,7 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
             </div>
             <div className="w-36 space-y-1">
               <label className="block text-xs text-muted-foreground">Type</label>
-              <Select value={filters.type} onValueChange={(v) => setFilters((f) => ({ ...f, type: v as Filters["type"] }))}>
+              <Select value={filters.type} onValueChange={(v) => setFilters((f) => ({ ...f, type: v as PartFilters["type"] }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="ALL">All types</SelectItem>
@@ -310,7 +292,7 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
             </div>
             <div className="w-36 space-y-1">
               <label className="block text-xs text-muted-foreground">Side</label>
-              <Select value={filters.side} onValueChange={(v) => setFilters((f) => ({ ...f, side: v as Filters["side"] }))}>
+              <Select value={filters.side} onValueChange={(v) => setFilters((f) => ({ ...f, side: v as PartFilters["side"] }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="ALL">All sides</SelectItem>
@@ -320,6 +302,49 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
                 </SelectContent>
               </Select>
             </div>
+            {groupings && (
+              <>
+                <div className="w-44 space-y-1">
+                  <label className="block text-xs text-muted-foreground">Assembly</label>
+                  <Select value={filters.assembly} onValueChange={(v) => setFilters((f) => ({ ...f, assembly: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">All assemblies</SelectItem>
+                      <SelectItem value={UNASSIGNED}>No assembly</SelectItem>
+                      {groupings.assemblies.map((a) => (
+                        <SelectItem key={a.id} value={a.id}>{a.code}{a.name ? ` — ${a.name}` : ""}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="w-44 space-y-1">
+                  <label className="block text-xs text-muted-foreground">Scope</label>
+                  <Select value={filters.scope} onValueChange={(v) => setFilters((f) => ({ ...f, scope: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">All scopes</SelectItem>
+                      <SelectItem value={UNASSIGNED}>No scope</SelectItem>
+                      {groupings.scopes.map((sc) => (
+                        <SelectItem key={sc.id} value={sc.id}>{sc.description}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="w-44 space-y-1">
+                  <label className="block text-xs text-muted-foreground">Work order</label>
+                  <Select value={filters.workOrder} onValueChange={(v) => setFilters((f) => ({ ...f, workOrder: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">All work orders</SelectItem>
+                      <SelectItem value={UNASSIGNED}>No work order</SelectItem>
+                      {groupings.workOrders.map((w) => (
+                        <SelectItem key={w.id} value={w.id}>{w.code}{w.name ? ` — ${w.name}` : ""}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </>
+            )}
             {filtersActive && (
               <Button size="sm" variant="ghost" onClick={() => setFilters(emptyFilters)}>
                 <X className="h-3.5 w-3.5" /> Clear
@@ -328,6 +353,7 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
           </div>
 
           <div className="flex flex-wrap gap-x-8 gap-y-1 border-t border-border pt-3 text-sm">
+            <span>Parts: <span className="font-semibold text-foreground">{allVisibleParts.length}{filtersActive ? ` of ${totalPartCount}` : ""}</span></span>
             <span>Total Weight: <span className="font-semibold text-primary">{fmt(grandTotalWeight, 1)} kg</span></span>
             <span>Total Area: <span className="font-semibold text-foreground">{fmt(grandTotalArea, 3)} m²</span></span>
             <span>Total External: <span className="font-semibold text-foreground">{fmt(grandExternalArea, 3)} m²</span></span>

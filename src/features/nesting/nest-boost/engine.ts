@@ -706,6 +706,18 @@ export interface Counters {
 }
 
 /**
+ * Names are compared without case or extra spaces. A part with a name of its own is merged only into a row with the SAME
+ * name: identical shape / thickness / material but a different name stays a row of its own. An empty name is not
+ * "a different name", so it still merges into a matching row.
+ */
+export const sameGroupName = (a: string | undefined, b: string | undefined): boolean => {
+  const nm = (x: string | undefined) => (x ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  const na = nm(a);
+  const nb = nm(b);
+  return na === "" || nb === "" || na === nb;
+};
+
+/**
  * Splits one DXF's contours into parts and merges them into `groups`
  * (identical parts share one row with a higher quantity). Returns the new
  * array and how many parts were found.
@@ -734,6 +746,7 @@ export function addFileParts(
     const m = out.find(
       (g) =>
         !g.seg &&
+        sameGroupName(g.name, name) &&
         g.th === th &&
         g.material === material &&
         g.holes.length === p.holes.length &&
@@ -764,6 +777,7 @@ export function mergeDuplicateGroups(groups: Group[], ids: Set<number>): { group
       (m, k) =>
         k < i &&
         !m.seg &&
+        sameGroupName(m.name, g.name) &&
         m.th === g.th &&
         m.material === g.material &&
         m.holes.length === g.holes.length &&
@@ -1075,6 +1089,7 @@ export function addManualPart(
   const m = groups.find(
     (g) =>
       !g.seg &&
+      sameGroupName(g.name, o.name) &&
       g.th === th &&
       g.material === material &&
       g.holes.length === geo.holes.length &&
@@ -1232,7 +1247,7 @@ export function addNestParts(
       for (let gi = 0; gi < out.length && !found; gi++) {
         const g = out[gi];
         if (
-          g.seg || g.th !== opts.th || g.material !== opts.material || g.holes.length !== p.holes.length ||
+          g.seg || !sameGroupName(g.name, name) || g.th !== opts.th || g.material !== opts.material || g.holes.length !== p.holes.length ||
           Math.abs(g.area - p.area) > g.area * 0.002 + 0.5 || Math.abs(g.per - p.per) > g.per * 0.005 + 0.5
         )
           continue;
