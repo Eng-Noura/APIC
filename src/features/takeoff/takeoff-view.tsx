@@ -1,6 +1,6 @@
 "use client";
 import * as React from "react";
-import { Plus, Trash2, Ruler, FolderKanban, Layers, Filter, X, PackagePlus, RefreshCw } from "lucide-react";
+import { Plus, Trash2, Ruler, FolderKanban, Layers, Filter, X, PackagePlus, RefreshCw, FileSpreadsheet, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -8,12 +8,16 @@ import { EmptyState } from "@/components/shared/empty-state";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { DrawingForm } from "./drawing-form";
 import { NestingImportDialog } from "./nesting-import-dialog";
+import { Nesting1DImportDialog } from "./nesting-import-1d-dialog";
 import { PartsGrid } from "./parts-grid";
 import { BoqPanel } from "./boq-panel";
 import { GroupingsPanel } from "./groupings-panel";
 import type { GroupingsData } from "@/server/services/part-grouping.service";
 import { sideAreas } from "./side-areas";
-import { autoImportNestParts } from "./nest-auto-import";
+import { buildExportModel, buildWorkbook, describeFilters, toCsv } from "./parts-export";
+import { UNASSIGNED, assemblyScope, dropStaleFilters, emptyFilters, filtersActive as hasActiveFilters, matchesFilters, type PartFilters } from "./part-filters";
+import { autoImportNestParts, autoImportNestPieces } from "./nest-auto-import";
+import { ACCESSORIES_DRAWING, ACCESSORIES_DRAWING_TITLE } from "./parts-csv";
 import { useTakeoffProject } from "./project-context";
 import type { TakeoffDrawingRow, TakeoffPartRow, PartType, PartSide } from "./types";
 import { toast } from "sonner";
@@ -34,37 +38,17 @@ const PART_TYPE_LABEL: Record<PartType, string> = {
   ACCESSORY: "Accessory",
 };
 
-interface Filters {
-  type: PartType | "ALL";
-  thickness: string; // exact-match text, blank = any
-  description: string; // substring search, case-insensitive
-  side: PartSide | "ALL";
-}
-
-const emptyFilters: Filters = { type: "ALL", thickness: "", description: "", side: "ALL" };
-
-function matchesFilters(part: TakeoffPartRow, f: Filters): boolean {
-  if (f.type !== "ALL" && part.partType !== f.type) return false;
-  if (f.side !== "ALL" && part.side !== f.side) return false;
-  if (f.thickness.trim() !== "") {
-    const wanted = Number(f.thickness);
-    if (!Number.isFinite(wanted) || part.thicknessMm !== wanted) return false;
-  }
-  if (f.description.trim() !== "") {
-    if (!part.description.toLowerCase().includes(f.description.trim().toLowerCase())) return false;
-  }
-  return true;
-}
-
 export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canDelete: boolean }) {
   const { projects, projectId, setProjectId } = useTakeoffProject();
   const [drawings, setDrawings] = React.useState<TakeoffDrawingRow[]>([]);
   const [loading, setLoading] = React.useState(false);
-  const [filters, setFilters] = React.useState<Filters>(emptyFilters);
+  const [rawFilters, setFilters] = React.useState<PartFilters>(emptyFilters);
 
   const [drawingFormOpen, setDrawingFormOpen] = React.useState(false);
   // "Take parts from 2D Nesting": `key` changes on every opening so the popup always starts fresh
   const [nestImport, setNestImport] = React.useState({ open: false, key: 0 });
+  // same for "Take parts from 1D Nesting"
+  const [nestImport1D, setNestImport1D] = React.useState({ open: false, key: 0 });
   const [deletingDrawing, setDeletingDrawing] = React.useState<TakeoffDrawingRow | null>(null);
   const [deleteLoading, setDeleteLoading] = React.useState(false);
 
@@ -76,33 +60,63 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
     setGroupings(res?.ok ? ((await res.json()) as GroupingsData) : null);
   }, []);
 
+  // "Loading…" replaces the whole grid, so it is shown only the first time a project is opened. Later reloads (auto-sync,
+  // coming back to the tab, after an import) refresh the data in place; otherwise the grid — and any open window inside
+  // it, like the CSV import preview — would be thrown away in the middle of what the person is doing.
+  const loadedFor = React.useRef("");
   const loadDrawings = React.useCallback(async (pid: string): Promise<TakeoffDrawingRow[]> => {
     if (!pid) return [];
-    setLoading(true);
-    const [res] = await Promise.all([fetch(`/api/takeoff/drawings?projectId=${pid}`), loadGroupings(pid)]);
-    const list: TakeoffDrawingRow[] = res.ok ? await res.json() : [];
-    setDrawings(list);
-    setLoading(false);
-    return list;
+    const first = loadedFor.current !== pid;
+    if (first) setLoading(true);
+    try {
+      const [res] = await Promise.all([fetch(`/api/takeoff/drawings?projectId=${pid}`), loadGroupings(pid)]);
+      const list: TakeoffDrawingRow[] = res.ok ? await res.json() : [];
+      setDrawings(list);
+      if (res.ok) loadedFor.current = pid;
+      return list;
+    } finally {
+      if (first) setLoading(false);
+    }
   }, [loadGroupings]);
 
-  // Automatic: opening the Part List (or coming back to this browser tab) brings in the nest's new parts (once per
-  // project) and carries quantity changes between the nest and the BOQ. The "Sync with nest" button stays for a manual run.
-  const autoImported = React.useRef<string>("");
+  // Automatic: opening the Part List (coming back to this browser tab, or the nest being saved from another tab)
+  // brings in the parts of the 2D nest AND the 1D nest that are not in the list yet, and carries quantity changes
+  // between the nests and the BOQ. The "Sync with nest" button stays for a manual run.
   const autoBusy = React.useRef(false);
+  // what the auto-import already told the person, so the same warning is not shown on every run
+  const warned = React.useRef<Set<string>>(new Set());
+  // version of each saved nest the last run saw: a cheap poll tells when one of them changed
+  const seen = React.useRef<{ d2: number | null; d1: number | null }>({ d2: null, d1: null });
+  const readVersions = React.useCallback(async (pid: string) => {
+    const one = async (kind: "2D" | "1D") => {
+      const r = await fetch(`/api/nesting/workspace?kind=${kind}&projectId=${pid}&versionOnly=1`).catch(() => null);
+      return r?.ok ? (((await r.json().catch(() => null)) as { version?: number | null } | null)?.version ?? null) : null;
+    };
+    const [d2, d1] = await Promise.all([one("2D"), one("1D")]);
+    return { d2, d1 };
+  }, []);
+
   const autoSync = React.useCallback(async (pid: string, first: boolean) => {
     if (!pid || !canCreate || autoBusy.current) return;
     autoBusy.current = true;
     try {
+      // read the versions BEFORE importing: a save that lands during the run is noticed by the next poll
+      seen.current = await readVersions(pid);
       const list = await loadDrawings(pid);
-      let imported = 0;
-      if (autoImported.current !== pid) {
-        autoImported.current = pid;
-        const r = await autoImportNestParts(pid, list);
-        imported = r.imported;
-        if (r.imported) toast.success(`${r.imported} part(s) added from the 2D nest`);
-        if (r.failed) toast.error(`${r.failed} nest part(s) could not be added — use "Take parts from 2D Nesting" to see why`);
+      const r2 = await autoImportNestParts(pid, list);
+      if (r2.imported) toast.success(`${r2.imported} part(s) added from the 2D nest`);
+      if (r2.failed) toast.error(`${r2.failed} nest part(s) could not be added — use "Take parts from 2D Nesting" to see why`);
+      const r1 = await autoImportNestPieces(pid);
+      if (r1.imported) toast.success(`${r1.imported} part(s) added from the 1D nest`);
+      if (r1.failed) toast.error(`${r1.failed} 1D nest piece(s) could not be added — use "Take parts from 1D Nesting" to see why`);
+      const fresh = r1.warnings.filter((w) => !warned.current.has(w));
+      if (fresh.length) {
+        fresh.forEach((w) => warned.current.add(w));
+        toast.warning(`${fresh.length} piece(s) of the 1D nest were not added`, {
+          description: fresh.slice(0, 4).map((w) => `• ${w}`).join("\n") + (fresh.length > 4 ? `\n• … and ${fresh.length - 4} more — see "Take parts from 1D Nesting"` : ""),
+        });
       }
+      const imported = r2.imported + r1.imported;
       const res = await fetch("/api/takeoff/nest-sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: pid }) }).catch(() => null);
       const r = res?.ok ? ((await res.json().catch(() => null)) as { hasNest: boolean; applied: number; pushed: number; summary: { conflict: number } } | null) : null;
       if (r?.hasNest) {
@@ -114,15 +128,29 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
     } finally {
       autoBusy.current = false;
     }
-  }, [canCreate, loadDrawings]);
+  }, [canCreate, loadDrawings, readVersions]);
 
   React.useEffect(() => {
     if (!projectId) return;
+    seen.current = { d2: null, d1: null };
+    warned.current = new Set();
     void (canCreate ? autoSync(projectId, true) : loadDrawings(projectId));
     const onVisible = () => { if (document.visibilityState === "visible") void autoSync(projectId, false); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [projectId, canCreate, autoSync, loadDrawings]);
+    // While this page stays open: every 20 s ask (cheaply, versions only) whether a nest was saved since the last run —
+    // a piece added to the 1D nest (or a part to the 2D nest) in another tab then comes in without reopening the page.
+    const poll = canCreate
+      ? setInterval(async () => {
+          if (document.visibilityState !== "visible" || autoBusy.current) return;
+          const now = await readVersions(projectId);
+          if (now.d2 !== seen.current.d2 || now.d1 !== seen.current.d1) void autoSync(projectId, false);
+        }, 20000)
+      : null;
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      if (poll) clearInterval(poll);
+    };
+  }, [projectId, canCreate, autoSync, loadDrawings, readVersions]);
 
   const selectedProject = projects.find((p) => p.id === projectId);
 
@@ -134,20 +162,35 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
     setSyncing(false);
     if (!res?.ok) { toast.error("Could not sync with the nest"); return; }
     const r = (await res.json()) as { hasNest: boolean; applied: number; pushed: number; summary: { boq_changed: number; conflict: number; orphan: number; unlinked: number }; items: { status: string; label: string; reason?: string }[] };
-    if (!r.hasNest) { toast.info("This project has no saved 2D nest yet"); return; }
+    if (!r.hasNest) { toast.info("This project has no saved nest yet (2D or 1D)"); return; }
     if (r.applied || r.pushed) loadDrawings(projectId);
     const issues = r.items.filter((i) => i.status === "conflict" || i.status === "orphan" || i.status === "boq_changed");
     const lines = [
       r.summary.conflict ? `${r.summary.conflict} conflict(s) need a decision` : "",
       r.summary.boq_changed ? `${r.summary.boq_changed} changed in the BOQ but not yet in the nest` : "",
       r.summary.orphan ? `${r.summary.orphan} no longer in the nest` : "",
-      r.summary.unlinked ? `${r.summary.unlinked} nest part(s) not in the BOQ yet` : "",
+      r.summary.unlinked ? `${r.summary.unlinked} nest part(s) / piece(s) not in the BOQ yet` : "",
     ].filter(Boolean);
     const detail = [...lines, ...issues.slice(0, 4).map((i) => `• ${i.label}: ${i.reason ?? i.status}`)].join("\n");
     const moved = [r.applied ? `${r.applied} quantity change(s) taken from the nest` : "", r.pushed ? `${r.pushed} written into the nest` : ""].filter(Boolean).join(" · ");
     if (moved) toast.success(moved, { description: detail || undefined });
     else if (lines.length) toast.warning("Nest and BOQ are not fully in step", { description: detail });
     else toast.success("Nest and BOQ are in step");
+  }
+
+  const [addingAcc, setAddingAcc] = React.useState(false);
+  // Creates the ACCESSORIES section (bolts, nuts, washers...), the same kind of section as NESTING / NESTING-1D.
+  async function addAccessoriesSection() {
+    if (!projectId) return;
+    setAddingAcc(true);
+    const res = await fetch("/api/takeoff/drawings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId, drawingNumber: ACCESSORIES_DRAWING, title: ACCESSORIES_DRAWING_TITLE, weightFromDwg: null }),
+    }).catch(() => null);
+    setAddingAcc(false);
+    if (!res?.ok) { toast.error("Could not create the Accessories section"); return; }
+    toast.success("Accessories section added: use Import CSV or Add Item inside it");
+    loadDrawings(projectId);
   }
 
   async function handleDeleteDrawing() {
@@ -161,30 +204,71 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
     loadDrawings(projectId);
   }
 
-  const filtersActive = filters.type !== "ALL" || filters.side !== "ALL" || filters.thickness.trim() !== "" || filters.description.trim() !== "";
+  // a filter on an assembly / scope / work order that was deleted meanwhile counts as "All"
+  const filters = React.useMemo(() => dropStaleFilters(rawFilters, groupings), [rawFilters, groupings]);
+  const filtersActive = hasActiveFilters(filters);
 
-  // Filtered view of every drawing — filters apply across the whole
-  // project, not just one drawing, so grand totals below always reflect
-  // exactly what's visible on screen.
+  // Filtered view of every drawing — filters apply across the whole project, not just one drawing, so the totals
+  // above the list are those of exactly what is visible: no filter = every part, a filter = only the matching parts.
   const filteredDrawings = React.useMemo(() => {
     if (!filtersActive) return drawings;
-    return drawings.map((d) => ({ ...d, parts: d.parts.filter((p) => matchesFilters(p, filters)) }));
-  }, [drawings, filters, filtersActive]);
+    const asmIds = assemblyScope(filters, groupings?.assemblies ?? []);
+    return drawings.map((d) => ({ ...d, parts: d.parts.filter((p) => matchesFilters(p, filters, asmIds)) }));
+  }, [drawings, filters, filtersActive, groupings]);
 
   const allVisibleParts = React.useMemo(
     () => filteredDrawings.flatMap((d) => d.parts),
     [filteredDrawings],
   );
 
+  const totalPartCount = drawings.reduce((n, d) => n + d.parts.length, 0);
   const grandTotalWeight = allVisibleParts.reduce((s, p) => s + num(p.weightKg), 0);
   const grandTotalArea = allVisibleParts.reduce((s, p) => s + num(p.totalArea), 0);
   const { internalSqm: grandInternalArea, externalSqm: grandExternalArea } = sideAreas(allVisibleParts);
+
+  // Export of what is on screen: every assembly with its parts (follows the filters above)
+  const [exporting, setExporting] = React.useState(false);
+  function saveBlob(blob: Blob, name: string) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  }
+  async function exportParts(kind: "xlsx" | "csv") {
+    if (allVisibleParts.length === 0 || exporting) return;
+    setExporting(true);
+    try {
+      const model = buildExportModel(filteredDrawings, groupings);
+      const day = new Date().toISOString().slice(0, 10);
+      const base = `PartList_${(selectedProject?.number ?? "project").replace(/[^\w.-]+/g, "_")}${filtersActive ? "_filtered" : ""}_${day}`;
+      if (kind === "csv") {
+        saveBlob(new Blob([toCsv(model)], { type: "text/csv;charset=utf-8" }), `${base}.csv`);
+      } else {
+        const ExcelJS = (await import("exceljs")).default;
+        const wb = buildWorkbook(ExcelJS, model, {
+          title: `Part List — ${selectedProject ? `${selectedProject.number} ${selectedProject.name}` : "project"}`,
+          filter: describeFilters(filters, groupings),
+          date: day,
+        });
+        const buf = await wb.xlsx.writeBuffer();
+        saveBlob(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `${base}.xlsx`);
+      }
+    } catch {
+      toast.error("Could not create the export file");
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <div className="space-y-6">
       {canCreate && (
         <div className="flex flex-wrap justify-end gap-2">
-          <Button variant="outline" onClick={syncWithNest} disabled={!projectId || syncing} title="Bring quantity changes made in the 2D nest into this list and show what still differs">
+          <Button variant="outline" onClick={syncWithNest} disabled={!projectId || syncing} title="Bring quantity changes made in the 2D and 1D nests into this list and show what still differs">
             <RefreshCw className={`h-4 w-4 ${syncing ? "animate-spin" : ""}`} /> Sync with nest
           </Button>
           <Button
@@ -195,6 +279,24 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
           >
             <PackagePlus className="h-4 w-4" /> Take parts from 2D Nesting
           </Button>
+          <Button
+            variant="outline"
+            onClick={() => setNestImport1D((n) => ({ open: true, key: n.key + 1 }))}
+            disabled={!projectId}
+            title="Turn the pieces of a 1D nest (this project's, or one from your history) into profile / pipe parts of this project"
+          >
+            <PackagePlus className="h-4 w-4" /> Take parts from 1D Nesting
+          </Button>
+          {!drawings.some((d) => d.drawingNumber === ACCESSORIES_DRAWING) && (
+            <Button
+              variant="outline"
+              onClick={addAccessoriesSection}
+              disabled={!projectId || addingAcc}
+              title="Create the ACCESSORIES section for bolts, nuts, washers and other bought-out items (like NESTING and NESTING-1D)"
+            >
+              <Plus className="h-4 w-4" /> Add Accessories section
+            </Button>
+          )}
           <Button onClick={() => setDrawingFormOpen(true)} disabled={!projectId}>
             <Plus className="h-4 w-4" /> Add Drawing
           </Button>
@@ -209,7 +311,7 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
             </div>
             <div className="w-36 space-y-1">
               <label className="block text-xs text-muted-foreground">Type</label>
-              <Select value={filters.type} onValueChange={(v) => setFilters((f) => ({ ...f, type: v as Filters["type"] }))}>
+              <Select value={filters.type} onValueChange={(v) => setFilters((f) => ({ ...f, type: v as PartFilters["type"] }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="ALL">All types</SelectItem>
@@ -229,7 +331,7 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
             </div>
             <div className="w-36 space-y-1">
               <label className="block text-xs text-muted-foreground">Side</label>
-              <Select value={filters.side} onValueChange={(v) => setFilters((f) => ({ ...f, side: v as Filters["side"] }))}>
+              <Select value={filters.side} onValueChange={(v) => setFilters((f) => ({ ...f, side: v as PartFilters["side"] }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="ALL">All sides</SelectItem>
@@ -239,6 +341,49 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
                 </SelectContent>
               </Select>
             </div>
+            {groupings && (
+              <>
+                <div className="w-44 space-y-1">
+                  <label className="block text-xs text-muted-foreground">Assembly</label>
+                  <Select value={filters.assembly} onValueChange={(v) => setFilters((f) => ({ ...f, assembly: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">All assemblies</SelectItem>
+                      <SelectItem value={UNASSIGNED}>No assembly</SelectItem>
+                      {groupings.assemblies.map((a) => (
+                        <SelectItem key={a.id} value={a.id}>{a.code}{a.name ? ` — ${a.name}` : ""}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="w-44 space-y-1">
+                  <label className="block text-xs text-muted-foreground">Scope</label>
+                  <Select value={filters.scope} onValueChange={(v) => setFilters((f) => ({ ...f, scope: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">All scopes</SelectItem>
+                      <SelectItem value={UNASSIGNED}>No scope</SelectItem>
+                      {groupings.scopes.map((sc) => (
+                        <SelectItem key={sc.id} value={sc.id}>{sc.description}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="w-44 space-y-1">
+                  <label className="block text-xs text-muted-foreground">Work order</label>
+                  <Select value={filters.workOrder} onValueChange={(v) => setFilters((f) => ({ ...f, workOrder: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">All work orders</SelectItem>
+                      <SelectItem value={UNASSIGNED}>No work order</SelectItem>
+                      {groupings.workOrders.map((w) => (
+                        <SelectItem key={w.id} value={w.id}>{w.code}{w.name ? ` — ${w.name}` : ""}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </>
+            )}
             {filtersActive && (
               <Button size="sm" variant="ghost" onClick={() => setFilters(emptyFilters)}>
                 <X className="h-3.5 w-3.5" /> Clear
@@ -247,10 +392,19 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
           </div>
 
           <div className="flex flex-wrap gap-x-8 gap-y-1 border-t border-border pt-3 text-sm">
+            <span>Parts: <span className="font-semibold text-foreground">{allVisibleParts.length}{filtersActive ? ` of ${totalPartCount}` : ""}</span></span>
             <span>Total Weight: <span className="font-semibold text-primary">{fmt(grandTotalWeight, 1)} kg</span></span>
             <span>Total Area: <span className="font-semibold text-foreground">{fmt(grandTotalArea, 3)} m²</span></span>
             <span>Total External: <span className="font-semibold text-foreground">{fmt(grandExternalArea, 3)} m²</span></span>
             <span>Total Internal: <span className="font-semibold text-foreground">{fmt(grandInternalArea, 3)} m²</span></span>
+            <span className="ml-auto flex gap-2">
+              <Button size="sm" variant="outline" disabled={exporting || allVisibleParts.length === 0} onClick={() => exportParts("xlsx")} title={filtersActive ? "Export the filtered parts, grouped by assembly, to Excel" : "Export all parts, grouped by assembly, to Excel"}>
+                <FileSpreadsheet className="h-3.5 w-3.5 text-green-600" /> Excel
+              </Button>
+              <Button size="sm" variant="outline" disabled={exporting || allVisibleParts.length === 0} onClick={() => exportParts("csv")} title={filtersActive ? "Export the filtered parts to CSV (one row per part)" : "Export all parts to CSV (one row per part)"}>
+                <FileText className="h-3.5 w-3.5" /> CSV
+              </Button>
+            </span>
           </div>
         </div>
       )}
@@ -319,6 +473,7 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
                   onChanged={() => loadDrawings(projectId)}
                   groupings={groupings}
                   onGroupingsChanged={() => void loadGroupings(projectId)}
+                  accessoriesDefault={drawing.drawingNumber === ACCESSORIES_DRAWING}
                 />
               </div>
             );
@@ -339,6 +494,17 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
           key={nestImport.key}
           open={nestImport.open}
           onOpenChange={(v) => setNestImport((n) => ({ ...n, open: v }))}
+          projectId={projectId}
+          drawings={drawings}
+          onImported={() => loadDrawings(projectId)}
+        />
+      )}
+
+      {projectId && canCreate && (
+        <Nesting1DImportDialog
+          key={`1d-${nestImport1D.key}`}
+          open={nestImport1D.open}
+          onOpenChange={(v) => setNestImport1D((n) => ({ ...n, open: v }))}
           projectId={projectId}
           drawings={drawings}
           onImported={() => loadDrawings(projectId)}
