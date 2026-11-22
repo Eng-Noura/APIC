@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { OFFER_LAYOUTS } from "@/features/estimation/offer";
 import { ALLOCATION_BASES, COST_TYPES, DISCOUNT_MODES, DISCOUNT_TIMINGS, INSURANCE_MODES, OP_PERCENT_BASES, PRICE_SOURCES, PROFIT_MODES, PROJECT_METHODS, PROJECT_PERCENT_BASES, SUB_COST_TYPES, SUB_PERCENT_BASES } from "@/features/estimation/calc";
 
 const money = z.number().finite().min(0, "Must be 0 or more").max(1e12);
@@ -90,6 +91,9 @@ export type SaveEstimateInput = z.infer<typeof saveEstimateSchema>;
 
 export const reopenSchema = z.object({ reason: text(500).min(3, "Give a reason for reopening") });
 export const compareSchema = z.object({ from: id, to: id });
+export const snapshotIdSchema = id;
+/** The body is optional: an empty body means the default layout. */
+export const createOfferSchema = z.object({ layout: z.enum(OFFER_LAYOUTS).optional() });
 export const restoreLineSchema = z.object({ materialId: id });
 
 // ---------------------------------------------------------------- templates

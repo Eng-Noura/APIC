@@ -6,9 +6,9 @@ const rect = (w: number, h: number): Pt[] => [[0, 0], [w, 0], [w, h], [0, h]];
 describe("editing thickness / material / quantity of imported rows", () => {
   it("folds an edited new row into an existing identical row (quantity adds up)", () => {
     const counters = { id: 0, sn: 0 };
-    // the same 100x50 plate imported twice: once as 8 mm S235 (existing), once with no thickness (new)
-    let gs = addFileParts([], [rect(100, 50)], "a PL8mm.dxf", 1, counters, { material: "S235", qty: 3 }).groups;
-    gs = addFileParts(gs, [rect(100, 50)], "b.dxf", 1, counters, { qty: 2 }).groups;
+    // the same 100x50 plate (same name) imported twice: once as 8 mm S235 (existing), once with no thickness (new)
+    let gs = addFileParts([], [rect(100, 50)], "plate.dxf", 1, counters, { th: 8, material: "S235", qty: 3 }).groups;
+    gs = addFileParts(gs, [rect(100, 50)], "plate.dxf", 1, counters, { th: 1, qty: 2 }).groups;
     expect(gs).toHaveLength(2);
     // the person types 8 mm + S235 for the second one
     const edited = gs.map((g) => (g.id === gs[1].id ? { ...g, th: 8, material: "S235" } : g));

@@ -287,10 +287,10 @@ model TakeoffPart {
   workOrderGroupId String?
   workOrderGroup   WorkOrderGroup? @relation(fields: [workOrderGroupId], references: [id], onDelete: SetNull)
 
-  // Link to the part of the project's nesting workspace this part came from (the workspace is unique per
+  // Link to the part (2D) or piece (1D) of the project's nesting workspace this part came from (the workspace is unique per
   // project + kind, so kind + part id is enough). `nestSyncedQty` is the quantity both sides had at the last sync:
   // comparing it with each side's current quantity tells WHO changed (see src/server/calc/nest-sync.ts).
-  nestKind      String? // "2D"
+  nestKind      String? // "2D" (plate of the DXF nest) or "1D" (profile / pipe of the 1D nest)
   nestPartId    Int?
   nestSyncedQty Int?
   nestSyncedAt  DateTime?
@@ -1978,6 +1978,11 @@ model EstimateOffer {
   quotationId String    @unique
   quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
 
+  // Which approved snapshot the offer was built from, and how its lines were laid out (LUMP_SUM | PER_ITEM). Null on older offers.
+  snapshotId      String?
+  snapshotVersion Int?
+  layout          String?
+
   @@index([estimateId, createdAt])
   @@map("estimate_offers")
 }
@@ -2006,7 +2011,7 @@ model EstimateSnapshot {
 // Who changed what on a pricing sheet. `changes` is a list of { entity, label, field, from, to }.
 model EstimateAuditEntry {
   id        String   @id @default(cuid())
-  action    String // SAVE | RECALCULATE | APPROVE | REOPEN | SYNC | RESTORE | TEMPLATE
+  action    String // SAVE | RECALCULATE | APPROVE | REOPEN | SYNC | RESTORE | TEMPLATE | OFFER
   summary   String
   changes   Json?
   version   Int      @default(1)

@@ -11,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { computeTakeoffPart } from "@/server/calc/takeoff";
 import {
-  parseTakeoffCsv, csvRowProblem, csvRowToPayload, TAKEOFF_CSV_TEMPLATE,
+  parseTakeoffCsv, csvRowProblem, csvRowToPayload, TAKEOFF_CSV_TEMPLATE, ACCESSORY_CSV_TEMPLATE,
   type CsvPartRow, type CsvPartType,
 } from "./parts-csv";
 
@@ -21,11 +21,12 @@ interface Row extends CsvPartRow {
   error?: string;
 }
 
-const TYPE_LABEL: Record<CsvPartType, string> = { HOT_ROLLED: "Hot Rolled", PIPE: "Pipe" };
+const TYPE_LABEL: Record<CsvPartType, string> = { HOT_ROLLED: "Hot Rolled", PIPE: "Pipe", ACCESSORY: "Accessory" };
 
 function weightOf(r: Row, unit: "mm" | "m", drawingId: string): number {
   if (csvRowProblem(r)) return 0;
   const p = csvRowToPayload(r, drawingId, 0, unit);
+  if (p.partType === "ACCESSORY") return (p.geometry.unitWeightKg ?? 0) * p.qty;
   return computeTakeoffPart({
     partType: p.partType,
     geometry: p.geometry as Record<string, unknown>,
@@ -37,13 +38,15 @@ function weightOf(r: Row, unit: "mm" | "m", drawingId: string): number {
 }
 
 export function CsvImportDialog({
-  open, onOpenChange, drawingId, nextItemNo, onImported,
+  open, onOpenChange, drawingId, nextItemNo, onImported, accessoriesDefault = false,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   drawingId: string;
   nextItemNo: number;
   onImported: () => void;
+  /** The Accessories section: a row with no type is an accessory, not a hot-rolled section. */
+  accessoriesDefault?: boolean;
 }) {
   const [rows, setRows] = React.useState<Row[]>([]);
   const [errors, setErrors] = React.useState<string[]>([]);
@@ -62,7 +65,7 @@ export function CsvImportDialog({
 
   async function addFile(file: File) {
     if (!/\.(csv|txt)$/i.test(file.name)) { toast.error("Please choose a .csv file"); return; }
-    const parsed = parseTakeoffCsv(await file.text());
+    const parsed = parseTakeoffCsv(await file.text(), { defaultAccessory: accessoriesDefault });
     setRows((prev) => [...prev, ...parsed.rows.map((r) => ({ ...r, key: `c${++counter.current}`, status: "idle" as const }))]);
     setErrors((prev) => [...prev, ...parsed.errors]);
     setUnit(parsed.lengthUnit);
@@ -82,10 +85,10 @@ export function CsvImportDialog({
     }));
   }
 
-  function downloadTemplate() {
-    const url = URL.createObjectURL(new Blob([TAKEOFF_CSV_TEMPLATE], { type: "text/csv" }));
+  function downloadTemplate(accessories = false) {
+    const url = URL.createObjectURL(new Blob([accessories ? ACCESSORY_CSV_TEMPLATE : TAKEOFF_CSV_TEMPLATE], { type: "text/csv" }));
     const a = document.createElement("a");
-    a.href = url; a.download = "parts-template.csv"; a.click();
+    a.href = url; a.download = accessories ? "accessories-template.csv" : "parts-template.csv"; a.click();
     URL.revokeObjectURL(url);
   }
 
@@ -118,7 +121,7 @@ export function CsvImportDialog({
         <DialogHeader>
           <DialogTitle>Import parts from CSV</DialogTitle>
           <DialogDescription>
-            For hot-rolled sections and pipes. Needs at least length and qty columns; unknown columns are ignored. Plates come from DXF files.
+            For hot-rolled sections, pipes and accessories (bolts, nuts, washers). Needs a qty column, plus length for sections and pipes; accessories use unit and unit_weight_kg instead of length. Unknown columns are ignored. Plates come from DXF files.
           </DialogDescription>
         </DialogHeader>
 
@@ -134,9 +137,14 @@ export function CsvImportDialog({
         </div>
         <input ref={inputRef} type="file" accept=".csv,.txt,text/csv" className="hidden"
           onChange={(e) => { const f = e.target.files?.[0]; if (f) void addFile(f); e.target.value = ""; }} />
-        <button type="button" onClick={downloadTemplate} className="flex w-fit items-center gap-1.5 text-xs text-primary hover:underline">
-          <Download className="h-3.5 w-3.5" /> Download CSV template
-        </button>
+        <div className="flex flex-wrap gap-x-4 gap-y-1">
+          <button type="button" onClick={() => downloadTemplate(false)} className="flex w-fit items-center gap-1.5 text-xs text-primary hover:underline">
+            <Download className="h-3.5 w-3.5" /> Download CSV template
+          </button>
+          <button type="button" onClick={() => downloadTemplate(true)} className="flex w-fit items-center gap-1.5 text-xs text-primary hover:underline">
+            <Download className="h-3.5 w-3.5" /> Accessories template
+          </button>
+        </div>
 
         {errors.length > 0 && (
           <div className="space-y-0.5 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -193,6 +201,8 @@ export function CsvImportDialog({
                   <th className="w-20 px-2 py-1.5 font-medium">kg/m</th>
                   <th className="w-20 px-2 py-1.5 font-medium">OD (mm)</th>
                   <th className="w-20 px-2 py-1.5 font-medium">Thk (mm)</th>
+                  <th className="w-20 px-2 py-1.5 font-medium">Unit</th>
+                  <th className="w-24 px-2 py-1.5 font-medium">Unit wt (kg)</th>
                   <th className="px-2 py-1.5 font-medium">Material</th>
                   <th className="px-2 py-1.5 font-medium">Side</th>
                   <th className="px-2 py-1.5 font-medium">Paint</th>
@@ -204,6 +214,7 @@ export function CsvImportDialog({
                 {rows.map((r, i) => {
                   const locked = r.status === "done" || r.status === "importing";
                   const hr = r.partType === "HOT_ROLLED";
+                  const acc = r.partType === "ACCESSORY";
                   const cell = (k: keyof CsvPartRow, w: string, disabled = false, type = "text") => (
                     <Input disabled={locked || disabled} type={type} value={r[k]} onChange={(e) => patch(r.key, { [k]: e.target.value } as Partial<Row>)} className={`h-8 ${w}`} />
                   );
@@ -218,11 +229,13 @@ export function CsvImportDialog({
                           </Select>
                         </td>
                         <td className="px-2 py-1.5">{cell("profile", "w-[110px]", !hr)}</td>
-                        <td className="px-2 py-1.5">{cell("length", "", false, "number")}</td>
+                        <td className="px-2 py-1.5">{cell("length", "", acc, "number")}</td>
                         <td className="px-2 py-1.5">{cell("qty", "", false, "number")}</td>
-                        <td className="px-2 py-1.5">{cell("weightPerMeter", "", !hr, "number")}</td>
-                        <td className="px-2 py-1.5">{cell("od", "", hr, "number")}</td>
-                        <td className="px-2 py-1.5">{cell("thickness", "", hr, "number")}</td>
+                        <td className="px-2 py-1.5">{cell("weightPerMeter", "", !hr || acc, "number")}</td>
+                        <td className="px-2 py-1.5">{cell("od", "", hr || acc, "number")}</td>
+                        <td className="px-2 py-1.5">{cell("thickness", "", hr || acc, "number")}</td>
+                        <td className="px-2 py-1.5">{cell("unit", "", !acc)}</td>
+                        <td className="px-2 py-1.5">{cell("unitWeightKg", "", !acc, "number")}</td>
                         <td className="px-2 py-1.5">{cell("material", "w-[100px]")}</td>
                         <td className="px-2 py-1.5">
                           <Select disabled={locked} value={r.side} onValueChange={(v) => patch(r.key, { side: v as Row["side"] })}>
@@ -236,7 +249,7 @@ export function CsvImportDialog({
                             <SelectContent><SelectItem value="1">1 side</SelectItem><SelectItem value="2">2 sides</SelectItem></SelectContent>
                           </Select>
                         </td>
-                        <td className="px-2 py-1.5 text-right text-xs font-medium tabular-nums">{problems[i] === null && r.status !== "done" ? weightOf(r, unit, drawingId).toFixed(1) : "—"}</td>
+                        <td className="px-2 py-1.5 text-right text-xs font-medium tabular-nums">{problems[i] === null && r.status !== "done" ? weightOf(r, unit, drawingId).toFixed(acc ? 3 : 1) : "—"}</td>
                         <td className="px-1 py-1.5 text-center">
                           {r.status === "importing" ? <Loader2 className="mx-auto h-4 w-4 animate-spin text-muted-foreground" />
                             : r.status === "done" ? <CircleCheck className="mx-auto h-4 w-4 text-emerald-600" />
@@ -247,7 +260,7 @@ export function CsvImportDialog({
                       </tr>
                       {(r.status === "error" || problems[i]) && !locked && (
                         <tr className="border-b border-border">
-                          <td colSpan={13} className="px-2 pb-1.5 text-xs text-destructive">{r.status === "error" ? r.error : problems[i]}</td>
+                          <td colSpan={15} className="px-2 pb-1.5 text-xs text-destructive">{r.status === "error" ? r.error : problems[i]}</td>
                         </tr>
                       )}
                     </React.Fragment>

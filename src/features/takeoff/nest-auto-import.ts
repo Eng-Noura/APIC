@@ -1,4 +1,4 @@
-// Fills the Part List with every part of the project's saved 2D nest that is not in it yet (no button needed).
+// Fills the Part List with every part of the project's saved 2D nest and 1D nest that is not in it yet (no button needed).
 // Same path as the "Take parts from 2D Nesting" dialog: a one-part DXF per nest part goes through the DXF importer,
 // and the plate keeps the nest part id (nestPartId) so the two-way quantity sync and duplicate protection work.
 
@@ -47,4 +47,20 @@ export async function autoImportNestParts(projectId: string, drawings: TakeoffDr
     if (res?.ok && body?.results?.[0]?.ok) imported++; else failed++;
   }
   return { imported, failed };
+}
+
+export interface AutoImport1DResult { imported: number; failed: number; warnings: string[]; }
+
+/**
+ * The 1D counterpart: the server reads the project's saved 1D nest and turns every piece that is not in the Part List
+ * yet into a Profile / Pipe part of the drawing NESTING-1D (see nest-1d-import.service.ts). Safe to call repeatedly.
+ */
+export async function autoImportNestPieces(projectId: string): Promise<AutoImport1DResult> {
+  const none = { imported: 0, failed: 0, warnings: [] };
+  const res = await fetch("/api/takeoff/nest-1d-import", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId }),
+  }).catch(() => null);
+  if (!res?.ok) return none;
+  const body = (await res.json().catch(() => null)) as Partial<AutoImport1DResult> | null;
+  return { imported: body?.imported ?? 0, failed: body?.failed ?? 0, warnings: Array.isArray(body?.warnings) ? body.warnings : [] };
 }

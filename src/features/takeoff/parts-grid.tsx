@@ -56,7 +56,7 @@ function GroupChip({ text, title }: { text: string | null; title?: string }) {
 }
 
 export function PartsGrid({
-  drawingId, projectId, parts, canCreate, canDelete, onChanged, groupings = null, onGroupingsChanged,
+  drawingId, projectId, parts, canCreate, canDelete, onChanged, groupings = null, onGroupingsChanged, accessoriesDefault = false,
 }: {
   drawingId: string;
   projectId: string;
@@ -67,6 +67,8 @@ export function PartsGrid({
   /** the project's assemblies / scopes / work orders — used for the three group columns and the "Group as…" buttons */
   groupings?: GroupingsData | null;
   onGroupingsChanged?: () => void;
+  /** This drawing is the Accessories section (CSV rows default to Accessory). */
+  accessoriesDefault?: boolean;
 }) {
   const [groupKind, setGroupKind] = React.useState<GroupKind>("assembly");
   const [groupOpen, setGroupOpen] = React.useState(false);
@@ -389,7 +391,7 @@ export function PartsGrid({
             <Button size="sm" variant="ghost" onClick={() => setImportOpen(true)} title="Import DXF files — a sheet with several labelled parts is split into items">
               <FileUp className="h-3.5 w-3.5" /> Import DXF
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => setCsvOpen(true)} title="Import hot-rolled sections and pipes from a CSV file">
+            <Button size="sm" variant="ghost" onClick={() => setCsvOpen(true)} title="Import hot-rolled sections, pipes and accessories (bolts, nuts, washers) from a CSV file">
               <FileSpreadsheet className="h-3.5 w-3.5" /> Import CSV
             </Button>
           </div>
@@ -439,7 +441,7 @@ export function PartsGrid({
       )}
 
       {canCreate && (
-        <CsvImportDialog open={csvOpen} onOpenChange={setCsvOpen} drawingId={drawingId} nextItemNo={nextItemNo} onImported={onChanged} />
+        <CsvImportDialog open={csvOpen} onOpenChange={setCsvOpen} drawingId={drawingId} nextItemNo={nextItemNo} onImported={onChanged} accessoriesDefault={accessoriesDefault} />
       )}
 
       {canCreate && (
@@ -457,7 +459,11 @@ export function PartsGrid({
         open={!!deletingId}
         onOpenChange={(v) => !v && setDeletingId(null)}
         title="Are you sure you want to delete this item?"
-        description="This will remove this part from the drawing. This cannot be undone."
+        description={
+          parts.find((p) => p.id === deletingId)?.nestPartId != null
+            ? "This will remove this part from the drawing. It came from a nest, so it is added again while it is still in that nest — remove it from the nest too to get rid of it for good. This cannot be undone."
+            : "This will remove this part from the drawing. This cannot be undone."
+        }
         confirmLabel="Delete"
         loading={deleteLoading}
         onConfirm={handleDelete}

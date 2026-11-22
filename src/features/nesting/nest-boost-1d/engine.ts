@@ -30,6 +30,9 @@ export interface Piece1D {
   qty: number;
   /** Plate / hot rolled / pipe (missing = hot rolled). */
   partType?: PartType1D;
+  /** Id of the Part List part this piece was sent from. Such a piece stands for exactly that part (it is never merged
+   *  with another row), and Part List never takes it back as a new part. */
+  partId?: string;
   /** Set on the pieces made by splitting a part that is longer than every stock bar: "segment `index` of `total`". */
   segment?: { index: number; total: number; parentId: number; parentLength: number };
 }
@@ -136,10 +139,10 @@ export function lotKey(profile: string, material: string): string {
   return `${n(profile)}\u0000${n(material)}`;
 }
 
-/** Merges a manually entered piece into `pieces` (identical pieces share one row with a higher quantity). */
+/** Merges a manually entered piece into `pieces` (identical pieces — same name too — share one row with a higher quantity). */
 export function addPiece(
   pieces: Piece1D[],
-  input: { name: string; profile: string; material: string; length: number; qty: number; partType?: PartType1D },
+  input: { name: string; profile: string; material: string; length: number; qty: number; partType?: PartType1D; partId?: string },
   counters: Counters1D,
 ): Piece1D[] {
   const profile = input.profile.trim();
@@ -148,15 +151,22 @@ export function addPiece(
   const qty = Math.max(1, Math.round(input.qty || 1));
   const partType = input.partType ?? DEFAULT_PART_TYPE_1D;
   const out = pieces.slice();
-  const m = out.find(
+  // a piece with a name of its own is merged only into a piece with the SAME name: same profile / material / length but a
+  // different name stays a row of its own. A piece entered without a name is not "differently named", so it still merges.
+  const nm = (x: string) => x.trim().replace(/\s+/g, " ").toLowerCase();
+  const wantName = nm(input.name ?? "");
+  // a piece that stands for one Part List part keeps its own row (the link would be lost in a merge)
+  const m = input.partId ? undefined : out.find(
     (p) =>
+      !p.partId &&
+      (wantName === "" || nm(p.name) === wantName) &&
       p.profile === profile &&
       p.material === material &&
       (p.partType ?? DEFAULT_PART_TYPE_1D) === partType &&
       Math.abs(p.length - length) < 0.05,
   );
   if (m) out[out.indexOf(m)] = { ...m, qty: m.qty + qty };
-  else out.push({ id: counters.id++, sn: ++counters.sn, name: input.name || `Part #${counters.sn}`, profile, material, length, qty, partType });
+  else out.push({ id: counters.id++, sn: ++counters.sn, name: input.name || `Part #${counters.sn}`, profile, material, length, qty, partType, ...(input.partId ? { partId: input.partId } : {}) });
   return out;
 }
 

@@ -35,9 +35,9 @@ export function NumInput({ value, onChange, disabled, nullable, className, min =
 export function SourceBadge({ source }: { source: string }) {
   const tone: Record<string, string> = {
     NESTING: "bg-blue-50 text-blue-700", PART_LIST: "bg-emerald-50 text-emerald-700", PROCUREMENT: "bg-emerald-50 text-emerald-700",
-    MANUAL: "bg-slate-100 text-slate-600", DEFAULT: "bg-slate-100 text-slate-600",
+    SCRAP: "bg-amber-50 text-amber-700", STOCK: "bg-violet-50 text-violet-700", MANUAL: "bg-slate-100 text-slate-600", DEFAULT: "bg-slate-100 text-slate-600",
   };
-  const label: Record<string, string> = { NESTING: "From Nesting", PART_LIST: "From Part List", PROCUREMENT: "Procurement", MANUAL: "Manual", DEFAULT: "Default" };
+  const label: Record<string, string> = { NESTING: "From Nesting", PART_LIST: "From Part List", PROCUREMENT: "Procurement", SCRAP: "Scrap", STOCK: "Stock", MANUAL: "Manual", DEFAULT: "Default" };
   return <span className={cn("inline-flex whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-medium", tone[source] ?? tone.MANUAL)}>{label[source] ?? source}</span>;
 }
 
