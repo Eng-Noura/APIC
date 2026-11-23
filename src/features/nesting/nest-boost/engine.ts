@@ -1504,11 +1504,26 @@ function mask(S: Settings, rc: MaskCache, g: Group, rot: number): Mask {
   return m;
 }
 
+/** Free grid cells left on a sheet (kept next to the grid so a full sheet is rejected without scanning it). */
+const FREE = new WeakMap<Sheet, number>();
+function freeOf(sh: Sheet): number {
+  let f = FREE.get(sh);
+  if (f === undefined) {
+    const G = sh.grid as Uint8Array;
+    f = 0;
+    for (let i = 0; i < G.length; i++) if (!G[i]) f++;
+    FREE.set(sh, f);
+  }
+  return f;
+}
+
 function place(S: Settings, rc: MaskCache, sh: Sheet, g: Group, rots: number[]): Slot | null {
   let best: Slot | null = null;
+  const free = freeOf(sh);
   for (const rot of rots) {
     const m = mask(S, rc, g, rot);
     if (m.maxC - m.minC + 1 > S.GW || m.maxR - m.minR + 1 > S.GH) continue;
+    if (m.off.length > free) continue; // more cells than the sheet has left: it can't fit, skip the scan
     const G = sh.grid as Uint8Array;
     const o = m.off;
     // gx/gy are the mask box's origin; only the occupied cells (minC..maxC / minR..maxR) must
@@ -1541,7 +1556,9 @@ function place(S: Settings, rc: MaskCache, sh: Sheet, g: Group, rots: number[]):
 
 function commit(S: Settings, sh: Sheet, g: Group, b: Slot) {
   const b0 = b.gy * S.GW + b.gx;
+  const left = freeOf(sh); // counted before the cells are taken
   for (const k of b.m.off) (sh.grid as Uint8Array)[b0 + k] = 1;
+  FREE.set(sh, left - b.m.off.length);
   sh.used = Math.max(sh.used, b.sc);
   sh.items.push({ g, rot: b.rot, x: S.x0 + (b.gx + b.m.pad) * S.cell, y: S.x0 + (b.gy + b.m.pad) * S.cell });
 }
@@ -1587,22 +1604,43 @@ interface Seed {
   used: number;
 }
 
-async function attempt(S: Settings, rc: MaskCache, items: Group[], rots: number[], stop: () => boolean, seeds: Seed[] = [], maxSheets = Infinity) {
+async function attempt(
+  S: Settings, rc: MaskCache, items: Group[], rots: number[], stop: () => boolean, seeds: Seed[] = [], maxSheets = Infinity,
+  progress?: (done: number, total: number) => void,
+) {
   // seeded sheets come first (they are filled before any new sheet is opened); copies, so every attempt starts from the same state
   const sheets: Sheet[] = seeds.map((x) => ({ ...x.sh, items: x.sh.items.slice(), grid: x.grid.slice(), used: x.used }));
   const un: Group[] = [];
+  // A part that did not fit a sheet will never fit it later in this attempt (sheets only fill up), so the next copy of the
+  // same part skips that sheet without scanning it again. This is what keeps big quantities fast.
+  const failed = new Map<Sheet, Set<Group>>();
+  let last = performance.now();
+  /** Gives the browser a turn about every 40 ms (so the page stays alive and Stop works). */
+  const breathe = async (n: number) => {
+    const t = performance.now();
+    if (t - last < 40) return;
+    await tick();
+    last = performance.now();
+    progress?.(n, items.length);
+  };
   for (let n = 0; n < items.length; n++) {
     const g = items[n];
     let ok = false;
     for (const sh of sheets) {
+      const bad = failed.get(sh);
+      if (bad?.has(g)) continue;
       const b = place(S, rc, sh, g, rots);
       if (b) {
         commit(S, sh, g, b);
         ok = true;
         break;
       }
+      if (bad) bad.add(g);
+      else failed.set(sh, new Set([g]));
+      if (stop()) break;
+      await breathe(n);
     }
-    if (!ok) {
+    if (!ok && !stop()) {
       if (sheets.length - seeds.length >= maxSheets) un.push(g); // no more sheets of this source: the part waits for the next one
       else {
         const sh: Sheet = { grid: new Uint8Array(S.GW * S.GH), items: [], used: 0, th: 0, material: "" };
@@ -1612,9 +1650,12 @@ async function attempt(S: Settings, rc: MaskCache, items: Group[], rots: number[
           sheets.push(sh);
         } else un.push(g);
       }
+    } else if (!ok) un.push(g);
+    if (stop()) {
+      for (let r = n + 1; r < items.length; r++) un.push(items[r]); // stopped by the user: what is left is "not nested yet"
+      break;
     }
-    if (n % 2 === 0) await tick();
-    if (stop()) break;
+    await breathe(n);
   }
   const nNew = sheets.length - seeds.length;
   const sc = seeds.length
@@ -1819,11 +1860,12 @@ export async function runOptimize(groups: Group[], o: OptimizeOptions): Promise<
               rr = pick === 0 ? R : pick === 1 ? R.filter((a) => a % 90 === 0) : R.slice().sort(() => Math.random() - 0.5);
             }
           }
-          const r = await attempt(Ss, rc2, ord, rr, o.shouldStop, [], cap);
+          const r = await attempt(Ss, rc2, ord, rr, o.shouldStop, [], cap, (d, t) => o.onStatus(`${lbl} • iteration ${it + 1} • placing ${d}/${t} parts`));
           k++;
           it++;
           r.sheets.forEach(stamp);
-          if (!o.shouldStop() && (!best || r.sc < best.sc)) {
+          // after Stop, a finished attempt never replaces the best one, but if there is none yet the partial one is kept
+          if ((!o.shouldStop() || !best) && (!best || r.sc < best.sc)) {
             best = r;
             o.onBest(cur(best));
           }
@@ -1900,14 +1942,15 @@ export async function runOptimize(groups: Group[], o: OptimizeOptions): Promise<
           rr = pick === 0 ? R : pick === 1 ? R.filter((a) => a % 90 === 0) : R.slice().sort(() => Math.random() - 0.5);
         }
       }
-      const r = await attempt(S, rc, ord, rr, o.shouldStop, seeds);
+      const lbl0 = material ? `${material} • ${th || "?"} mm` : `${th || "?"} mm`;
+      const r = await attempt(S, rc, ord, rr, o.shouldStop, seeds, Infinity, (d, t) => o.onStatus(`${lbl0} • iteration ${it + 1} • placing ${d}/${t} parts`));
       k++;
       it++;
       r.sheets.forEach((x) => {
         x.th = th;
         x.material = material;
       });
-      if (!o.shouldStop() && (!best || r.sc < best.sc)) {
+      if ((!o.shouldStop() || !best) && (!best || r.sc < best.sc)) {
         best = r;
         o.onBest(cur(best, seedIdx));
       }

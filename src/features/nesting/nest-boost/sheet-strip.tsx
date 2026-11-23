@@ -38,6 +38,24 @@ export function SheetThumb({ sheet, S, version, w = 200, h = 64 }: { sheet: Shee
   return <canvas ref={ref} style={{ width: w, height: h }} />;
 }
 
+/** Material + thickness of a sheet as a clear label (amber when one of them is not set yet). */
+export function SheetLotBadge({ material, th, className = "" }: { material?: string; th?: number; className?: string }) {
+  const m = (material ?? "").trim();
+  const missing = !m || !th;
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-semibold leading-none ${
+        missing ? "border-amber-400/70 bg-amber-100/60 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300" : "border-primary/40 bg-primary/10 text-primary"
+      } ${className}`}
+      title={`Material: ${m || "not set"} • Thickness: ${th ? `${th} mm` : "not set"}`}
+    >
+      <span>{m || "no material"}</span>
+      <span aria-hidden>·</span>
+      <span className="tabular-nums">{th ? `${th} mm` : "? mm"}</span>
+    </span>
+  );
+}
+
 /**
  * TruTops-style sheet strip: one small card per sheet (picture, name, utilisation); click a card to open that
  * sheet below. The last tile adds a new empty sheet.
@@ -67,15 +85,16 @@ export function SheetStrip({
               on ? "border-primary bg-primary/10 ring-2 ring-primary" : "border-border bg-card hover:bg-muted"
             }`}
           >
-            <span className="flex items-center justify-between font-semibold">
+            <span className="flex items-center justify-between gap-1 font-semibold">
               <span>Sheet {i + 1}</span>
               <span className="tabular-nums font-normal text-muted-foreground">{st.utilization.toFixed(1)}%</span>
             </span>
+            <SheetLotBadge material={sh.material} th={sh.th} className="max-w-full self-start" />
             <span className="flex justify-center rounded border border-border/60 bg-white">
               <SheetThumb sheet={sh} S={S} version={version} />
             </span>
             <span className="truncate text-muted-foreground">
-              {sh.material ? `${sh.material} • ` : ""}{sh.th ? `${sh.th} mm • ` : ""}{Math.round(sh.W ?? S.W)} × {Math.round(sh.H ?? S.H)} • {st.parts} parts
+              {Math.round(sh.W ?? S.W)} × {Math.round(sh.H ?? S.H)} • {st.parts} parts
             </span>
           </button>
         );

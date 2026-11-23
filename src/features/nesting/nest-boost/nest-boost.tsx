@@ -1,7 +1,7 @@
 "use client";
 import * as React from "react";
 import { createPortal, flushSync } from "react-dom";
-import { ArrowDown, ArrowUp, Boxes, Check, ChevronDown, ChevronLeft, ChevronRight, Circle as CircleIcon, Copy, Download, Eye, FileSpreadsheet, FolderInput, Gauge, Info, Layers, Loader2, Maximize2, Minimize2, MoreVertical, PackageCheck, Plus, Recycle, Redo2, RotateCcw, Save, Scissors, Search, Shapes, Square, SlidersHorizontal, Trash2, Triangle as TriangleIcon, TriangleAlert, Undo2, Upload } from "lucide-react";
+import { ArrowDown, ArrowUp, Boxes, Check, ChevronDown, ChevronRight, Circle as CircleIcon, Copy, Download, Eye, FileSpreadsheet, FolderInput, Gauge, Info, Layers, Loader2, Maximize2, Minimize2, MoreVertical, PackageCheck, Plus, Recycle, Redo2, RotateCcw, Save, Scissors, Search, Shapes, Square, SlidersHorizontal, Trash2, Triangle as TriangleIcon, TriangleAlert, Undo2, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { useTakeoffProject } from "@/features/takeoff/project-context";
 import type { TakeoffDrawingRow } from "@/features/takeoff/types";
@@ -17,7 +17,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { angleClick, setAngleFeedback } from "./angle-feedback";
 import { canRedo, canUndo, record, redo, resetHistory, undo, type NestHistory } from "./history";
 import { cloneResult, SavedNestsCard, type NestCfg, type SavedNest } from "./saved-nests";
-import { SheetStrip } from "./sheet-strip";
+import { SheetLotBadge, SheetStrip } from "./sheet-strip";
 import { PartDetailsDialog } from "./part-details-dialog";
 import { remnantLines } from "./remnants";
 import { buildMaterialRequests, toMaterialPayload, type MaterialRequestLine, type RequestUnit } from "./material-requests";
@@ -291,48 +291,115 @@ function StripThumb({ g, w = 112, h = 76 }: { g: Group; w?: number; h?: number }
   return <canvas ref={ref} style={{ width: w, height: h }} />;
 }
 
+type UnFilter = { q: string; mat: string; th: string; part: string; follow: boolean };
+const EMPTY_UNFILTER: UnFilter = { q: "", mat: "", th: "", part: "", follow: false };
+
 /**
  * TruTops-style "parts not nested yet" strip: one card per part (name, picture, "left of total"),
- * horizontally scrollable, with a search box and sorting. Press a card and drag it onto the sheet.
+ * horizontally scrollable, with a search box, part / material / thickness filters and sorting. Press a card and drag it onto the sheet.
  */
 function UnplacedStrip({
-  items, running, onHold,
+  items, running, onHold, filter, onFilter, activeSheet,
 }: {
   items: { g: Group; n: number }[];
   running: boolean;
   onHold: (g: Group, e: React.PointerEvent) => void;
+  filter: UnFilter;
+  onFilter: (f: UnFilter) => void;
+  /** The sheet that is open (page) or full screen: "Follow sheet" shows only the parts that can go on it. */
+  activeSheet?: { material: string; th: number } | null;
 }) {
-  const [q, setQ] = React.useState("");
   const [sortBy, setSortBy] = React.useState<"name" | "left" | "size">("name");
   const [asc, setAsc] = React.useState(true);
+  const set = (patch: Partial<UnFilter>) => onFilter({ ...filter, ...patch });
+  // options come from what is still to place (a value that is gone simply stops filtering)
+  const matOpts = [...new Set(items.map((x) => x.g.material || ""))].sort((a, b) => a.localeCompare(b));
+  const thOpts = [...new Set(items.map((x) => x.g.th || 0))].sort((a, b) => a - b);
+  const partOpts = [...new Set(items.map((x) => x.g.name))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const follow = filter.follow && !!activeSheet;
+  const eMat = follow ? (activeSheet!.material || "__none__") : filter.mat === "__none__" ? (matOpts.includes("") ? "__none__" : "") : matOpts.includes(filter.mat) ? filter.mat : "";
+  const eTh = follow ? String(activeSheet!.th || 0) : thOpts.some((t) => String(t) === filter.th) ? filter.th : "";
+  const ePart = partOpts.includes(filter.part) ? filter.part : "";
+  const filtersOn = !!(filter.q.trim() || eMat || eTh || ePart);
   const list = React.useMemo(() => {
-    const needle = q.trim().toLowerCase();
-    const f = items.filter(({ g }) => !needle || `${g.name} #${snText(g)}`.toLowerCase().includes(needle));
+    const needle = filter.q.trim().toLowerCase();
+    const f = items.filter(
+      ({ g }) =>
+        (!needle || `${g.name} #${snText(g)}`.toLowerCase().includes(needle)) &&
+        (!eMat || (eMat === "__none__" ? !g.material : g.material === eMat)) &&
+        (!eTh || String(g.th || 0) === eTh) &&
+        (!ePart || g.name === ePart),
+    );
     const dir = asc ? 1 : -1;
     return [...f].sort((a, b) => {
       if (sortBy === "left") return (a.n - b.n) * dir || a.g.sn - b.g.sn;
       if (sortBy === "size") return (a.g.area - b.g.area) * dir || a.g.sn - b.g.sn;
       return a.g.name.localeCompare(b.g.name, undefined, { numeric: true, sensitivity: "base" }) * dir || a.g.sn - b.g.sn;
     });
-  }, [items, q, sortBy, asc]);
+  }, [items, filter.q, eMat, eTh, ePart, sortBy, asc]);
   const total = items.reduce((t, x) => t + x.n, 0);
+  const shown = list.reduce((t, x) => t + x.n, 0);
+  const selCls = "h-7 max-w-[11rem] rounded-md border border-input bg-card px-1 text-xs text-foreground disabled:opacity-60";
 
   return (
     <div className="mb-2 shrink-0 overflow-hidden rounded-lg border border-border bg-card">
       <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/40 px-2 py-1.5 text-xs">
         <span className="font-semibold">Parts not nested yet</span>
-        <span className="tabular-nums text-muted-foreground">{items.length} parts · {total} pcs</span>
+        <span className="tabular-nums text-muted-foreground">
+          {filtersOn ? `${list.length} of ${items.length} parts · ${shown} of ${total} pcs` : `${items.length} parts · ${total} pcs`}
+        </span>
         <div className="relative ml-2">
           <Search className="pointer-events-none absolute left-1.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
-            value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search part"
-            className="h-7 w-40 rounded-md border border-input bg-card pl-6 pr-6 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            value={filter.q} onChange={(e) => set({ q: e.target.value })} placeholder="Search part"
+            className="h-7 w-36 rounded-md border border-input bg-card pl-6 pr-6 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
-          {q && (
-            <button type="button" onClick={() => setQ("")} className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" title="Clear search">×</button>
+          {filter.q && (
+            <button type="button" onClick={() => set({ q: "" })} className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" title="Clear search">×</button>
           )}
         </div>
-        <label className="ml-1 flex items-center gap-1 text-muted-foreground">
+        <label className="flex items-center gap-1 text-muted-foreground">
+          Part
+          <select value={ePart} onChange={(e) => set({ part: e.target.value })} className={selCls}>
+            <option value="">All parts</option>
+            {partOpts.map((n) => (
+              <option key={n} value={n}>{n} ({items.filter((x) => x.g.name === n).length})</option>
+            ))}
+          </select>
+        </label>
+        <label className="flex items-center gap-1 text-muted-foreground">
+          Material
+          <select value={eMat} disabled={follow} onChange={(e) => set({ mat: e.target.value })} className={selCls}>
+            <option value="">All materials</option>
+            {matOpts.map((m) => (
+              <option key={m || "__none__"} value={m || "__none__"}>{m || "— none —"} ({items.filter((x) => (x.g.material || "") === m).length})</option>
+            ))}
+          </select>
+        </label>
+        <label className="flex items-center gap-1 text-muted-foreground">
+          Thickness
+          <select value={eTh} disabled={follow} onChange={(e) => set({ th: e.target.value })} className={selCls}>
+            <option value="">All thicknesses</option>
+            {thOpts.map((t) => (
+              <option key={t} value={String(t)}>{t ? `${t} mm` : "Unknown (?)"} ({items.filter((x) => (x.g.th || 0) === t).length})</option>
+            ))}
+          </select>
+        </label>
+        {activeSheet && (
+          <button
+            type="button" onClick={() => set({ follow: !filter.follow })}
+            className={`flex h-7 items-center gap-1 rounded-md border px-2 text-xs ${filter.follow ? "border-primary bg-primary text-primary-foreground" : "border-input bg-card hover:bg-muted"}`}
+            title="Show only the parts of the same material and thickness as the sheet that is open — it follows when you change sheet"
+          >
+            {filter.follow ? <Check className="h-3.5 w-3.5" /> : null} Follow sheet
+          </button>
+        )}
+        {filtersOn && !follow && (
+          <button type="button" onClick={() => onFilter({ ...EMPTY_UNFILTER, follow: filter.follow })} className="h-7 rounded-md border border-input bg-card px-2 text-xs hover:bg-muted">
+            Clear filters
+          </button>
+        )}
+        <label className="flex items-center gap-1 text-muted-foreground">
           Sort by
           <select
             value={sortBy} onChange={(e) => setSortBy(e.target.value as "name" | "left" | "size")}
@@ -353,18 +420,25 @@ function UnplacedStrip({
         <span className="ml-auto text-muted-foreground">Press a part, drag it onto the sheet and release (or click, then click on the sheet)</span>
       </div>
       <div className="flex gap-0 overflow-x-auto overflow-y-hidden [scrollbar-gutter:stable]">
-        {list.length === 0 && <div className="p-3 text-xs text-muted-foreground">No part matches “{q}”.</div>}
+        {list.length === 0 && (
+          <div className="p-3 text-xs text-muted-foreground">
+            {filtersOn ? "No part matches the filters." : "Nothing left to place."}
+          </div>
+        )}
         {list.map(({ g, n }) => (
           <button
             key={g.id}
             type="button"
             disabled={running}
             onPointerDown={(e) => onHold(g, e)}
-            title={`Part #${snText(g)} ${g.name} — ${n} of ${g.qty} left to nest`}
+            title={`Part #${snText(g)} ${g.name} — ${g.material || "no material"} • ${g.th ? `${g.th} mm` : "thickness ?"} — ${n} of ${g.qty} left to nest`}
             style={{ touchAction: "none" }}
             className="flex w-[128px] shrink-0 cursor-grab select-none flex-col items-stretch gap-0.5 border-r border-border px-2 pb-1.5 pt-1 text-left hover:bg-primary/10 active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-60"
           >
             <span className="truncate text-xs font-semibold">#{snText(g)} {g.name}</span>
+            <span className="truncate text-[10px] font-medium text-primary/80">
+              {g.material || "no material"} · {g.th ? `${g.th} mm` : "? mm"}
+            </span>
             <span className="text-[11px] tabular-nums text-muted-foreground">
               <span className="font-semibold text-primary">{n}</span> of {g.qty} left
             </span>
@@ -944,6 +1018,104 @@ const UNIT_SCALE: Record<string, number> = { in: 25.4, ft: 304.8, mm: 1, cm: 10,
  * Sheet cut-size field: you can type a whole number freely; it is applied (and clamped to what the parts need /
  * the stock sheet size) only on Enter or when the field loses focus. Esc cancels.
  */
+/** Full screen: type a sheet number and press Enter to jump straight to that sheet (no need to step with the arrows). */
+function SheetJump({ index, count, onGo }: { index: number; count: number; onGo: (i: number) => void }) {
+  const [draft, setDraft] = React.useState<string | null>(null);
+  const commit = () => {
+    const raw = draft;
+    setDraft(null);
+    if (raw === null || raw.trim() === "") return;
+    const v = Math.round(Number(raw));
+    if (!Number.isFinite(v) || v < 1 || v > count) {
+      toast.warning(`There is no sheet ${raw} — this nest has sheets 1 to ${count}`);
+      return;
+    }
+    if (v - 1 !== index) onGo(v - 1);
+  };
+  return (
+    <span className="inline-flex items-center gap-1" title="Type a sheet number and press Enter (← / → also switch sheets)">
+      Go to sheet
+      <Input
+        type="number" min={1} max={count} inputMode="numeric" className="h-7 w-16 px-1.5 text-center tabular-nums"
+        value={draft ?? String(index + 1)}
+        onFocus={(e) => e.target.select()}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          e.stopPropagation(); // typing must not reach the sheet shortcuts
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          else if (e.key === "Escape") {
+            setDraft(null);
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+      />
+      <span className="tabular-nums">/ {count}</span>
+    </span>
+  );
+}
+
+/** Full screen: add a new empty sheet of any material and thickness (suggestions come from the parts and sheets you have). */
+function FsAddSheet({
+  materials, thicknesses, defaults, disabled, onAdd,
+}: {
+  materials: string[];
+  thicknesses: number[];
+  defaults: { material: string; th: number };
+  disabled?: boolean;
+  onAdd: (th: number, material: string) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [mat, setMat] = React.useState("");
+  const [th, setTh] = React.useState("");
+  const uid = React.useId();
+  const start = () => {
+    setMat(defaults.material);
+    setTh(defaults.th ? String(defaults.th) : "");
+    setOpen(true);
+  };
+  const submit = () => {
+    const t = th.trim() === "" ? 0 : Number(th.replace(",", "."));
+    if (!Number.isFinite(t) || t < 0) {
+      toast.warning("Thickness must be a number in mm");
+      return;
+    }
+    const typed = mat.trim();
+    // same material in another letter case is the same material (parts and sheets are matched by exact text)
+    const material = materials.find((m) => m.toLowerCase() === typed.toLowerCase()) ?? typed;
+    onAdd(t, material);
+    setOpen(false);
+  };
+  if (!open)
+    return (
+      <Button variant="outline" size="sm" className="h-7" disabled={disabled} onClick={start} title="Add an empty sheet of a chosen material and thickness">
+        <Plus /> Add sheet
+      </Button>
+    );
+  const onKey = (e: React.KeyboardEvent) => {
+    e.stopPropagation();
+    if (e.key === "Enter") submit();
+    else if (e.key === "Escape") setOpen(false);
+  };
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1 rounded-md border border-primary/40 bg-primary/5 px-1.5 py-0.5">
+      <span className="font-semibold text-foreground">New sheet</span>
+      <Input
+        autoFocus list={`${uid}-mat`} placeholder="Material (e.g. S235)" className="h-7 w-36" value={mat}
+        onChange={(e) => setMat(e.target.value)} onKeyDown={onKey}
+      />
+      <datalist id={`${uid}-mat`}>{materials.filter(Boolean).map((m) => <option key={m} value={m} />)}</datalist>
+      <Input
+        type="number" min={0} step="any" inputMode="decimal" list={`${uid}-th`} placeholder="mm" className="h-7 w-20" value={th}
+        onChange={(e) => setTh(e.target.value)} onKeyDown={onKey}
+      />
+      <datalist id={`${uid}-th`}>{thicknesses.filter((t) => t > 0).map((t) => <option key={t} value={t} />)}</datalist>
+      <Button size="sm" className="h-7" onClick={submit}><Plus /> Add</Button>
+      <Button variant="ghost" size="sm" className="h-7" onClick={() => setOpen(false)}>Cancel</Button>
+    </span>
+  );
+}
+
 function CutSizeInput({ value, max, onCommit }: { value: number; max: number; onCommit: (v: number) => void }) {
   const [draft, setDraft] = React.useState<string | null>(null);
   const commit = () => {
@@ -1262,6 +1434,8 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
   // ---- manual nesting: which material/thickness the "Add empty sheet" button uses,
   // whether the mouse button is still down after pressing a part in the list, and where to draw the floating part.
   const [lotSel, setLotSel] = React.useState("");
+  // filters of the "Parts not nested yet" strip (shared by the page and the full-screen view)
+  const [unF, setUnF] = React.useState<UnFilter>(EMPTY_UNFILTER);
   const dragRef = React.useRef(false);
   const [ghostPos, setGhostPos] = React.useState({ x: -999, y: -999 });
   const resultRef = React.useRef<OptResult | null>(null);
@@ -1375,6 +1549,8 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
     // Esc leaves fullscreen only when it isn't already cancelling a held part / selection
     const onKey = (e: KeyboardEvent) => {
       if (selRef.current || multiRef.current) return; // then the keys belong to the held part / selection
+      // typing in a field (sheet number, new sheet, cut size ...): Esc belongs to the field, not to full screen
+      if ((e.target as HTMLElement | null)?.closest?.("input,textarea,select")) return;
       if (e.key === "Escape") {
         setFsIdx(null);
         return;
@@ -1998,20 +2174,27 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
     toast.success(`Edge margin ${mg} mm, part spacing ${gp} mm applied`);
   }
 
-  /** Adds an empty sheet for the chosen material / thickness. */
-  function addSheet() {
-    const lot = lots.find((l) => l.key === lotKey);
-    if (!lot || running) return;
+  /** Adds an empty sheet of the given thickness / material; returns its index (null when it could not be added). */
+  function addSheetWith(th: number, material: string): number | null {
+    if (running) return null;
     const S = resS ?? readSettings();
     if (!S) {
       toast.error("Check the sheet settings (length, width, margin, spacing).");
-      return;
+      return null;
     }
     const res = manualResult(S);
-    res.sheets.push(newSheet(lot.th, lot.material));
+    res.sheets.push(newSheet(th, material));
     res.manual = true;
     syncUnplaced(res, groupsRef.current);
     bump();
+    return res.sheets.length - 1;
+  }
+
+  /** Adds an empty sheet for the chosen material / thickness. */
+  function addSheet() {
+    const lot = lots.find((l) => l.key === lotKey);
+    if (!lot) return;
+    addSheetWith(lot.th, lot.material);
   }
 
   /** Empties a sheet: every part on it goes back to the list (its "left" count goes up); the sheet itself stays. */
@@ -3052,7 +3235,10 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
             </div>
           )}
           {!!result && fs === null && stillToPlace.length > 0 && (
-            <UnplacedStrip items={stillToPlace} running={running} onHold={holdFromList} />
+            <UnplacedStrip
+              items={stillToPlace} running={running} onHold={holdFromList} filter={unF} onFilter={setUnF}
+              activeSheet={result.sheets[act] ? { material: result.sheets[act].material || "", th: result.sheets[act].th || 0 } : null}
+            />
           )}
           {/* fixed-height slot: the selection / held-part bar appears here without pushing the sheets down */}
           {actionBar}
@@ -3095,9 +3281,10 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
                 const node = (
                   <div key={i} id={`nest-sheet-${i}`} className={fs === i ? "fixed inset-0 z-[45] flex h-dvh flex-col overflow-hidden bg-background p-3" : undefined}>
                     <div className="mb-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                      <span>
-                        <b className="text-foreground">Sheet {i + 1}</b> — {sh.material ? `${sh.material} • ` : ""}{sh.th ? `${sh.th} mm plate • ` : ""}
-                        {st.parts} parts • utilization {st.utilization.toFixed(1)}%
+                      <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <b className="text-sm text-foreground">Sheet {i + 1}</b>
+                        <SheetLotBadge material={sh.material} th={sh.th} />
+                        <span>{st.parts} parts • utilization {st.utilization.toFixed(1)}%</span>
                       </span>
                       <span className="flex items-center gap-1">
                         Cut size
@@ -3188,19 +3375,30 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
                           Reset to full sheet
                         </Button>
                       )}
-                      {fs === i && result.sheets.length > 1 && (
-                        <span className="ml-auto inline-flex items-center gap-1">
-                          <Button variant="outline" size="sm" className="h-7 px-2" disabled={i === 0} title="Previous sheet (← / ↑)" onClick={() => setFsIdx(i - 1)}>
-                            <ChevronLeft />
-                          </Button>
-                          <span className="tabular-nums">{i + 1} / {result.sheets.length}</span>
-                          <Button variant="outline" size="sm" className="h-7 px-2" disabled={i === result.sheets.length - 1} title="Next sheet (→ / ↓)" onClick={() => setFsIdx(i + 1)}>
-                            <ChevronRight />
-                          </Button>
+                      {fs === i && (
+                        <span className="ml-auto inline-flex flex-wrap items-center gap-2">
+                          {result.sheets.length > 1 && (
+                            <SheetJump index={i} count={result.sheets.length} onGo={(n) => setFsIdx(n)} />
+                          )}
+                          <FsAddSheet
+                            materials={[...new Set([...groups.map((g) => g.material || ""), ...result.sheets.map((x) => x.material || "")])].filter(Boolean).sort((a, b) => a.localeCompare(b))}
+                            thicknesses={[...new Set([...groups.map((g) => g.th || 0), ...result.sheets.map((x) => x.th || 0)])].sort((a, b) => a - b)}
+                            defaults={{ material: sh.material || "", th: sh.th || 0 }}
+                            disabled={running || !!held}
+                            onAdd={(th, material) => {
+                              const n = addSheetWith(th, material);
+                              if (n === null) return;
+                              setFsIdx(n);
+                              setActiveSheet(n);
+                              toast.success(`Sheet ${n + 1} added — ${material || "no material"} • ${th ? `${th} mm` : "thickness ?"}`);
+                              if (!groups.some((g) => (g.th || 0) === th && (g.material || "") === material))
+                                toast.info("No part has this material / thickness yet — set it on a part to place it here");
+                            }}
+                          />
                         </span>
                       )}
                       <Button
-                        variant="ghost" size="sm" className={fs === i && result.sheets.length > 1 ? "h-7" : "ml-auto h-7"}
+                        variant="ghost" size="sm" className={fs === i ? "h-7" : "ml-auto h-7"}
                         title={fs === i ? "Back to the page (Esc)" : "Fill the whole window with this sheet"}
                         onClick={() => setFsIdx(fs === i ? null : i)}
                       >
@@ -3209,7 +3407,10 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
                     </div>
                     {fs === i && <div className="mb-2 shrink-0">{actionBar}</div>}
                     {fs === i && stillToPlace.length > 0 && (
-                      <UnplacedStrip items={stillToPlace} running={running} onHold={holdFromList} />
+                      <UnplacedStrip
+                        items={stillToPlace} running={running} onHold={holdFromList} filter={unF} onFilter={setUnF}
+                        activeSheet={{ material: sh.material || "", th: sh.th || 0 }}
+                      />
                     )}
                     <div
                       ref={fs === i ? fsBoxRef : undefined}
