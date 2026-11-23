@@ -291,6 +291,29 @@ function StripThumb({ g, w = 112, h = 76 }: { g: Group; w?: number; h?: number }
   return <canvas ref={ref} style={{ width: w, height: h }} />;
 }
 
+/**
+ * A sheet always carries the material / thickness of the parts that are on it (the current values from the parts list,
+ * so editing a part's material afterwards is followed too). Sheets without parts, or whose parts disagree, are left as they are.
+ * Returns true when something changed.
+ */
+function syncSheetLots(r: OptResult | null, groups: Group[]): boolean {
+  if (!r) return false;
+  const byId = new Map(groups.map((g) => [g.id, g]));
+  let changed = false;
+  for (const sh of r.sheets) {
+    if (!sh.items.length) continue;
+    const lots = new Set(sh.items.map((it) => { const g = byId.get(it.g.id) ?? it.g; return `${g.th || 0}\u0000${g.material || ""}`; }));
+    if (lots.size !== 1) continue;
+    const g0 = byId.get(sh.items[0].g.id) ?? sh.items[0].g;
+    if ((sh.th || 0) !== (g0.th || 0) || (sh.material || "") !== (g0.material || "")) {
+      sh.th = g0.th || 0;
+      sh.material = g0.material || "";
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 type UnFilter = { q: string; mat: string; th: string; part: string; follow: boolean };
 const EMPTY_UNFILTER: UnFilter = { q: "", mat: "", th: "", part: "", follow: false };
 
@@ -488,6 +511,8 @@ function GhostPart({ selRef, version, init }: { selRef: React.MutableRefObject<S
 }
 
 interface SheetCanvasProps {
+  /** Current material / thickness of a part (from the parts list). */
+  lotOf?: (g: Group) => { material: string; th: number };
   sheet: Sheet;
   index: number;
   S: Settings;
@@ -533,12 +558,12 @@ const MAX_ZOOM = 12;
 const MAX_SIDE_PX = 16000;
 const MAX_AREA_PX = 28e6;
 
-function SheetCanvas({ sheet, index, S, width, selRef, version, heldIdx, dragRef, multiRef, selectMode, fullscreen, onChange }: SheetCanvasProps) {
+function SheetCanvas({ sheet, index, S, width, selRef, version, heldIdx, dragRef, multiRef, selectMode, fullscreen, lotOf, onChange }: SheetCanvasProps) {
   const ref = React.useRef<HTMLCanvasElement>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
   // --- hover readout + measure tool ---------------------------------------------------------------
-  type HoverInfo = { sn: string; name: string; w: number; h: number; rot: number; area: number };
+  type HoverInfo = { sn: string; name: string; mat: string; th: number; w: number; h: number; rot: number; area: number };
   const [hover, setHover] = React.useState<HoverInfo | null>(null);
   const [measureOn, setMeasureOn] = React.useState(false);
   const measureRef = React.useRef<{ a: Pt; b: Pt; done: boolean } | null>(null);
@@ -911,8 +936,9 @@ function SheetCanvas({ sheet, index, S, width, selRef, version, heldIdx, dragRef
               if (!it) setHover(null);
               else {
                 const b = bbox(sides(it).o);
-                const next = { sn: snText(it.g), name: it.g.name, w: b[2] - b[0], h: b[3] - b[1], rot: it.rot, area: it.g.area };
-                setHover((p) => (p && p.sn === next.sn && Math.abs(p.w - next.w) < 1e-6 && Math.abs(p.h - next.h) < 1e-6 && p.rot === next.rot ? p : next));
+                const f = lotOf ? lotOf(it.g) : { material: it.g.material || "", th: it.g.th || 0 };
+                const next = { sn: snText(it.g), name: it.g.name, mat: f.material || "", th: f.th || 0, w: b[2] - b[0], h: b[3] - b[1], rot: it.rot, area: it.g.area };
+                setHover((p) => (p && p.sn === next.sn && p.mat === next.mat && p.th === next.th && Math.abs(p.w - next.w) < 1e-6 && Math.abs(p.h - next.h) < 1e-6 && p.rot === next.rot ? p : next));
               }
             }
           } else setHover(null);
@@ -999,6 +1025,7 @@ function SheetCanvas({ sheet, index, S, width, selRef, version, heldIdx, dragRef
         <>
           <span className="font-semibold text-foreground">#{hover.sn}</span>
           <span className="truncate">{hover.name}</span>
+          <SheetLotBadge material={hover.mat} th={hover.th} />
           <span>{hover.w.toFixed(1)} × {hover.h.toFixed(1)} mm</span>
           {hover.rot % 360 !== 0 && <span>rot {Math.round(hover.rot * 10) / 10}°</span>}
           <span>area {Math.round(hover.area).toLocaleString()} mm²</span>
@@ -1473,10 +1500,16 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
   const [width, setWidth] = React.useState(600);
   // What is currently picked up — mirrored into state so the UI can render it
   // (the live selection itself stays in selRef because it is mutated per mouse move).
-  const [held, setHeld] = React.useState<{ idx: number; sn: string; name: string; bad: boolean; fresh: boolean; ghost: boolean } | null>(null);
+  const [held, setHeld] = React.useState<{ idx: number; sn: string; name: string; mat: string; th: number; bad: boolean; fresh: boolean; ghost: boolean } | null>(null);
+  /** Current material / thickness of a part (the parts list is the source; a placed copy may be older). */
+  const lotOfPart = (g: Group) => {
+    const f = groupsRef.current.find((x) => x.id === g.id) ?? g;
+    return { material: f.material || "", th: f.th || 0 };
+  };
   const bump = React.useCallback(() => {
     // nothing in hand any more: refresh what is still left to place after a manual change
     const r = resultRef.current;
+    syncSheetLots(r, groupsRef.current); // the sheet's material / thickness = those of the parts on it
     // drop selected parts that are no longer on their sheet (removed, cleared, new result...)
     const ms = multiRef.current;
     if (ms) {
@@ -1502,11 +1535,11 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
     setVersion((v) => v + 1);
     const s = selRef.current;
     const next = s
-      ? { idx: s.idx, sn: snText(s.it.g), name: s.it.g.name, bad: !!s.bad, fresh: !!s.fresh, ghost: inGhost(s) }
+      ? { idx: s.idx, sn: snText(s.it.g), name: s.it.g.name, mat: lotOfPart(s.it.g).material, th: lotOfPart(s.it.g).th, bad: !!s.bad, fresh: !!s.fresh, ghost: inGhost(s) }
       : null;
     // keep the same object when nothing changed so mouse moves don't re-render the whole page
     setHeld((p) =>
-      p && next && p.idx === next.idx && p.sn === next.sn && p.bad === next.bad && p.fresh === next.fresh && p.ghost === next.ghost ? p : next,
+      p && next && p.idx === next.idx && p.sn === next.sn && p.mat === next.mat && p.th === next.th && p.bad === next.bad && p.fresh === next.fresh && p.ghost === next.ghost ? p : next,
     );
   }, []);
 
@@ -1839,6 +1872,7 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
   const updateGroup = (id: number, patch: Partial<Group>) => {
     // a segmented original passes quantity / thickness / material on to its pieces; a piece follows its original
     setG(patchGroup(groupsRef.current, id, patch));
+    if (syncSheetLots(resultRef.current, groupsRef.current)) setVersion((v) => v + 1); // sheets follow the part's new material / thickness
     if (resultRef.current?.manual) bump(); // quantity changed: what is left to place changes too
   };
 
@@ -2793,6 +2827,10 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
                     ? `Part #${held.sn} overlaps something (red) — move it to a free spot to place it, or press Esc to cancel`
                     : `Holding: Part #${held.sn} (${held.name}) — move the mouse, scroll to rotate, click to place`}
               </span>
+              <span className="inline-flex items-center gap-1.5">
+                <b className="text-xs">#{held.sn} {held.name}</b>
+                <SheetLotBadge material={held.mat} th={held.th} />
+              </span>
             </div>
           )}
           </div>
@@ -3416,7 +3454,7 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
                       ref={fs === i ? fsBoxRef : undefined}
                       className={fs === i ? "min-h-0 flex-1 overflow-auto [scrollbar-gutter:stable]" : undefined}
                     >
-                      <SheetCanvas sheet={sh} index={i} S={resS} width={fs === i ? fsWidth : width} selRef={selRef} version={version} heldIdx={held ? held.idx : null} dragRef={dragRef} multiRef={multiRef} selectMode={selectMode} fullscreen={fs === i} onChange={bump} />
+                      <SheetCanvas sheet={sh} index={i} S={resS} width={fs === i ? fsWidth : width} selRef={selRef} version={version} heldIdx={held ? held.idx : null} dragRef={dragRef} multiRef={multiRef} selectMode={selectMode} fullscreen={fs === i} lotOf={lotOfPart} onChange={bump} />
                     </div>
                   </div>
                 );
