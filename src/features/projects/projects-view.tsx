@@ -2,7 +2,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { ColumnDef } from "@tanstack/react-table";
-import { Plus, MoreHorizontal, Pencil, Trash2, Eye, FolderKanban, Mail, Phone } from "lucide-react";
+import { Plus, MoreHorizontal, Pencil, Trash2, Eye, FolderKanban, Mail, Phone, Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/shared/data-table";
 import { SearchBar } from "@/components/shared/search-bar";
@@ -17,6 +17,8 @@ import {
 import { formatDate } from "@/lib/utils";
 import { ProjectForm } from "./project-form";
 import type { ProjectRow, CustomerOption } from "./types";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { toast } from "sonner";
 
 const TENDER_STATUS_OPTIONS = ["UNDER_STUDY", "SUBMITTED", "APOLOGIZED", "CANCELLED"].map((s) => ({
@@ -50,6 +52,9 @@ export function ProjectsView({ canCreate, canEdit, canDelete }: { canCreate: boo
   const [editing, setEditing] = React.useState<ProjectRow | null>(null);
   const [deleting, setDeleting] = React.useState<ProjectRow | null>(null);
   const [deleteLoading, setDeleteLoading] = React.useState(false);
+  const [duplicating, setDuplicating] = React.useState<ProjectRow | null>(null);
+  const [dupName, setDupName] = React.useState("");
+  const [dupLoading, setDupLoading] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -82,6 +87,21 @@ export function ProjectsView({ canCreate, canEdit, canDelete }: { canCreate: boo
     if (!res.ok) { toast.error("Failed to delete project"); return; }
     toast.success("Project deleted");
     setDeleting(null);
+    load();
+  }
+
+  async function handleDuplicate() {
+    if (!duplicating || dupName.trim().length < 2) return;
+    setDupLoading(true);
+    const res = await fetch(`/api/projects/${duplicating.id}/duplicate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: dupName.trim() }),
+    });
+    setDupLoading(false);
+    if (!res.ok) { toast.error("Failed to duplicate project"); return; }
+    toast.success("Project duplicated");
+    setDuplicating(null);
     load();
   }
 
@@ -121,6 +141,11 @@ export function ProjectsView({ canCreate, canEdit, canDelete }: { canCreate: boo
             {canEdit && (
               <DropdownMenuItem onClick={() => { setEditing(row.original); setFormOpen(true); }}>
                 <Pencil className="h-4 w-4" /> Edit
+              </DropdownMenuItem>
+            )}
+            {canCreate && (
+              <DropdownMenuItem onClick={() => { setDuplicating(row.original); setDupName(`${row.original.name} (copy)`); }}>
+                <Copy className="h-4 w-4" /> Duplicate
               </DropdownMenuItem>
             )}
             {canDelete && (
@@ -172,6 +197,20 @@ export function ProjectsView({ canCreate, canEdit, canDelete }: { canCreate: boo
       )}
 
       <ProjectForm open={formOpen} onOpenChange={setFormOpen} customers={customers} project={editing} onSaved={load} defaultStage={tab} />
+      <Dialog open={!!duplicating} onOpenChange={(v) => !v && setDuplicating(null)}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>Duplicate project</DialogTitle></DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Creates an independent copy of &quot;{duplicating?.name}&quot; (nesting, take-off, groups, scope). Changes in one never affect the other.
+          </p>
+          <Input value={dupName} onChange={(e) => setDupName(e.target.value)} placeholder="New project name" autoFocus
+            onKeyDown={(e) => { if (e.key === "Enter") handleDuplicate(); }} />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDuplicating(null)}>Cancel</Button>
+            <Button onClick={handleDuplicate} disabled={dupLoading || dupName.trim().length < 2}>{dupLoading ? "Duplicating…" : "Duplicate"}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <ConfirmDialog
         open={!!deleting}
         onOpenChange={(v) => !v && setDeleting(null)}
