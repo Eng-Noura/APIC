@@ -1,6 +1,6 @@
 "use client";
 import * as React from "react";
-import { Plus, Trash2, Ruler, FolderKanban, Layers, Filter, X, PackagePlus, RefreshCw, FileSpreadsheet, FileText } from "lucide-react";
+import { Plus, Trash2, History, Ruler, FolderKanban, Layers, Filter, X, PackagePlus, RefreshCw, FileSpreadsheet, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -11,6 +11,8 @@ import { NestingImportDialog } from "./nesting-import-dialog";
 import { Nesting1DImportDialog } from "./nesting-import-1d-dialog";
 import { PartsGrid } from "./parts-grid";
 import { BoqPanel } from "./boq-panel";
+import { TrashDialog } from "./trash-dialog";
+import { ActivityDialog } from "./activity-dialog";
 import { GroupingsPanel } from "./groupings-panel";
 import type { GroupingsData } from "@/server/services/part-grouping.service";
 import { sideAreas } from "./side-areas";
@@ -50,6 +52,8 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
   // same for "Take parts from 1D Nesting"
   const [nestImport1D, setNestImport1D] = React.useState({ open: false, key: 0 });
   const [deletingDrawing, setDeletingDrawing] = React.useState<TakeoffDrawingRow | null>(null);
+  const [trashOpen, setTrashOpen] = React.useState(false);
+  const [activityOpen, setActivityOpen] = React.useState(false);
   const [deleteLoading, setDeleteLoading] = React.useState(false);
 
   // The project's assemblies / scopes / work orders: feeds the three group columns, the "Group as…" window and the panel.
@@ -287,6 +291,12 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
           >
             <PackagePlus className="h-4 w-4" /> Take parts from 1D Nesting
           </Button>
+          <Button variant="outline" onClick={() => setActivityOpen(true)} disabled={!projectId} title="Who added, changed or deleted what in this Part List, and when">
+            <History className="h-4 w-4" /> Activity
+          </Button>
+          <Button variant="outline" onClick={() => setTrashOpen(true)} disabled={!projectId} title="Deleted parts are kept for 30 days — restore one from here">
+            <Trash2 className="h-4 w-4" /> Trash
+          </Button>
           {!drawings.some((d) => d.drawingNumber === ACCESSORIES_DRAWING) && (
             <Button
               variant="outline"
@@ -457,7 +467,8 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
                       </p>
                     </div>
                   </div>
-                  {canDelete && (
+                  {/* the drawings that hold the nests' parts (NESTING / NESTING-1D) are not deleted as a whole: remove parts one by one */}
+                  {canDelete && !drawing.parts.some((p) => p.nestKind) && (
                     <Button size="icon" variant="ghost" onClick={() => setDeletingDrawing(drawing)}>
                       <Trash2 className="h-4 w-4 text-destructive" />
                     </Button>
@@ -520,11 +531,16 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
         />
       )}
 
+      {projectId && <ActivityDialog open={activityOpen} onOpenChange={setActivityOpen} projectId={projectId} />}
+      {projectId && <TrashDialog open={trashOpen} onOpenChange={setTrashOpen} projectId={projectId} onRestored={() => loadDrawings(projectId)} />}
+
       <ConfirmDialog
         open={!!deletingDrawing}
         onOpenChange={(v) => !v && setDeletingDrawing(null)}
-        title="Delete drawing?"
-        description={`This will remove "${deletingDrawing?.drawingNumber}" and all its parts. This cannot be undone.`}
+        title={`Delete drawing "${deletingDrawing?.drawingNumber ?? ""}"?`}
+        items={deletingDrawing?.parts.map((p) => p.description)}
+        requireText={deletingDrawing?.drawingNumber}
+        description={`This will remove "${deletingDrawing?.drawingNumber}" and all its parts, also from the 2D / 1D nests they are in. Unlike a single part, a deleted drawing is NOT kept in the Trash — this cannot be undone.`}
         confirmLabel="Delete"
         loading={deleteLoading}
         onConfirm={handleDeleteDrawing}

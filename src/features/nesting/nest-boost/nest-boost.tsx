@@ -1399,6 +1399,9 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
   // Takeoff part ids already imported into this session, so pressing
   // "Import" twice never doubles the quantities.
   const importedIds = React.useRef<Set<string>>(new Set());
+  // Parts removed here: the server deletes them from the Part List too (one part = one thing). Sent with the next save.
+  const removedIds = React.useRef<number[]>([]);
+  const removedSent = React.useRef(0);
   const [groups, setGroups] = React.useState<Group[]>([]);
   const groupsRef = React.useRef<Group[]>([]);
   const counters = React.useRef<Counters>({ id: 0, sn: 0 });
@@ -2092,6 +2095,7 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
     if (!ids.length) return;
     const drop = new Set(ids);
     const gone = groupsRef.current.filter((x) => drop.has(x.id));
+    removedIds.current.push(...ids);
     setG(groupsRef.current.filter((x) => !drop.has(x.id)));
     setChecked(new Set());
     clearResults();
@@ -2146,6 +2150,7 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
   };
 
   const resetAll = () => {
+    removedIds.current.push(...groupsRef.current.map((x) => x.id));
     setG([]);
     setChecked(new Set());
     importedIds.current = new Set();
@@ -2471,8 +2476,12 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
       encodeSnapshot({
         cfg, units, groups: groupsRef.current, counters: counters.current, savedSeq: savedSeq.current,
         importedIds: importedIds.current, result: resultRef.current, resS, savedNests, activeNestId,
+        removedIds: (removedSent.current = removedIds.current.length, [...removedIds.current]),
       }),
+    onSaved: () => { removedIds.current.splice(0, removedSent.current); removedSent.current = 0; },
     restore: (data) => {
+      removedIds.current = []; // what the server sent is the truth: a removal that never reached it is not carried over
+      removedSent.current = 0;
       runRef.current++;
       stopRef.current = true;
       selRef.current = null;
@@ -4184,8 +4193,8 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
         }
         description={
           pendingRemove?.some((id) => groups.find((x) => x.id === id)?.seg?.role === "parent")
-            ? "A segmented part is removed together with its pieces. The nesting result will be cleared and you'll need to press Optimize again."
-            : "The nesting result will be cleared and you'll need to press Optimize again."
+            ? "A segmented part is removed together with its pieces. It is also removed from the Part List. The nesting result will be cleared and you'll need to press Optimize again."
+            : "It is also removed from the Part List. The nesting result will be cleared and you'll need to press Optimize again."
         }
         confirmLabel="Remove"
         onConfirm={() => {
@@ -4527,7 +4536,7 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
         open={confirmReset}
         onOpenChange={setConfirmReset}
         title="Reset all parts?"
-        description="This removes every imported part and the current nesting result."
+        description="This removes every imported part (from the Part List too) and the current nesting result."
         confirmLabel="Reset all"
         onConfirm={resetAll}
       />

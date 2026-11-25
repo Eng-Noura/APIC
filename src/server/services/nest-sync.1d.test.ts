@@ -29,7 +29,11 @@ vi.mock("@/server/db/client", () => ({
     $transaction: async (ops: Promise<unknown>[]) => Promise.all(ops),
   },
 }));
-vi.mock("./activity-log.service", () => ({ logActivity: async () => undefined }));
+const partEvents: { userId: string; projectId: string | null; events: { partId: string; detail: string }[] }[] = [];
+vi.mock("./activity-log.service", () => ({
+  logActivity: async () => undefined,
+  logPartEvents: async (userId: string, projectId: string | null, events: { partId: string; detail: string }[]) => { partEvents.push({ userId, projectId, events }); },
+}));
 
 import { applyNestSync, getNestSyncStatus } from "./nest-sync.service";
 
@@ -41,6 +45,7 @@ const piece = (id: number, qty: number, over: Record<string, unknown> = {}) => (
 const nest1d = () => db.ws["1D"]!.dataJson as { pieces: { id: number; qty: number }[]; result: unknown };
 
 beforeEach(() => {
+  partEvents.length = 0;
   db.parts = [part()];
   db.ws = { "1D": { dataJson: { v: 1, pieces: [piece(1, 4)], result: { bars: 1 }, resS: {} }, version: 3 }, "2D": null };
   db.drawings = [];
@@ -54,6 +59,11 @@ describe("1D nest <-> BOQ quantity sync", () => {
     expect(db.parts[0]).toMatchObject({ qty: 6, nestSyncedQty: 6 });
     expect(db.parts[0].weightKg).toBeCloseTo(6 * 3 * 22.4, 6);
     expect(db.ws["1D"]!.version).toBe(3); // reading from the nest writes nothing into it
+    // the part's own history says who, and what changed
+    expect(partEvents).toHaveLength(1);
+    expect(partEvents[0]).toMatchObject({ userId: "u", projectId: "proj" });
+    expect(partEvents[0].events[0].detail).toContain("qty 4 → 6");
+    expect(partEvents[0].events[0].detail).toContain("1D nest");
   });
 
   it("BOQ quantity changed -> written into the 1D nest (version-checked), the stale cutting result is dropped", async () => {

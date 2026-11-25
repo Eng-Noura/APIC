@@ -214,6 +214,10 @@ export function NestBoost1D() {
   const [importMsg, setImportMsg] = React.useState("");
   // Takeoff part ids already imported, so pressing Import twice never doubles quantities.
   const importedIds = React.useRef<Set<string>>(new Set());
+  // Pieces removed here: the server deletes their Part List parts too (one part = one thing). Sent with the next save.
+  const removedIds = React.useRef<number[]>([]);
+  const removedSent = React.useRef(0);
+  const [pendingRemovePiece, setPendingRemovePiece] = React.useState<number | null>(null);
 
   const [pieceForm, setPieceForm] = React.useState<{ name: string; profile: string; material: string; length: string; qty: string; partType: PartType1D }>({
     name: "", profile: "", material: "", length: "", qty: "1", partType: DEFAULT_PART_TYPE_1D,
@@ -342,8 +346,12 @@ export function NestBoost1D() {
     capture: () => ({
       v: 1, pieces: piecesRef.current, sources: sourcesRef.current, cfg, result, resS,
       pieceCounters: pieceCounters.current, sourceCounters: sourceCounters.current, importedIds: [...importedIds.current],
+      ...((removedSent.current = removedIds.current.length) ? { removedIds: [...removedIds.current] } : {}),
     }),
+    onSaved: () => { removedIds.current.splice(0, removedSent.current); removedSent.current = 0; },
     restore: (data) => {
+      removedIds.current = []; // what the server sent is the truth: a removal that never reached it is not carried over
+      removedSent.current = 0;
       const d = data as {
         v?: number; pieces?: Piece1D[]; sources?: Source1D[]; cfg?: typeof cfg; result?: Result1D | null; resS?: Settings1D | null;
         pieceCounters?: { id: number; sn: number }; sourceCounters?: { id: number; sn: number }; importedIds?: string[];
@@ -459,7 +467,10 @@ export function NestBoost1D() {
     if ("profile" in patch || "material" in patch) ensureSourcesFor(next);
   };
   const removePiece = (id: number) => {
-    setPieces((prev) => prev.filter((p) => p.id !== id));
+    // a segmented piece (a part longer than every bar) goes together with its segments
+    const gone = piecesRef.current.filter((p) => p.id === id || p.segment?.parentId === id).map((p) => p.id);
+    removedIds.current.push(...gone);
+    setPieces((prev) => prev.filter((p) => !gone.includes(p.id)));
     setResult(null);
   };
   const updateSource = (id: number, patch: Partial<Source1D>) => setSources((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
@@ -496,6 +507,7 @@ export function NestBoost1D() {
   };
 
   const resetAll = () => {
+    removedIds.current.push(...piecesRef.current.map((p) => p.id));
     setPieces([]);
     setSources([]);
     piecesRef.current = [];
@@ -936,7 +948,7 @@ export function NestBoost1D() {
                         <Input type="number" min={0} className="h-8 w-20" value={p.qty} onChange={(e) => updatePiece(p.id, { qty: Math.max(0, Number(e.target.value) | 0) })} />
                       </td>
                       <td className="p-1">
-                        <Button variant="ghost" size="sm" className="text-destructive" onClick={() => removePiece(p.id)}>
+                        <Button variant="ghost" size="sm" className="text-destructive" onClick={() => setPendingRemovePiece(p.id)}>
                           <Trash2 /> Remove
                         </Button>
                       </td>
@@ -1085,10 +1097,22 @@ export function NestBoost1D() {
       </div>
 
       <ConfirmDialog
+        open={pendingRemovePiece !== null}
+        onOpenChange={(v) => !v && setPendingRemovePiece(null)}
+        title="Remove this part?"
+        description="It is also removed from the Part List, and the cutting result is cleared."
+        confirmLabel="Remove"
+        onConfirm={() => {
+          if (pendingRemovePiece !== null) removePiece(pendingRemovePiece);
+          setPendingRemovePiece(null);
+        }}
+      />
+
+      <ConfirmDialog
         open={confirmReset}
         onOpenChange={setConfirmReset}
         title="Remove all parts and sources?"
-        description="This clears every part, every source and the cutting result."
+        description="This clears every part (from the Part List too), every source and the cutting result."
         confirmLabel="Reset all"
         onConfirm={resetAll}
       />

@@ -11,7 +11,8 @@ import { nestPartDescription, nestPartFileName, nestPartToDxf, parseNestParts } 
 import { isFromPartList, labelSet, parseNestPieces, partListLabel } from "@/features/takeoff/nest-1d-parts";
 import { getWorkspace, pushQuantitiesToNest } from "./nesting-workspace.service";
 import { recomputeFor } from "./part-group.service";
-import { logActivity } from "./activity-log.service";
+import { pushSpecsToNestSafe } from "./nest-link.service";
+import { logActivity, logPartEvents } from "./activity-log.service";
 
 export interface NestSyncReport {
   hasNest: boolean;
@@ -126,17 +127,16 @@ async function applyNestSyncFor(projectId: string, userId: string, kind: NestKin
       prisma.takeoffPart.update({ where: { id: i.partId }, data: { nestSyncedQty: i.boqQty, nestSyncedAt: now } }));
     if (marks.length) await prisma.$transaction(marks);
     await logActivity({
-      userId, action: "UPDATE", entity: "NESTING_RUN", entityId: projectId,
+      userId, action: "UPDATE", entity: "NESTING_RUN", entityId: projectId, projectId,
       detail: `Nest sync: ${pushedIds.length} quantities written into the ${kind} nest from the BOQ (${toPush.filter((i) => done.has(i.nestPartId)).map((i) => `${byId.get(i.partId)!.description} ${i.nestQty}→${i.boqQty}`).slice(0, 5).join(", ")})`,
     });
   }
 
   const changed = plan.items.filter((i) => i.status === "nest_changed");
   if (changed.length) {
-    await logActivity({
-      userId, action: "UPDATE", entity: "TAKEOFF_PART", entityId: projectId,
-      detail: `Nest sync: ${changed.length} quantities updated from the ${kind} nest (${changed.map((i) => `${byId.get(i.partId)!.description} ${i.boqQty}→${i.newQty}`).slice(0, 5).join(", ")}${changed.length > 5 ? ", …" : ""})`,
-    });
+    await logPartEvents(userId, projectId, changed.map((i) => ({
+      partId: i.partId, action: "UPDATE" as const, detail: `"${byId.get(i.partId)!.description}": qty ${i.boqQty} → ${i.newQty} (changed in the ${kind} nest)`,
+    })));
   }
   // what is left after applying: nest_changed items are now linked
   const pushed = new Set(pushedIds);
@@ -208,7 +208,10 @@ export async function importMissingNestParts(projectId: string, userId: string):
     }], userId).catch(() => null);
     if (res?.[0]?.ok && !res[0].skipped) added++;
   }
-  if (added) await logActivity({ userId, action: "CREATE", entity: "NESTING_RUN", entityId: projectId, detail: `${added} parts taken from the 2D nest into the Part List` });
+  if (added) {
+    await logActivity({ userId, action: "CREATE", entity: "NESTING_RUN", entityId: projectId, detail: `${added} parts taken from the 2D nest into the Part List` });
+    await pushSpecsToNestSafe(projectId, userId); // the nest rows take the Part List's name straight away
+  }
   return added;
 }
 

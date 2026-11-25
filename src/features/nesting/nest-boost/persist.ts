@@ -23,6 +23,8 @@ export interface Snapshot2D {
   resS: Settings | null;
   savedNests: EncNest[];
   activeNestId: number | null;
+  /** Ids of the parts the person removed since the last save: the server deletes them from the Part List too, then drops this list. */
+  removedIds?: number[];
 }
 
 export interface Restored2D {
@@ -71,7 +73,7 @@ function decodeResult(e: EncResult, find: (id: number) => Group | undefined): Op
 
 export function encodeSnapshot(s: {
   cfg: NestCfg; units: string; groups: Group[]; counters: Counters; savedSeq: number; importedIds: Iterable<string>;
-  result: OptResult | null; resS: Settings | null; savedNests: SavedNest[]; activeNestId: number | null;
+  result: OptResult | null; resS: Settings | null; savedNests: SavedNest[]; activeNestId: number | null; removedIds?: number[];
 }): Snapshot2D {
   const table = new Map<number, Group>();
   const result = s.result ? encodeResult(s.result, table) : null;
@@ -90,6 +92,7 @@ export function encodeSnapshot(s: {
     resS: s.resS,
     savedNests,
     activeNestId: s.activeNestId,
+    ...(s.removedIds?.length ? { removedIds: s.removedIds } : {}),
   };
 }
 

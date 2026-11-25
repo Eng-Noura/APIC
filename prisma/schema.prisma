@@ -173,6 +173,8 @@ model Project {
   // `projectId` and relate back here. No change to Project is required.
   // ---------------------------------------------------------------------
 
+  trashedParts TakeoffPartTrash[]
+
   @@map("projects")
 }
 
@@ -308,6 +310,25 @@ model TakeoffPart {
   @@index([workOrderGroupId])
   @@index([nestKind, nestPartId])
   @@map("takeoff_parts")
+}
+
+// Trash of the Part List: a deleted part is really deleted (so no query anywhere has to know about "deleted" rows), but a
+// full copy of it (and of its DXF record) is kept here for 30 days so it can be restored. See part-trash.service.ts.
+model TakeoffPartTrash {
+  id            String   @id @default(cuid())
+  projectId     String
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  drawingId     String // where it was (the drawing may be gone by the time it is restored)
+  drawingNumber String
+  partId        String // the id the part had
+  description   String
+  snapshot      Json // every column of the part
+  dxf           Json? // the part's DXF record (the file itself stays in storage)
+  deletedAt     DateTime @default(now())
+  deletedById   String?
+
+  @@index([projectId, deletedAt])
+  @@map("takeoff_part_trash")
 }
 
 // BOQ assemblies. Drawing -> Assembly (PartGroup) -> Part. Groups can nest (a hatch inside a wall):
@@ -837,10 +858,14 @@ model ActivityLog {
   entityId  String?
   detail    String?
   timestamp DateTime @default(now())
+  // The project the change belongs to (set for the Part List: lets a project show who changed what, even for deleted parts).
+  projectId String?
 
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@index([projectId, timestamp])
+  @@index([entityId])
   @@map("activity_logs")
 }
 

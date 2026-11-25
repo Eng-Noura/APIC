@@ -116,3 +116,23 @@ export async function pushQuantitiesToNest(projectId: string, changes: { nestPar
   }
   throw new Error("The nest was being saved at the same time — try again");
 }
+
+/**
+ * Rewrites the project's 2D or 1D nest through `transform` (server -> nest). Like pushQuantitiesToNest the write is
+ * conditional on the version that was read, so it can never overwrite a browser save that landed in between; on a
+ * race it re-reads and tries again. `transform` returns null when nothing has to change (no write, no version bump).
+ */
+export async function mutateWorkspace(projectId: string, kind: WorkspaceKind, userId: string, transform: (data: unknown) => unknown | null): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ws = await prisma.nestingWorkspace.findUnique({ where: { projectId_kind: { projectId, kind } }, select: { dataJson: true, version: true } });
+    if (!ws) return false;
+    const next = transform(ws.dataJson);
+    if (next === null) return false;
+    const hit = await prisma.nestingWorkspace.updateMany({
+      where: { projectId, kind, version: ws.version },
+      data: { dataJson: next as object, updatedById: userId, version: { increment: 1 } },
+    });
+    if (hit.count === 1) return true;
+  }
+  throw new Error("The nest was being saved at the same time — try again");
+}

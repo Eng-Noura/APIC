@@ -23,8 +23,9 @@ export async function DELETE(_req: NextRequest, { params }: Ctx) {
   if (res) return res;
   const { id } = await params;
   try {
-    await deletePart(id, session!.user.id);
-    return NextResponse.json({ ok: true });
+    const { trashId } = await deletePart(id, session!.user.id);
+    // `trashId` = the copy kept in the trash: the client's "Undo" restores it
+    return NextResponse.json({ ok: true, trashId });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to delete part";
     if (message === "NOT_FOUND") return NextResponse.json({ error: "Not found" }, { status: 404 });

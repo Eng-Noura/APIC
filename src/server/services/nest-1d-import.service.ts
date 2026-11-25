@@ -14,6 +14,7 @@ import {
 import { createDrawing, createPart } from "./takeoff.service";
 import { getWorkspace } from "./nesting-workspace.service";
 import { logActivity } from "./activity-log.service";
+import { pushSpecsToNestSafe } from "./nest-link.service";
 
 export const NESTING_1D_DRAWING = "NESTING-1D";
 
@@ -105,7 +106,10 @@ export async function importMissingNestPieces(projectId: string, userId: string)
     const r = await createLinkedPart(drawingId, projectId, draft, piece.id, userId).catch((e: unknown) => ({ ok: false as const, error: e instanceof Error ? e.message : "Import failed" }));
     if (!r.ok) { failed++; warnings.push(`${pieceLabel(piece)}: ${r.error}`); } else if (!r.skipped) imported++;
   }
-  if (imported) await logActivity({ userId, action: "CREATE", entity: "NESTING_RUN", entityId: projectId, detail: `${imported} parts taken from the 1D nest into the Part List` });
+  if (imported) {
+    await logActivity({ userId, action: "CREATE", entity: "NESTING_RUN", entityId: projectId, detail: `${imported} parts taken from the 1D nest into the Part List` });
+    await pushSpecsToNestSafe(projectId, userId); // the nest rows take the Part List's name straight away
+  }
   return { imported, failed, warnings };
 }
 
@@ -126,6 +130,9 @@ export async function importNestPieces(drawingId: string, items: Nest1DImportIte
     results.push(r.ok ? { index, ok: true, skipped: r.skipped } : { index, ok: false, error: r.error });
   }
   const added = results.filter((r) => r.ok && !r.skipped).length;
-  if (added) await logActivity({ userId, action: "CREATE", entity: "NESTING_RUN", entityId: drawing.projectId, detail: `${added} parts taken from the 1D nest into the Part List` });
+  if (added) {
+    await logActivity({ userId, action: "CREATE", entity: "NESTING_RUN", entityId: drawing.projectId, detail: `${added} parts taken from the 1D nest into the Part List` });
+    await pushSpecsToNestSafe(drawing.projectId, userId);
+  }
   return results;
 }

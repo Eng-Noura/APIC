@@ -1,11 +1,14 @@
 "use client";
 import { isNestable, nestKindOf } from "@/features/nesting/part-routing";
 import * as React from "react";
-import { Pencil, Trash2, Plus, Sigma, X, Upload, FileCheck2, FileX2, Loader2, Download, TriangleAlert, Layers, FileUp, FileSpreadsheet, ListTree, Target, ClipboardList } from "lucide-react";
+import { Pencil, Trash2, MoreVertical, History, Plus, Sigma, X, Upload, FileCheck2, FileX2, Loader2, Download, TriangleAlert, Layers, FileUp, FileSpreadsheet, ListTree, Target, ClipboardList } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useTakeoffProject } from "./project-context";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { showUndoToast } from "./undo-delete";
+import { ActivityDialog } from "./activity-dialog";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { toast } from "sonner";
 import { explainTakeoffPart } from "@/server/calc/takeoff";
@@ -86,6 +89,7 @@ export function PartsGrid({
   // Multi-select: ticked part ids + the bulk-delete confirmation.
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
+  const [historyPart, setHistoryPart] = React.useState<{ id: string; description: string } | null>(null);
   const [bulkDeleteLoading, setBulkDeleteLoading] = React.useState(false);
   const [uploadingId, setUploadingId] = React.useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
@@ -108,8 +112,13 @@ export function PartsGrid({
     setDeleteLoading(true);
     const res = await fetch(`/api/takeoff/parts/${deletingId}`, { method: "DELETE" });
     setDeleteLoading(false);
-    if (!res.ok) { toast.error("Failed to delete item"); return; }
-    toast.success("Item deleted");
+    if (!res.ok) {
+      const j = (await res.json().catch(() => null)) as { error?: string } | null;
+      toast.error(typeof j?.error === "string" ? j.error : "Failed to delete item");
+      return;
+    }
+    const { trashId } = (await res.json().catch(() => ({}))) as { trashId?: string | null };
+    showUndoToast("Item deleted", trashId ? [trashId] : [], onChanged);
     setDeletingId(null);
     onChanged();
   }
@@ -140,12 +149,17 @@ export function PartsGrid({
     setBulkDeleteLoading(true);
     const ids = [...selected];
     const results = await Promise.all(
-      ids.map((id) => fetch(`/api/takeoff/parts/${id}`, { method: "DELETE" }).then((r) => r.ok).catch(() => false)),
+      ids.map((id) =>
+        fetch(`/api/takeoff/parts/${id}`, { method: "DELETE" })
+          .then(async (r) => (r.ok ? ((await r.json().catch(() => ({}))) as { trashId?: string | null }).trashId ?? "" : null))
+          .catch(() => null),
+      ),
     );
     setBulkDeleteLoading(false);
-    const failed = results.filter((ok) => !ok).length;
+    const failed = results.filter((r) => r === null).length;
+    const trashIds = results.filter((r): r is string => !!r);
     if (failed) toast.error(`${failed} of ${ids.length} item(s) could not be deleted`);
-    else toast.success(`${ids.length} item(s) deleted`);
+    if (ids.length - failed > 0) showUndoToast(`${ids.length - failed} item(s) deleted`, trashIds, onChanged);
     setBulkDeleteOpen(false);
     setSelected(new Set());
     onChanged();
@@ -351,11 +365,33 @@ export function PartsGrid({
                             <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
                           </Button>
                         )}
-                        {canDelete && (
-                          <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => setDeletingId(part.id)} title="Delete item">
-                            <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                          </Button>
-                        )}
+                        {/* delete lives in a menu, away from the edit button (one click on the wrong icon can no longer delete) */}
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button size="icon" variant="ghost" className="ml-1 h-7 w-7" title="More actions" aria-label="More actions">
+                              <MoreVertical className="h-3.5 w-3.5 text-muted-foreground" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onSelect={() => setExpandedId(isExpanded ? null : part.id)}>
+                              <Sigma className="h-3.5 w-3.5" /> {isExpanded ? "Hide the equation" : "Show the equation"}
+                            </DropdownMenuItem>
+                            {canCreate && (
+                              <DropdownMenuItem onSelect={() => openEdit(part)}><Pencil className="h-3.5 w-3.5" /> Edit item</DropdownMenuItem>
+                            )}
+                            <DropdownMenuItem onSelect={() => setHistoryPart({ id: part.id, description: part.description })}>
+                              <History className="h-3.5 w-3.5" /> History — who changed it
+                            </DropdownMenuItem>
+                            {canDelete && (
+                              <>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={() => setDeletingId(part.id)}>
+                                  <Trash2 className="h-3.5 w-3.5" /> Delete item…
+                                </DropdownMenuItem>
+                              </>
+                            )}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
                       </div>
                     </td>
                   </tr>
@@ -397,7 +433,8 @@ export function PartsGrid({
           </div>
         ) : <span />}
         {selected.size > 0 && (
-          <div className="flex items-center gap-2 rounded-md border border-border bg-card px-2 py-1 text-xs">
+          // Floating bar pinned to the bottom of the window, so the actions are always in reach however long the list is
+          <div role="toolbar" aria-label="Actions for the selected parts" className="fixed bottom-4 left-1/2 z-40 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-wrap items-center justify-center gap-2 rounded-xl border border-border bg-card px-3 py-2 text-xs shadow-xl animate-in fade-in slide-in-from-bottom-4">
             <span className="font-medium">{selected.size} selected</span>
             <Button
               size="sm"
@@ -455,15 +492,16 @@ export function PartsGrid({
         />
       )}
 
+      {historyPart && (
+        <ActivityDialog open onOpenChange={(v) => !v && setHistoryPart(null)} projectId={projectId} partId={historyPart.id} title={`History — ${historyPart.description}`} />
+      )}
+
       <ConfirmDialog
         open={!!deletingId}
         onOpenChange={(v) => !v && setDeletingId(null)}
-        title="Are you sure you want to delete this item?"
-        description={
-          parts.find((p) => p.id === deletingId)?.nestPartId != null
-            ? "This will remove this part from the drawing. It came from a nest, so it is added again while it is still in that nest — remove it from the nest too to get rid of it for good. This cannot be undone."
-            : "This will remove this part from the drawing. This cannot be undone."
-        }
+        title="Delete this item?"
+        items={deletingId ? [parts.find((p) => p.id === deletingId)?.description ?? ""] : undefined}
+        description="It is removed from the drawing and from the 2D / 1D nest it is in. You can undo it right after, or restore it from the Trash for 30 days."
         confirmLabel="Delete"
         loading={deleteLoading}
         onConfirm={handleDelete}
@@ -472,8 +510,10 @@ export function PartsGrid({
       <ConfirmDialog
         open={bulkDeleteOpen}
         onOpenChange={setBulkDeleteOpen}
-        title={`Are you sure you want to delete ${selected.size} item(s)?`}
-        description="The selected parts (and their DXF links) will be removed from the drawing. This cannot be undone."
+        title={`Delete ${selected.size} item(s)?`}
+        items={parts.filter((p) => selected.has(p.id)).map((p) => p.description)}
+        requireText={selected.size > 5 ? "DELETE" : undefined}
+        description="They are removed from the drawing and from the 2D / 1D nests they are in. You can undo it right after, or restore them from the Trash for 30 days."
         confirmLabel={`Delete ${selected.size} item(s)`}
         loading={bulkDeleteLoading}
         onConfirm={handleBulkDelete}

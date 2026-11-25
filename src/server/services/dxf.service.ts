@@ -2,7 +2,7 @@ import { put, del } from "@vercel/blob";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@/server/db/client";
 import { parseDxf } from "@/server/calc/dxf";
-import { logActivity } from "./activity-log.service";
+import { logActivity, logPartEvents } from "./activity-log.service";
 
 // The parser returns a strongly-typed { outer, holes } shape (see
 // src/server/calc/dxf.ts). Prisma's Json input type wants a plain,
@@ -21,6 +21,10 @@ function toJsonInput(value: unknown): Prisma.InputJsonValue | undefined {
 // writing to `public/uploads` — which works in local dev — throws
 // ENOENT/EROFS in production. Blob gives us a real persistent file store
 // with a public URL back immediately, no extra infra to manage.
+async function projectOfPart(drawingId: string): Promise<string | null> {
+  return (await prisma.takeoffDrawing.findUnique({ where: { id: drawingId }, select: { projectId: true } }))?.projectId ?? null;
+}
+
 export async function saveAndParseDxf(takeoffPartId: string, file: File, userId: string) {
   const part = await prisma.takeoffPart.findUnique({ where: { id: takeoffPartId } });
   if (!part) throw new Error("Takeoff part not found");
@@ -92,6 +96,9 @@ export async function saveAndParseDxf(takeoffPartId: string, file: File, userId:
     entityId: dxf.id,
     detail: `${file.name} on part ${part.description}${result.valid ? "" : " (invalid)"}`,
   });
+  await logPartEvents(userId, await projectOfPart(part.drawingId), [{
+    partId: part.id, action: "UPDATE", detail: `"${part.description}": DXF file ${previous ? "replaced" : "added"}: ${file.name}${result.valid ? "" : " (invalid)"}`,
+  }]);
 
   return dxf;
 }
@@ -114,5 +121,7 @@ export async function deleteDxf(takeoffPartId: string, userId: string) {
     entityId: existing.id,
     detail: existing.fileName,
   });
+  const owner = await prisma.takeoffPart.findUnique({ where: { id: takeoffPartId }, select: { description: true, drawingId: true } });
+  if (owner) await logPartEvents(userId, await projectOfPart(owner.drawingId), [{ partId: takeoffPartId, action: "UPDATE", detail: `"${owner.description}": DXF file removed: ${existing.fileName}` }]);
   return existing;
 }

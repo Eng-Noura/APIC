@@ -77,5 +77,9 @@ export async function importDxfParts(
       results.push({ partIndex: item.partIndex, ok: false, error: err instanceof Error ? err.message : "Import failed" });
     }
   }
+  // plates taken from the 2D nest: the nest rows take the Part List's name straight away (one part = one name)
+  if (results.some((r, i) => r.ok && !r.skipped && items[i]?.nestPartId !== undefined)) {
+    await (await import("./nest-link.service")).pushSpecsToNestSafe(drawing.projectId, userId);
+  }
   return results;
 }

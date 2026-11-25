@@ -10,7 +10,7 @@ import {
   type GroupNode, type WeightSplit,
 } from "@/server/calc/boq-groups";
 import type { AssignPartsInput, PartGroupInput } from "@/server/validators/part-group";
-import { logActivity } from "./activity-log.service";
+import { logActivity, logPartEvents } from "./activity-log.service";
 
 export class PartGroupError extends Error {
   constructor(message: string, public status = 400) {
@@ -42,12 +42,12 @@ export async function resolvePartQty(projectId: string, groupId: string | null |
 }
 
 /** Brings every grouped part of the project back in line with its group's quantity. Returns how many changed. */
-export async function recalcGroupedParts(projectId: string): Promise<number> {
+export async function recalcGroupedParts(projectId: string, userId?: string): Promise<number> {
   const [nodes, parts] = await Promise.all([
     loadNodes(projectId),
     prisma.takeoffPart.findMany({
       where: { drawing: { projectId }, groupId: { not: null } },
-      select: { id: true, groupId: true, partType: true, qty: true, qtyPerAssembly: true, weightKg: true, geometry: true, thicknessMm: true, paintSides: true, areaFormula: true, buyWeightKg: true },
+      select: { id: true, description: true, groupId: true, partType: true, qty: true, qtyPerAssembly: true, weightKg: true, geometry: true, thicknessMm: true, paintSides: true, areaFormula: true, buyWeightKg: true },
     }),
   ]);
   const updates = planPartQtyUpdates(nodes, parts);
@@ -59,6 +59,11 @@ export async function recalcGroupedParts(projectId: string): Promise<number> {
       return prisma.takeoffPart.update({ where: { id: u.partId }, data: { qty: u.qty, ...recomputeFor(p, u.qty) } });
     }),
   );
+  if (userId) {
+    await logPartEvents(userId, projectId, updates.map((u) => ({
+      partId: u.partId, action: "UPDATE" as const, detail: `"${byId.get(u.partId)!.description}": qty ${byId.get(u.partId)!.qty} → ${u.qty} (the assembly quantity changed)`,
+    })));
+  }
   return updates.length;
 }
 
@@ -133,7 +138,7 @@ export async function updateGroup(id: string, data: PartGroupInput, userId: stri
       where: { id },
       data: { code: data.code, name: data.name, dwgNo: data.dwgNo ?? null, qty: data.qty, remark: data.remark ?? null, parentId: data.parentId ?? null },
     });
-    const changed = await recalcGroupedParts(existing.projectId);
+    const changed = await recalcGroupedParts(existing.projectId, userId);
     if (changed) await (await import("./nest-sync.service")).autoSyncAfterBoqChange(existing.projectId, userId); // lazy: nest-sync imports this file
     await logActivity({ userId, action: "UPDATE", entity: "PART_GROUP", entityId: id, detail: `${group.code} — qty ${group.qty}${changed ? `, ${changed} part quantities updated` : ""}` });
     return { group, partsUpdated: changed };
@@ -162,13 +167,14 @@ export interface AssignResult {
 export async function assignParts(data: AssignPartsInput, userId: string): Promise<AssignResult> {
   const parts = await prisma.takeoffPart.findMany({
     where: { id: { in: data.partIds }, drawing: { projectId: data.projectId } },
-    select: { id: true, qty: true, qtyPerAssembly: true, partType: true, geometry: true, thicknessMm: true, paintSides: true, areaFormula: true, buyWeightKg: true },
+    select: { id: true, description: true, groupId: true, qty: true, qtyPerAssembly: true, partType: true, geometry: true, thicknessMm: true, paintSides: true, areaFormula: true, buyWeightKg: true },
   });
   if (parts.length !== new Set(data.partIds).size) throw new PartGroupError("Some of the selected parts do not belong to this project", 409);
 
   if (!data.groupId) {
     await prisma.takeoffPart.updateMany({ where: { id: { in: parts.map((p) => p.id) } }, data: { groupId: null } });
-    await logActivity({ userId, action: "UPDATE", entity: "PART_GROUP", entityId: data.projectId, detail: `${parts.length} parts taken out of their assembly` });
+    await logActivity({ userId, action: "UPDATE", entity: "PART_GROUP", entityId: data.projectId, projectId: data.projectId, detail: `${parts.length} parts taken out of their assembly` });
+    await logPartEvents(userId, data.projectId, parts.map((p) => ({ partId: p.id, action: "UPDATE" as const, detail: `"${p.description}": taken out of its assembly` })));
     return { assigned: parts.length, quantityChanged: [] };
   }
 
@@ -188,7 +194,13 @@ export async function assignParts(data: AssignPartsInput, userId: string): Promi
     });
   });
   await prisma.$transaction(writes);
-  await logActivity({ userId, action: "UPDATE", entity: "PART_GROUP", entityId: data.groupId, detail: `${parts.length} parts added${quantityChanged.length ? `, ${quantityChanged.length} quantities adjusted` : ""}` });
+  await logActivity({ userId, action: "UPDATE", entity: "PART_GROUP", entityId: data.groupId, projectId: data.projectId, detail: `${parts.length} parts added${quantityChanged.length ? `, ${quantityChanged.length} quantities adjusted` : ""}` });
+  const target = await prisma.partGroup.findUnique({ where: { id: data.groupId }, select: { code: true, name: true } });
+  const qtyOf = new Map(quantityChanged.map((q) => [q.partId, q]));
+  await logPartEvents(userId, data.projectId, parts.map((p) => {
+    const q = qtyOf.get(p.id);
+    return { partId: p.id, action: "UPDATE" as const, detail: `"${p.description}": added to assembly ${target?.code ?? ""}${target?.name ? ` — ${target.name}` : ""}${q ? `, qty ${q.from} → ${q.to}` : ""}` };
+  }));
   return { assigned: parts.length, quantityChanged };
 }
 

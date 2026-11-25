@@ -6,7 +6,7 @@
 import { prisma } from "@/server/db/client";
 import { dateToIso, isoToDate } from "@/features/planning/calendar";
 import type { AssignGroupingInput, GroupingInput, GroupingKind } from "@/server/validators/part-grouping";
-import { logActivity } from "./activity-log.service";
+import { logActivity, logPartEvents } from "./activity-log.service";
 
 export class PartGroupingError extends Error {
   constructor(message: string, public status = 400) {
@@ -127,8 +127,8 @@ export async function deleteGrouping(kind: GroupingKind, id: string, userId: str
 
 export async function assignGrouping(data: AssignGroupingInput, userId: string): Promise<{ assigned: number }> {
   const ids = [...new Set(data.partIds)];
-  const found = await prisma.takeoffPart.count({ where: { id: { in: ids }, drawing: { projectId: data.projectId } } });
-  if (found !== ids.length) throw new PartGroupingError("Some of the selected parts do not belong to this project", 409);
+  const found = await prisma.takeoffPart.findMany({ where: { id: { in: ids }, drawing: { projectId: data.projectId } }, select: { id: true, description: true } });
+  if (found.length !== ids.length) throw new PartGroupingError("Some of the selected parts do not belong to this project", 409);
 
   if (data.targetId) {
     const target = data.kind === "scope"
@@ -140,8 +140,18 @@ export async function assignGrouping(data: AssignGroupingInput, userId: string):
     where: { id: { in: ids } },
     data: data.kind === "scope" ? { scopeId: data.targetId } : { workOrderGroupId: data.targetId },
   });
+  const targetName = data.targetId
+    ? data.kind === "scope"
+      ? (await prisma.scopeItem.findUnique({ where: { id: data.targetId }, select: { description: true } }))?.description
+      : (await prisma.workOrderGroup.findUnique({ where: { id: data.targetId }, select: { code: true, name: true } }).then((w) => (w ? `${w.code} — ${w.name}` : undefined)))
+    : undefined;
+  const label = data.kind === "scope" ? "scope" : "work order";
+  await logPartEvents(userId, data.projectId, found.map((p) => ({
+    partId: p.id, action: "UPDATE" as const,
+    detail: `"${p.description}": ${data.targetId ? `added to ${label} ${targetName ?? ""}`.trim() : `taken out of its ${label}`}`,
+  })));
   await logActivity({
-    userId, action: "UPDATE", entity: data.kind === "scope" ? "SCOPE_ITEM" : "PART_GROUP", entityId: data.targetId ?? data.projectId,
+    userId, action: "UPDATE", entity: data.kind === "scope" ? "SCOPE_ITEM" : "PART_GROUP", entityId: data.targetId ?? data.projectId, projectId: data.projectId,
     detail: `${ids.length} part${ids.length === 1 ? "" : "s"} ${data.targetId ? "added to" : "taken out of"} a ${data.kind === "scope" ? "scope" : "work order"}`,
   });
   return { assigned: ids.length };

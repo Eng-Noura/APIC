@@ -2,6 +2,7 @@ import { prisma } from "@/server/db/client";
 import { computeTakeoffPart, buildDefaultAreaFormula } from "@/server/calc/takeoff";
 import type { TakeoffDrawingInput, TakeoffPartInputData } from "@/server/validators/takeoff";
 import { logActivity } from "./activity-log.service";
+import { describeChanges } from "@/server/calc/part-changes";
 import { resolvePartQty } from "./part-group.service";
 
 // computeTakeoffPart() returns a `formulaError` field for the UI's benefit —
@@ -55,19 +56,23 @@ export async function createDrawing(data: TakeoffDrawingInput, userId: string) {
     action: "CREATE",
     entity: "TAKEOFF_DRAWING",
     entityId: drawing.id,
-    detail: `${drawing.drawingNumber} — ${drawing.title}`,
+    projectId: drawing.projectId,
+    detail: `Drawing added: ${drawing.drawingNumber} — ${drawing.title}`,
   });
   return drawing;
 }
 
 export async function deleteDrawing(id: string, userId: string) {
+  const doomed = await prisma.takeoffPart.findMany({ where: { drawingId: id }, select: { id: true, nestKind: true, nestPartId: true } });
   const drawing = await prisma.takeoffDrawing.delete({ where: { id } });
+  if (doomed.length) await (await import("./nest-link.service")).removePartsFromNests(drawing.projectId, userId, doomed);
   await logActivity({
     userId,
     action: "DELETE",
     entity: "TAKEOFF_DRAWING",
     entityId: id,
-    detail: `${drawing.drawingNumber} — ${drawing.title}`,
+    projectId: drawing.projectId,
+    detail: `Drawing deleted: ${drawing.drawingNumber} — ${drawing.title} (${doomed.length} part(s), not kept in the Trash)`,
   });
   return drawing;
 }
@@ -88,14 +93,20 @@ export async function createPart(data: TakeoffPartInputData, userId: string) {
       paintSides: data.paintSides, ...computed,
     },
   });
-  await logActivity({ userId, action: "CREATE", entity: "TAKEOFF_PART", entityId: part.id, detail: part.description });
+  await logActivity({
+    userId, action: "CREATE", entity: "TAKEOFF_PART", entityId: part.id, projectId: await projectOfDrawing(part.drawingId),
+    detail: `Added "${part.description}" — ${part.partType}, qty ${part.qty}`,
+  });
   return part;
 }
 
 export async function updatePart(id: string, data: TakeoffPartInputData, userId: string) {
   const existing = await prisma.takeoffPart.findUnique({
     where: { id },
-    select: { drawingId: true, groupId: true, qtyPerAssembly: true, posNo: true, remark: true, qty: true, nestPartId: true },
+    select: {
+      drawingId: true, groupId: true, qtyPerAssembly: true, posNo: true, remark: true, qty: true, nestPartId: true,
+      description: true, itemNo: true, partType: true, side: true, thicknessMm: true, material: true, paintSides: true, areaFormula: true, geometry: true,
+    },
   });
   if (!existing) throw new Error("NOT_FOUND");
 
@@ -117,10 +128,20 @@ export async function updatePart(id: string, data: TakeoffPartInputData, userId:
       paintSides: data.paintSides, ...computed,
     },
   });
-  await logActivity({ userId, action: "UPDATE", entity: "TAKEOFF_PART", entityId: part.id, detail: part.description });
+  const projectId = await projectOfDrawing(existing.drawingId);
+  // who changed what, and when: one line with the old and the new values (nothing is written when nothing changed)
+  const changes = describeChanges(existing, part);
+  if (changes.length) {
+    await logActivity({ userId, action: "UPDATE", entity: "TAKEOFF_PART", entityId: part.id, projectId, detail: `"${part.description}": ${changes.join(", ")}` });
+  }
+  // One part = one thing: the nests show this part's name / specs, so write them into the saved 2D / 1D nests too
+  // (best effort, never fails the edit; a nest that is open in a tab reloads itself when it notices the new version).
+  if (existing.nestPartId !== null || part.partType === "HOT_ROLLED" || part.partType === "PIPE") {
+    await (await import("./nest-link.service")).pushSpecsToNestSafe(projectId, userId);
+  }
   // a quantity changed on a plate that came from the nest: carry it over (best effort, never fails the edit)
   if (existing.nestPartId !== null && existing.qty !== qty) {
-    await (await import("./nest-sync.service")).autoSyncAfterBoqChange(await projectOfDrawing(existing.drawingId), userId);
+    await (await import("./nest-sync.service")).autoSyncAfterBoqChange(projectId, userId);
   }
   return part;
 }
@@ -135,9 +156,13 @@ function isPrismaErrorCode(err: unknown, code: string): boolean {
 
 export async function deletePart(id: string, userId: string) {
   let part;
+  // a copy goes to the trash first, so a wrong delete can be undone (see part-trash.service.ts)
+  const trash = await import("./part-trash.service");
+  const trashId = await trash.trashPart(id, userId).catch((e) => { console.error("[trash] could not keep a copy", e); return null; });
   try {
     part = await prisma.takeoffPart.delete({ where: { id } });
   } catch (err) {
+    await trash.dropTrash(trashId);
     // NestingPlacement.takeoffPart uses onDelete: Restrict — a part that
     // has ever been placed in a nesting run must not be deletable out from
     // under historical results (see schema comment on NestingPlacement).
@@ -152,12 +177,16 @@ export async function deletePart(id: string, userId: string) {
     }
     throw err;
   }
+  const projectId = await projectOfDrawing(part.drawingId).catch(() => null);
   await logActivity({
     userId,
     action: "DELETE",
     entity: "TAKEOFF_PART",
     entityId: id,
-    detail: part.description,
+    ...(projectId ? { projectId } : {}),
+    detail: `Deleted "${part.description}" — qty ${part.qty}${trashId ? " (kept in the Trash for 30 days)" : ""}`,
   });
-  return part;
+  // One part = one thing: it must not stay behind in the 2D / 1D nest (and be taken back into the Part List from there)
+  if (projectId) await (await import("./nest-link.service")).removePartsFromNests(projectId, userId, [part]);
+  return { ...part, trashId };
 }

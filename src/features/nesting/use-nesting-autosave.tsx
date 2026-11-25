@@ -15,6 +15,8 @@ interface Options {
   capture: () => unknown;
   /** Puts a stored snapshot back; `null` = this workspace has none yet (start empty). */
   restore: (data: unknown | null) => void;
+  /** Called after a successful save: the tool can forget what it only had to tell the server once (e.g. removed parts). */
+  onSaved?: () => void;
   /** Returns true while the user is mid-gesture (holding a part...) — the save waits. */
   busy?: () => boolean;
   /** Everything whose change should trigger a save (fixed length). */
@@ -89,6 +91,7 @@ export function useNestingAutosave(opts: Options) {
       if (typeof saved?.version === "number") version.current = saved.version;
       lastBody.current = data;
       dirty.current = false;
+      latest.current.onSaved?.();
       if (loadedFor.current !== pid) return; // the user already moved on to another workspace
       setSavedAt(Date.now());
       setState("saved");
