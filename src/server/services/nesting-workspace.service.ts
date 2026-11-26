@@ -67,7 +67,10 @@ export async function getWorkspaceVersion(projectId: string, kind: WorkspaceKind
   return ws?.version ?? null;
 }
 
-export type SaveResult = { ok: true; updatedAt: Date; version: number } | { ok: false; version: number };
+/** A refused save says who wrote the newer copy and when, so the person can be told ("Ahmed saved at 10:48"). */
+export type SaveResult =
+  | { ok: true; updatedAt: Date; version: number }
+  | { ok: false; version: number; updatedAt: Date | null; updatedById: string | null };
 
 /**
  * Saves a project workspace. With `baseVersion` (the version the caller last read) the save is refused when the
@@ -84,8 +87,8 @@ export async function saveWorkspace(projectId: string, kind: WorkspaceKind, data
       const ws = await prisma.nestingWorkspace.findUnique({ where: { projectId_kind: { projectId, kind } }, select: { updatedAt: true, version: true } });
       return { ok: true, updatedAt: ws!.updatedAt, version: ws!.version };
     }
-    const current = await getWorkspaceVersion(projectId, kind);
-    if (current !== null) return { ok: false, version: current }; // exists but moved on
+    const current = await prisma.nestingWorkspace.findUnique({ where: { projectId_kind: { projectId, kind } }, select: { version: true, updatedAt: true, updatedById: true } });
+    if (current) return { ok: false, version: current.version, updatedAt: current.updatedAt, updatedById: current.updatedById }; // exists but moved on
     // no row yet: fall through and create it
   }
   const ws = await prisma.nestingWorkspace.upsert({

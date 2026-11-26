@@ -28,6 +28,7 @@ import { childrenOf, commitSegmentation, expandRemoval, patchGroup, removeSegmen
 import type { Plan } from "../segmentation/planner";
 import { decodeSnapshot, encodeSnapshot } from "./persist";
 import { AutosaveBadge, useNestingAutosave } from "../use-nesting-autosave";
+import { PresenceBanner, useNestPresence } from "../use-nest-presence";
 import {
   addFileParts,
   addManualPart,
@@ -2518,6 +2519,8 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
     busy: () => !!selRef.current || !!multiRef.current || running,
     deps: [groups, result, resS, cfg, units, savedNests, activeNestId, version],
   });
+  // who else has this nest open (and is editing it right now)
+  const presence = useNestPresence(workspaceId, "2D", active, autosave.lastEditAt);
 
   function exportDxf() {
     if (!result || !resS) return;
@@ -3084,7 +3087,8 @@ export function NestBoost({ active = true }: { active?: boolean } = {}) {
         subtitle="Optimize your parts layout on sheets, save material and reduce waste."
         actions={
           <>
-            {workspaceId && <AutosaveBadge state={autosave.state} savedAt={autosave.savedAt} projectLabel={workspaceLabel} />}
+            {workspaceId && <PresenceBanner others={presence} />}
+            {workspaceId && <AutosaveBadge state={autosave.state} savedAt={autosave.savedAt} projectLabel={workspaceLabel} conflict={autosave.conflict} onKeepMine={autosave.keepMine} onDismiss={autosave.dismissConflict} />}
             <Button variant="outline" onClick={openRemnants} disabled={!canExport || !!held} title="Add the usable offcuts of this nest to the company stock, so later nests can use them">
               <Recycle /> Register remnants
             </Button>

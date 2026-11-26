@@ -174,6 +174,8 @@ model Project {
   // ---------------------------------------------------------------------
 
   trashedParts TakeoffPartTrash[]
+  takeoffUndo  TakeoffUndo[]
+  nestingPresence NestingPresence[]
 
   @@map("projects")
 }
@@ -329,6 +331,39 @@ model TakeoffPartTrash {
 
   @@index([projectId, deletedAt])
   @@map("takeoff_part_trash")
+}
+
+// Ctrl+Z / Ctrl+Y for the Part List. Every change a person makes to parts is kept as a before / after copy of the rows
+// it touched; undo puts the "before" back, redo the "after". Each person has their own stack per project.
+// See part-undo.service.ts.
+model TakeoffUndo {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  label     String // "Edit \"Plate A\"", "Delete 3 parts" ...
+  changes   Json // [{ id, before, after }] — a part row + its DXF record, or null when it did not exist
+  state     String   @default("done") // "done" | "undone"
+  createdAt DateTime @default(now())
+
+  @@index([projectId, userId, createdAt])
+  @@map("takeoff_undo")
+}
+
+// Who has a project's 2D / 1D nest open right now (a heartbeat every ~10 s), so people see each other and
+// do not overwrite each other. See nest-presence.service.ts.
+model NestingPresence {
+  id         String    @id @default(cuid())
+  projectId  String
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  kind       String // "2D" | "1D"
+  userId     String
+  lastSeenAt DateTime  @default(now())
+  lastEditAt DateTime? // the last heartbeat that came while the person was changing the nest
+
+  @@unique([projectId, kind, userId])
+  @@index([projectId, kind, lastSeenAt])
+  @@map("nesting_presence")
 }
 
 // BOQ assemblies. Drawing -> Assembly (PartGroup) -> Part. Groups can nest (a hatch inside a wall):

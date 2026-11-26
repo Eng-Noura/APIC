@@ -7,6 +7,7 @@ import { prisma } from "@/server/db/client";
 import { dateToIso, isoToDate } from "@/features/planning/calendar";
 import type { AssignGroupingInput, GroupingInput, GroupingKind } from "@/server/validators/part-grouping";
 import { logActivity, logPartEvents } from "./activity-log.service";
+import { trackPartChange } from "./part-undo.service";
 
 export class PartGroupingError extends Error {
   constructor(message: string, public status = 400) {
@@ -125,7 +126,7 @@ export async function deleteGrouping(kind: GroupingKind, id: string, userId: str
 
 // ------------------------------------------------------------------------------------------------ moving parts
 
-export async function assignGrouping(data: AssignGroupingInput, userId: string): Promise<{ assigned: number }> {
+async function assignGroupingCore(data: AssignGroupingInput, userId: string): Promise<{ assigned: number }> {
   const ids = [...new Set(data.partIds)];
   const found = await prisma.takeoffPart.findMany({ where: { id: { in: ids }, drawing: { projectId: data.projectId } }, select: { id: true, description: true } });
   if (found.length !== ids.length) throw new PartGroupingError("Some of the selected parts do not belong to this project", 409);
@@ -155,4 +156,15 @@ export async function assignGrouping(data: AssignGroupingInput, userId: string):
     detail: `${ids.length} part${ids.length === 1 ? "" : "s"} ${data.targetId ? "added to" : "taken out of"} a ${data.kind === "scope" ? "scope" : "work order"}`,
   });
   return { assigned: ids.length };
+}
+
+/** Puts parts into a scope or work order (or takes them out): undoable with Ctrl+Z. */
+export async function assignGrouping(data: AssignGroupingInput, userId: string): Promise<{ assigned: number }> {
+  const n = new Set(data.partIds).size;
+  const what = data.kind === "scope" ? "scope" : "work order";
+  const { result } = await trackPartChange(
+    { userId, projectId: data.projectId, beforeIds: data.partIds, label: `${data.targetId ? "Add" : "Take out"} ${n} part${n === 1 ? "" : "s"} ${data.targetId ? "to a" : "from a"} ${what}` },
+    () => assignGroupingCore(data, userId),
+  );
+  return result;
 }

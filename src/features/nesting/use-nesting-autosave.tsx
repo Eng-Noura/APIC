@@ -5,6 +5,15 @@ import { useTakeoffProject } from "@/features/takeoff/project-context";
 
 export type AutosaveState = "idle" | "loading" | "saving" | "saved" | "error" | "reloaded";
 
+/** A save was refused because somebody saved a newer copy first: the tab took theirs, and keeps this person's edits aside. */
+export interface SaveConflict {
+  /** who saved the newer copy (null = unknown) */
+  by: string | null;
+  /** it was this same person (another tab, or the Part List / BOQ writing into the nest) */
+  byMe: boolean;
+  at: string | null;
+}
+
 interface Options {
   kind: "2D" | "1D";
   /** What to save into: a project id, or `h:<id>` for an entry of the user's nesting history ("" = nothing open). */
@@ -53,6 +62,12 @@ export function useNestingAutosave(opts: Options) {
   const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   // version of the project workspace this tab last loaded / saved (history entries are not versioned)
   const version = React.useRef<number | null>(null);
+  // the last time the person changed something here (the presence heartbeat tells others "editing now"), and the
+  // edits that a refused save set aside, so they can be put back
+  const lastEditAt = React.useRef(0);
+  const loadedAt = React.useRef(0);
+  const mine = React.useRef<string | null>(null);
+  const [conflict, setConflict] = React.useState<SaveConflict | null>(null);
 
   // Reads the workspace again and puts it into the tool — used when the server copy moved on (e.g. the BOQ changed a quantity).
   const reload = React.useCallback(async (pid: string) => {
@@ -63,6 +78,7 @@ export function useNestingAutosave(opts: Options) {
     if (json.data) { latest.current.restore(json.data); lastBody.current = JSON.stringify(json.data); }
     version.current = json.version ?? null;
     dirty.current = false;
+    loadedAt.current = Date.now();
     setState("reloaded");
   }, [kind]);
 
@@ -82,8 +98,12 @@ export function useNestingAutosave(opts: Options) {
         keepalive: keepalive && body.length < 60000,
       });
       if (res.status === 409) {
-        // The server copy is newer (a quantity was synced from the BOQ): take it instead of overwriting it.
+        // The server copy is newer (somebody saved, or a quantity was synced from the BOQ): take it instead of overwriting it —
+        // but keep this person's unsaved edits aside, so they are not lost without a word ("Restore my edits").
+        const info = (await res.json().catch(() => null)) as { by?: string | null; byMe?: boolean; at?: string | null } | null;
+        mine.current = data;
         await reload(pid);
+        setConflict({ by: info?.by ?? null, byMe: info?.byMe === true, at: info?.at ?? null });
         return;
       }
       if (!res.ok) throw new Error(String(res.status));
@@ -134,6 +154,8 @@ export function useNestingAutosave(opts: Options) {
           latest.current.restore(null); // switching to a workspace without a nest yet: start clean
         }
         loadedFor.current = projectId;
+        loadedAt.current = Date.now();
+        mine.current = null; setConflict(null);
         setState("idle");
         if (!json.data && !prev) { dirty.current = true; void save(projectId); } // adopt work done before choosing a project / entry
       })
@@ -150,6 +172,7 @@ export function useNestingAutosave(opts: Options) {
   React.useEffect(() => {
     if (!projectId || loadedFor.current !== projectId) return;
     dirty.current = true;
+    if (Date.now() - loadedAt.current > 2500) lastEditAt.current = Date.now(); // not the restore that follows a load
     const tick = () => {
       if (latest.current.busy?.()) { timer.current = setTimeout(tick, 1000); return; }
       timer.current = null;
@@ -182,10 +205,34 @@ export function useNestingAutosave(opts: Options) {
     return () => window.removeEventListener("pagehide", flush);
   }, [save]);
 
-  return { state: projectId ? state : ("idle" as AutosaveState), savedAt };
+  /** Puts the edits that the refused save set aside back; the next auto-save writes them over the newer copy. */
+  const keepMine = React.useCallback(() => {
+    const saved = mine.current;
+    if (!saved) return;
+    try { latest.current.restore(JSON.parse(saved)); } catch { return; }
+    mine.current = null;
+    setConflict(null);
+  }, []);
+  const dismissConflict = React.useCallback(() => { mine.current = null; setConflict(null); }, []);
+
+  return { state: projectId ? state : ("idle" as AutosaveState), savedAt, conflict, keepMine, dismissConflict, lastEditAt };
 }
 
-export function AutosaveBadge({ state, savedAt, projectLabel }: { state: AutosaveState; savedAt: number | null; projectLabel?: string }) {
+export function AutosaveBadge({ state, savedAt, projectLabel, conflict, onKeepMine, onDismiss }: {
+  state: AutosaveState; savedAt: number | null; projectLabel?: string;
+  conflict?: SaveConflict | null; onKeepMine?: () => void; onDismiss?: () => void;
+}) {
+  if (conflict) {
+    const at = conflict.at ? new Date(conflict.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+    const who = conflict.byMe ? "This nest was changed from another tab or the Part List" : `${conflict.by ?? "Someone"} saved a newer version`;
+    return (
+      <div role="alert" className="flex max-w-xl flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-900 dark:text-amber-200">
+        <span>{who}{at ? ` at ${at}` : ""}, so it was reloaded. Your latest edits were not saved.</span>
+        {onKeepMine && <button type="button" onClick={onKeepMine} className="font-semibold underline underline-offset-2">Restore my edits</button>}
+        {onDismiss && <button type="button" onClick={onDismiss} className="text-muted-foreground underline underline-offset-2">Dismiss</button>}
+      </div>
+    );
+  }
   if (state === "idle" && !savedAt) return null;
   const time = savedAt ? new Date(savedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
   return (

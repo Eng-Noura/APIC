@@ -2,6 +2,7 @@ import { prisma } from "@/server/db/client";
 import { computeTakeoffPart, buildDefaultAreaFormula } from "@/server/calc/takeoff";
 import type { TakeoffDrawingInput, TakeoffPartInputData } from "@/server/validators/takeoff";
 import { logActivity } from "./activity-log.service";
+import { trackPartChange } from "./part-undo.service";
 import { describeChanges } from "@/server/calc/part-changes";
 import { resolvePartQty } from "./part-group.service";
 
@@ -79,7 +80,7 @@ export async function deleteDrawing(id: string, userId: string) {
 
 // A grouped part's quantity is always derived from its assembly (group qty x qtyPerAssembly); the qty the client
 // sent only counts for an ungrouped part.
-export async function createPart(data: TakeoffPartInputData, userId: string) {
+async function createPartCore(data: TakeoffPartInputData, userId: string) {
   const groupId = data.groupId ?? null;
   const qtyPerAssembly = data.qtyPerAssembly ?? 1;
   const qty = groupId ? await resolvePartQty(await projectOfDrawing(data.drawingId), groupId, qtyPerAssembly, data.qty) : data.qty;
@@ -100,7 +101,7 @@ export async function createPart(data: TakeoffPartInputData, userId: string) {
   return part;
 }
 
-export async function updatePart(id: string, data: TakeoffPartInputData, userId: string) {
+async function updatePartCore(id: string, data: TakeoffPartInputData, userId: string) {
   const existing = await prisma.takeoffPart.findUnique({
     where: { id },
     select: {
@@ -154,7 +155,7 @@ function isPrismaErrorCode(err: unknown, code: string): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === code;
 }
 
-export async function deletePart(id: string, userId: string) {
+async function deletePartCore(id: string, userId: string) {
   let part;
   // a copy goes to the trash first, so a wrong delete can be undone (see part-trash.service.ts)
   const trash = await import("./part-trash.service");
@@ -189,4 +190,39 @@ export async function deletePart(id: string, userId: string) {
   // One part = one thing: it must not stay behind in the 2D / 1D nest (and be taken back into the Part List from there)
   if (projectId) await (await import("./nest-link.service")).removePartsFromNests(projectId, userId, [part]);
   return { ...part, trashId };
+}
+
+// ---------------------------------------------------------------------------------------------------- undoable
+// Every change to a part is recorded as a before / after copy, so Ctrl+Z / Ctrl+Y can step through it
+// (src/server/services/part-undo.service.ts).
+
+export async function createPart(data: TakeoffPartInputData, userId: string) {
+  const projectId = await projectOfDrawing(data.drawingId);
+  const { result } = await trackPartChange(
+    { userId, projectId, beforeIds: [], afterIds: (p) => [p.id], label: (p) => `Add "${p.description}"` },
+    () => createPartCore(data, userId),
+  );
+  return result;
+}
+
+export async function updatePart(id: string, data: TakeoffPartInputData, userId: string) {
+  const owner = await prisma.takeoffPart.findUnique({ where: { id }, select: { drawingId: true } });
+  if (!owner) throw new Error("NOT_FOUND");
+  const projectId = await projectOfDrawing(owner.drawingId);
+  const { result } = await trackPartChange(
+    { userId, projectId, beforeIds: [id], label: (p) => `Edit "${p.description}"` },
+    () => updatePartCore(id, data, userId),
+  );
+  return result;
+}
+
+export async function deletePart(id: string, userId: string) {
+  const owner = await prisma.takeoffPart.findUnique({ where: { id }, select: { drawingId: true } });
+  if (!owner) throw new Error("NOT_FOUND");
+  const projectId = await projectOfDrawing(owner.drawingId);
+  const { result, undoId } = await trackPartChange(
+    { userId, projectId, beforeIds: [id], label: (p) => `Delete "${p.description}"` },
+    () => deletePartCore(id, userId),
+  );
+  return { ...result, undoId };
 }

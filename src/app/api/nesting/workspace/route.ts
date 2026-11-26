@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requirePermission } from "@/server/api/guard";
+import { prisma } from "@/server/db/client";
 import { getWorkspace, getWorkspaceVersion, saveWorkspace, type WorkspaceKind } from "@/server/services/nesting-workspace.service";
 import { getHistoryData, saveHistoryData } from "@/server/services/nesting-history.service";
 import { applyNestSideEffects, overlayForRead, splitRemovals } from "@/server/services/nest-link.service";
@@ -48,7 +49,11 @@ export async function PUT(req: NextRequest) {
   const previous = removedIds.length ? await getWorkspace(projectId!, kind) : null;
   const saved = await saveWorkspace(projectId!, kind, data, userId, baseVersion);
   // 409: the nest changed on the server since this tab loaded it (e.g. a quantity synced from the BOQ)
-  if (!saved.ok) return NextResponse.json({ error: "STALE", version: saved.version }, { status: 409 });
+  if (!saved.ok) {
+    // say who wrote the newer copy: "Ahmed saved at 10:48" (or "you, in another tab / from the Part List")
+    const by = saved.updatedById ? await prisma.user.findUnique({ where: { id: saved.updatedById }, select: { name: true } }) : null;
+    return NextResponse.json({ error: "STALE", version: saved.version, by: by?.name ?? null, byMe: saved.updatedById === userId, at: saved.updatedAt }, { status: 409 });
+  }
 
   // Nest -> Part List: removed parts are deleted there, name / spec edits are written to the part, quantities are synced.
   let effects = { deleted: 0, blocked: 0, updated: 0 };

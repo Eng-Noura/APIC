@@ -1,6 +1,6 @@
 "use client";
 import * as React from "react";
-import { Plus, Trash2, History, Ruler, FolderKanban, Layers, Filter, X, PackagePlus, RefreshCw, FileSpreadsheet, FileText } from "lucide-react";
+import { Plus, Trash2, History, Undo2, Redo2, Ruler, FolderKanban, Layers, Filter, X, PackagePlus, RefreshCw, FileSpreadsheet, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -13,6 +13,7 @@ import { PartsGrid } from "./parts-grid";
 import { BoqPanel } from "./boq-panel";
 import { TrashDialog } from "./trash-dialog";
 import { ActivityDialog } from "./activity-dialog";
+import { useUndoRedo } from "./use-undo-redo";
 import { GroupingsPanel } from "./groupings-panel";
 import type { GroupingsData } from "@/server/services/part-grouping.service";
 import { sideAreas } from "./side-areas";
@@ -82,6 +83,10 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
       if (first) setLoading(false);
     }
   }, [loadGroupings]);
+
+  // Ctrl+Z / Ctrl+Y for everything done to parts here (your own steps; text fields keep their own undo)
+  const reloadAfterUndo = React.useCallback(() => { if (projectId) void loadDrawings(projectId); }, [projectId, loadDrawings]);
+  const history = useUndoRedo(projectId ?? null, canCreate, reloadAfterUndo, drawings);
 
   // Automatic: opening the Part List (coming back to this browser tab, or the nest being saved from another tab)
   // brings in the parts of the 2D nest AND the 1D nest that are not in the list yet, and carries quantity changes
@@ -290,6 +295,14 @@ export function TakeoffView({ canCreate, canDelete }: { canCreate: boolean; canD
             title="Turn the pieces of a 1D nest (this project's, or one from your history) into profile / pipe parts of this project"
           >
             <PackagePlus className="h-4 w-4" /> Take parts from 1D Nesting
+          </Button>
+          <Button variant="outline" size="icon" onClick={history.undo} disabled={!history.peek.undo || history.working} aria-label="Undo"
+            title={history.peek.undo ? `Undo: ${history.peek.undo.label} (Ctrl+Z)` : "Nothing to undo"}>
+            <Undo2 className="h-4 w-4" />
+          </Button>
+          <Button variant="outline" size="icon" onClick={history.redo} disabled={!history.peek.redo || history.working} aria-label="Redo"
+            title={history.peek.redo ? `Redo: ${history.peek.redo.label} (Ctrl+Y)` : "Nothing to redo"}>
+            <Redo2 className="h-4 w-4" />
           </Button>
           <Button variant="outline" onClick={() => setActivityOpen(true)} disabled={!projectId} title="Who added, changed or deleted what in this Part List, and when">
             <History className="h-4 w-4" /> Activity

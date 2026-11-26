@@ -11,6 +11,7 @@ import {
 } from "@/server/calc/boq-groups";
 import type { AssignPartsInput, PartGroupInput } from "@/server/validators/part-group";
 import { logActivity, logPartEvents } from "./activity-log.service";
+import { trackPartChange } from "./part-undo.service";
 
 export class PartGroupError extends Error {
   constructor(message: string, public status = 400) {
@@ -164,7 +165,7 @@ export interface AssignResult {
   quantityChanged: { partId: string; from: number; to: number }[];
 }
 
-export async function assignParts(data: AssignPartsInput, userId: string): Promise<AssignResult> {
+async function assignPartsCore(data: AssignPartsInput, userId: string): Promise<AssignResult> {
   const parts = await prisma.takeoffPart.findMany({
     where: { id: { in: data.partIds }, drawing: { projectId: data.projectId } },
     select: { id: true, description: true, groupId: true, qty: true, qtyPerAssembly: true, partType: true, geometry: true, thicknessMm: true, paintSides: true, areaFormula: true, buyWeightKg: true },
@@ -205,3 +206,13 @@ export async function assignParts(data: AssignPartsInput, userId: string): Promi
 }
 
 export { BoqGroupError };
+
+/** Puts parts into an assembly (or takes them out): undoable with Ctrl+Z, quantity changes included. */
+export async function assignParts(data: AssignPartsInput, userId: string): Promise<AssignResult> {
+  const n = new Set(data.partIds).size;
+  const { result } = await trackPartChange(
+    { userId, projectId: data.projectId, beforeIds: data.partIds, label: `${data.groupId ? "Add" : "Take out"} ${n} part${n === 1 ? "" : "s"} ${data.groupId ? "to an assembly" : "from an assembly"}` },
+    () => assignPartsCore(data, userId),
+  );
+  return result;
+}

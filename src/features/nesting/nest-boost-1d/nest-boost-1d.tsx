@@ -7,6 +7,7 @@ import type { TakeoffDrawingRow } from "@/features/takeoff/types";
 import { partListLabel } from "@/features/takeoff/nest-1d-parts";
 import { PARTS_CSV_TEMPLATE, parsePartsCsv } from "../csv-parts";
 import { AutosaveBadge, useNestingAutosave } from "../use-nesting-autosave";
+import { PresenceBanner, useNestPresence } from "../use-nest-presence";
 import { dxfToPiece } from "../dxf-piece";
 import { nestKindOf, partTo1DPiece } from "../part-routing";
 import { pieceColor, renderBarPng } from "../report/draw-1d";
@@ -194,7 +195,7 @@ const DEFAULT_SETTINGS: Settings1D = {
   restrictedRestTo: 0,
 };
 
-export function NestBoost1D() {
+export function NestBoost1D({ active = true }: { active?: boolean } = {}) {
   const [pieces, setPieces] = React.useState<Piece1D[]>([]);
   const [sources, setSources] = React.useState<Source1D[]>([]);
   const piecesRef = React.useRef<Piece1D[]>([]);
@@ -374,6 +375,8 @@ export function NestBoost1D() {
     },
     deps: [pieces, sources, cfg, result, resS],
   });
+  // who else has this nest open (and is editing it right now)
+  const presence = useNestPresence(workspaceId, "1D", active, autosave.lastEditAt);
 
   async function handleCsv(files: File[]) {
     let added = 0;
@@ -626,7 +629,8 @@ export function NestBoost1D() {
         subtitle="Optimize the cutting of bars, pipes, angles and profiles."
         actions={
           <>
-            {workspaceId && <AutosaveBadge state={autosave.state} savedAt={autosave.savedAt} projectLabel={workspaceLabel} />}
+            {workspaceId && <PresenceBanner others={presence} />}
+            {workspaceId && <AutosaveBadge state={autosave.state} savedAt={autosave.savedAt} projectLabel={workspaceLabel} conflict={autosave.conflict} onKeepMine={autosave.keepMine} onDismiss={autosave.dismissConflict} />}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button><Download /> Export <ChevronDown /></Button>

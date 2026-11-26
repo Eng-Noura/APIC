@@ -17,6 +17,35 @@ import { logActivity } from "./activity-log.service";
 
 export const TRASH_DAYS = 30;
 
+type Rec = Record<string, unknown>;
+
+/**
+ * A saved part row, ready to be written back: the assembly / scope / work order it was in are kept unless they were
+ * deleted in the meantime, and (for a part that is created again) the link to a nest row is dropped — that row left
+ * the nest together with the part. Shared by the Trash and by Ctrl+Z.
+ */
+export async function reviveRow(saved: Rec, opts: { dropNestLink: boolean }): Promise<Rec> {
+  const s = { ...saved };
+  if (opts.dropNestLink) { s.nestKind = null; s.nestPartId = null; s.nestSyncedQty = null; s.nestSyncedAt = null; }
+  const [group, scope, wo] = await Promise.all([
+    typeof s.groupId === "string" ? prisma.partGroup.findUnique({ where: { id: s.groupId }, select: { id: true } }) : null,
+    typeof s.scopeId === "string" ? prisma.scopeItem.findUnique({ where: { id: s.scopeId }, select: { id: true } }) : null,
+    typeof s.workOrderGroupId === "string" ? prisma.workOrderGroup.findUnique({ where: { id: s.workOrderGroupId }, select: { id: true } }) : null,
+  ]);
+  if (!group) s.groupId = null;
+  if (!scope) s.scopeId = null;
+  if (!wo) s.workOrderGroupId = null;
+  return s;
+}
+
+/** The saved DXF record as data for `partDxf.create`. */
+export function dxfData(saved: Rec, partId: string): Rec {
+  const d: Rec = { ...saved, takeoffPartId: partId };
+  delete d.id;
+  if (d.geometryJson === null) delete d.geometryJson; // a nullable JSON column does not take a plain null: leaving it out stores null
+  return d;
+}
+
 export class TrashError extends Error {
   constructor(message: string, public status = 409) { super(message); }
 }
@@ -80,19 +109,8 @@ export async function restoreFromTrash(trashId: string, userId: string) {
   const drawing = await prisma.takeoffDrawing.findUnique({ where: { id: t.drawingId }, select: { id: true, projectId: true } });
   if (!drawing) throw new TrashError(`Its drawing (${t.drawingNumber}) was deleted — create the drawing again, or add the part by hand.`);
 
-  const s = { ...(t.snapshot as Record<string, unknown>) };
   // the part was deleted from the nest too, so there is nothing to point at any more
-  s.nestKind = null; s.nestPartId = null; s.nestSyncedQty = null; s.nestSyncedAt = null;
-
-  // assembly / scope / work order: back where it was, unless that group was deleted in the meantime
-  const [group, scope, wo] = await Promise.all([
-    typeof s.groupId === "string" ? prisma.partGroup.findUnique({ where: { id: s.groupId }, select: { id: true } }) : null,
-    typeof s.scopeId === "string" ? prisma.scopeItem.findUnique({ where: { id: s.scopeId }, select: { id: true } }) : null,
-    typeof s.workOrderGroupId === "string" ? prisma.workOrderGroup.findUnique({ where: { id: s.workOrderGroupId }, select: { id: true } }) : null,
-  ]);
-  if (!group) s.groupId = null;
-  if (!scope) s.scopeId = null;
-  if (!wo) s.workOrderGroupId = null;
+  const s = await reviveRow(t.snapshot as Rec, { dropNestLink: true });
 
   // keep the original id unless something took it (it never should)
   const taken = await prisma.takeoffPart.findUnique({ where: { id: t.partId }, select: { id: true } });
@@ -100,11 +118,7 @@ export async function restoreFromTrash(trashId: string, userId: string) {
 
   const restored = await prisma.$transaction(async (tx) => {
     const part = await tx.takeoffPart.create({ data: s as never });
-    if (t.dxf) {
-      const d: Record<string, unknown> = { ...(t.dxf as Record<string, unknown>), takeoffPartId: part.id };
-      delete d.id;
-      await tx.partDxf.create({ data: d as never });
-    }
+    if (t.dxf) await tx.partDxf.create({ data: dxfData(t.dxf as Rec, part.id) as never });
     await tx.takeoffPartTrash.delete({ where: { id: trashId } });
     return part;
   });

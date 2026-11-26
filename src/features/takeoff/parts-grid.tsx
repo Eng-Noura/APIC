@@ -117,8 +117,8 @@ export function PartsGrid({
       toast.error(typeof j?.error === "string" ? j.error : "Failed to delete item");
       return;
     }
-    const { trashId } = (await res.json().catch(() => ({}))) as { trashId?: string | null };
-    showUndoToast("Item deleted", trashId ? [trashId] : [], onChanged);
+    const { undoId } = (await res.json().catch(() => ({}))) as { undoId?: string | null };
+    showUndoToast("Item deleted", projectId, undoId ? [undoId] : [], onChanged);
     setDeletingId(null);
     onChanged();
   }
@@ -151,15 +151,15 @@ export function PartsGrid({
     const results = await Promise.all(
       ids.map((id) =>
         fetch(`/api/takeoff/parts/${id}`, { method: "DELETE" })
-          .then(async (r) => (r.ok ? ((await r.json().catch(() => ({}))) as { trashId?: string | null }).trashId ?? "" : null))
+          .then(async (r) => (r.ok ? ((await r.json().catch(() => ({}))) as { undoId?: string | null }).undoId ?? "" : null))
           .catch(() => null),
       ),
     );
     setBulkDeleteLoading(false);
     const failed = results.filter((r) => r === null).length;
-    const trashIds = results.filter((r): r is string => !!r);
+    const undoIds = results.filter((r): r is string => !!r);
     if (failed) toast.error(`${failed} of ${ids.length} item(s) could not be deleted`);
-    if (ids.length - failed > 0) showUndoToast(`${ids.length - failed} item(s) deleted`, trashIds, onChanged);
+    if (ids.length - failed > 0) showUndoToast(`${ids.length - failed} item(s) deleted`, projectId, undoIds, onChanged);
     setBulkDeleteOpen(false);
     setSelected(new Set());
     onChanged();

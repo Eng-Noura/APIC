@@ -18,7 +18,7 @@ export function NestingWorkspaces() {
         <NestBoost active={view === "2d"} />
       </div>
       <div hidden={view !== "1d"}>
-        <NestBoost1D />
+        <NestBoost1D active={view === "1d"} />
       </div>
       <CombinedReportButton />
     </div>
